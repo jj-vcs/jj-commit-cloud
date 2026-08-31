@@ -20,6 +20,8 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=../server/src/");
     println!("cargo:rerun-if-changed=../server/Cargo.toml");
+    println!("cargo:rerun-if-changed=../daemon/src/");
+    println!("cargo:rerun-if-changed=../daemon/Cargo.toml");
     println!("cargo:rerun-if-changed=../lib/src/");
     println!("cargo:rerun-if-changed=../lib/Cargo.toml");
     println!("cargo:rerun-if-changed=../common/src/");
@@ -33,14 +35,25 @@ fn main() {
 
     // Use a separate target directory for the child Cargo invocation to avoid Cargo lock deadlocks.
     let server_target_dir = out_path.join("server_target");
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR should be set");
+    let workspace_manifest = Path::new(&manifest_dir)
+        .parent()
+        .unwrap()
+        .join("Cargo.toml");
 
     let mut cmd = Command::new(cargo);
     cmd.args([
         "build",
+        "--manifest-path",
+        workspace_manifest.to_str().unwrap(),
         "-p",
         "jj-commit-cloud-server",
         "--bin",
         "jj-cc-server",
+        "-p",
+        "jj-commit-cloud-daemon",
+        "--bin",
+        "jj-cc-daemon",
     ]);
     if profile == "release" {
         cmd.arg("--release");
@@ -54,14 +67,15 @@ fn main() {
 
     let status = cmd
         .status()
-        .expect("Failed to execute cargo build for jj-cc-server");
+        .expect("Failed to execute cargo build for test helper binaries");
 
     if !status.success() {
-        panic!("Failed to build jj-cc-server helper binaries");
+        panic!("Failed to build test helper binaries");
     }
 
     let exe_suffix = std::env::consts::EXE_SUFFIX;
     let server_name = format!("jj-cc-server{exe_suffix}");
+    let daemon_name = format!("jj-cc-daemon{exe_suffix}");
 
     let compiled_binary_path = server_target_dir.join(&profile).join(&server_name);
     assert!(
@@ -81,6 +95,10 @@ fn main() {
         .ancestors()
         .find(|p| p.file_name().and_then(|n| n.to_str()) == Some(profile.as_str()))
     {
-        let _ = fs::copy(&compiled_binary_path, profile_dir.join(&server_name));
+        for name in [&server_name, &daemon_name] {
+            let dest = profile_dir.join(name);
+            let _ = fs::remove_file(&dest);
+            let _ = fs::copy(server_target_dir.join(&profile).join(name), dest);
+        }
     }
 }
