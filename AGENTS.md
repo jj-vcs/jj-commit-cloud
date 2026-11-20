@@ -13,7 +13,7 @@ Use these rules when reading, editing, testing, or reviewing code in [jj-commit-
 ## Codebase, Proto, and Comment Conventions
 
 * **Match Implementation Scope:** Keep code changes focused on the requested behavior and active storage backend. Do not add multi-region coordination or high-scale distributed machinery when editing in-memory or single-service code unless specified by the task or a design doc in [docs/](docs/).
-* **License and Module-Level `//!` Invariant Headers in Rust:** Every new source file carries the Apache 2.0 header from [README.md](README.md). New modules, and modules whose invariants you change, carry a `//!` docblock of at most 25 lines after the Apache header, covering whichever topics apply:
+* **License and Module-Level `//!` Invariant Headers in Rust:** Every new source file carries the Apache 2.0 header from [docs/contributing.md](docs/contributing.md#source-code-headers). New modules, and modules whose invariants you change, carry a `//!` docblock of at most 25 lines after the Apache header, covering whichever topics apply:
   * **Authority and Crash-Safety Ordering:** Write-before-publish ordering across objects, views, operations, and active operation heads, and how interrupted writes recover.
   * **Concurrency and Merge Invariants:** Locking rules, compare-and-swap semantics on operation heads, and how divergent heads reconcile.
   * **Cross-Process and RPC Boundaries:** gRPC request/response framing, streaming invariants, and retry safety.
