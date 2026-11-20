@@ -1,3 +1,24 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! `jj_lib::op_heads_store::OpHeadsStore` client adapter over `OpStoreService` gRPC RPCs.
+//!
+//! # Concurrency and Merge Invariants
+//! `lock()` is a client-side no-op; `UpdateOpHeads` executes atomically on the server,
+//! removing superseded `old_op_head_ids` while retaining concurrent sibling operation
+//! heads so `jj_lib` can reconcile divergent views without distributed locks.
+
 use async_trait::async_trait;
 use cc_common::op_store::op_store_service_client::OpStoreServiceClient;
 use cc_common::op_store::*;
@@ -38,8 +59,6 @@ impl OpHeadsStore for CommitCloudOpHeadsStore {
         Self::name()
     }
 
-    // TODO: Add support for concurrency control with locking to prevent race conditions
-    // during concurrent client operations from overwriting operation heads.
     async fn update_op_heads(
         &self,
         old_ids: &[OperationId],
@@ -64,7 +83,7 @@ impl OpHeadsStore for CommitCloudOpHeadsStore {
         })
         .map_err(|e| OpHeadsStoreError::Write {
             new_op_id: target_new_id,
-            source: e.into(),
+            source: e,
         })
     }
 
@@ -75,15 +94,25 @@ impl OpHeadsStore for CommitCloudOpHeadsStore {
         run_async(move || async move {
             let mut client = OpStoreServiceClient::connect(server_url).await?;
             let response = client.get_op_heads(GetOpHeadsRequest { repo_id }).await?;
-            let head_ids: Vec<OperationId> = response
-                .into_inner()
-                .op_head_ids
-                .into_iter()
-                .map(|b| OperationId::from_bytes(&b))
-                .collect();
+            let raw_ids = response.into_inner().op_head_ids;
+            if raw_ids.is_empty() {
+                return Err("GetOpHeadsResponse returned empty op_head_ids".into());
+            }
+            let mut head_ids = Vec::with_capacity(raw_ids.len());
+            for b in raw_ids {
+                if b.len() != cc_common::OPERATION_ID_LENGTH {
+                    return Err(format!(
+                        "invalid OperationId length in GetOpHeadsResponse: expected {} bytes, got {}",
+                        cc_common::OPERATION_ID_LENGTH,
+                        b.len()
+                    )
+                    .into());
+                }
+                head_ids.push(OperationId::from_bytes(&b));
+            }
             Ok(head_ids)
         })
-        .map_err(|e| OpHeadsStoreError::Read(e.into()))
+        .map_err(|e| OpHeadsStoreError::Read(e))
     }
 
     async fn lock(&self) -> Result<Box<dyn OpHeadsStoreLock + '_>, OpHeadsStoreError> {
