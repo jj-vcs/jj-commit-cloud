@@ -2,7 +2,7 @@ use cc_lib::cc_backend::CommitCloudBackend;
 use cc_lib::cc_op_heads_store::CommitCloudOpHeadsStore;
 use cc_lib::cc_op_store::CommitCloudOpStore;
 use clap::Parser;
-use jj_cli::command_error::{user_error, CommandError};
+use jj_cli::command_error::{CommandError, user_error};
 use jj_lib::backend::BackendInitError;
 use jj_lib::config::StackedConfig;
 use jj_lib::op_store::RootOperationData;
@@ -10,7 +10,7 @@ use jj_lib::ref_name::WorkspaceName;
 use jj_lib::repo::ReadonlyRepo;
 use jj_lib::settings::UserSettings;
 use jj_lib::signing::Signer;
-use jj_lib::workspace::{default_working_copy_factory, Workspace};
+use jj_lib::workspace::{Workspace, default_working_copy_factory};
 use std::path::Path;
 
 #[derive(Parser, Clone, Debug)]
@@ -24,7 +24,6 @@ pub struct CcInitArgs {
     #[arg(long)]
     pub create: bool,
 
-
     /// Destination directory for the local workspace
     #[arg(default_value = ".")]
     pub destination: String,
@@ -37,17 +36,14 @@ pub async fn cmd_cc_init(args: &CcInitArgs) -> Result<(), CommandError> {
     // Load default user settings and signer (required by Jujutsu engine)
     let user_settings = UserSettings::from_config(StackedConfig::with_defaults())
         .map_err(|e| user_error(format!("Failed to initialize settings: {:?}", e)))?;
-    
+
     let signer = Signer::from_settings(&user_settings)
         .map_err(|e| user_error(format!("Failed to initialize signature signer: {:?}", e)))?;
 
     // Define the backend initializer closure for Workspace
     let backend_initializer = |_settings: &UserSettings, store_path: &Path| {
-        let backend = CommitCloudBackend::init(
-            store_path,
-            &args.server,
-        )
-        .map_err(BackendInitError)?;
+        let backend =
+            CommitCloudBackend::init(store_path, &args.server).map_err(BackendInitError)?;
         Ok(Box::new(backend) as Box<dyn jj_lib::backend::Backend>)
     };
 
