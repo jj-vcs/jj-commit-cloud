@@ -82,13 +82,15 @@ pub fn compute_git_commit_hash(commit: &cc_common::backend::Commit) -> Vec<u8> {
     gix_commit
         .write_to(&mut buf)
         .expect("gix commit should have serialized successfully");
-    let hash = gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Commit, &buf);
+    let hash = gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Commit, &buf)
+        .expect("SHA-1 digest computation should succeed");
     hash.as_bytes().to_vec()
 }
 
 /// Standalone black-box function that computes a Git blob hash using `gix` (Gitoxide).
 pub fn compute_git_blob_hash(content: &[u8]) -> Vec<u8> {
-    let hash = gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Blob, content);
+    let hash = gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Blob, content)
+        .expect("SHA-1 digest computation should succeed");
     hash.as_bytes().to_vec()
 }
 
@@ -138,7 +140,8 @@ pub fn compute_git_tree_hash(entries: &[cc_common::backend::TreeEntry]) -> Vec<u
         .write_to(&mut buf)
         .expect("gix tree should have serialized successfully");
 
-    let hash = gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Tree, &buf);
+    let hash = gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Tree, &buf)
+        .expect("SHA-1 digest computation should succeed");
     hash.as_bytes().to_vec()
 }
 
@@ -171,7 +174,8 @@ pub fn hash_operation(op: &cc_common::op_store::Operation) -> Vec<u8> {
             append_length_prefixed_bytes(&mut buf, p_id);
         }
     }
-    let hash = gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Blob, &buf);
+    let hash = gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Blob, &buf)
+        .expect("SHA-1 digest computation should succeed");
     hash.as_bytes()[..cc_common::OPERATION_ID_LENGTH].to_vec()
 }
 
@@ -220,6 +224,7 @@ pub fn hash_view(view: &cc_common::op_store::View) -> Vec<u8> {
         }
     }
 
-    let hash = gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Blob, &buf);
+    let hash = gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Blob, &buf)
+        .expect("SHA-1 digest computation should succeed");
     hash.as_bytes()[..cc_common::VIEW_ID_LENGTH].to_vec()
 }
