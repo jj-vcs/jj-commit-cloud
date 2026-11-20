@@ -34,8 +34,15 @@ fn ensure_protoc() -> Result<(), Box<dyn std::error::Error>> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=proto/backend.proto");
     println!("cargo:rerun-if-changed=proto/op_store.proto");
+    println!("cargo:rerun-if-changed=proto/workspace.proto");
     ensure_protoc()?;
-    tonic_build::configure()
-        .compile_protos(&["proto/backend.proto", "proto/op_store.proto"], &["proto"])?;
+    tonic_build::configure().compile_protos(
+        &[
+            "proto/backend.proto",
+            "proto/op_store.proto",
+            "proto/workspace.proto",
+        ],
+        &["proto"],
+    )?;
     Ok(())
 }

@@ -4,7 +4,7 @@ Use these rules when reading, editing, testing, or reviewing code in [jj-commit-
 
 ## Workspace Crates and Service Surfaces
 
-* **Protocol Definitions ([common/](common/), `cc-common`):** Compiles `BackendService` ([common/proto/backend.proto](common/proto/backend.proto)) and `OpStoreService` ([common/proto/op_store.proto](common/proto/op_store.proto)) into `tonic` stubs and defines digest-length and virtual-root constants.
+* **Protocol Definitions ([common/](common/), `cc-common`):** Compiles `BackendService` ([common/proto/backend.proto](common/proto/backend.proto)), `OpStoreService` ([common/proto/op_store.proto](common/proto/op_store.proto)), and `WorkspaceService` ([common/proto/workspace.proto](common/proto/workspace.proto)) into `tonic` stubs and defines digest-length and virtual-root constants.
 * **Client Storage Backends ([lib/](lib/), `cc-lib`):** Implements `jj_lib` storage traits (`CommitCloudBackend`, `CommitCloudOpStore`, `CommitCloudOpHeadsStore`) over gRPC.
 * **Commit Cloud Server ([server/](server/), `jj-commit-cloud-server`, binary jj-cc-server):** Serves gRPC endpoints, computes canonical object digests via [gitoxide](https://github.com/GitoxideLabs/gitoxide), and keeps repository state behind the `Store` trait (in-memory only on `main` via `MemoryStore`).
 * **Custom CLI ([cli/](cli/), binary jj):** Embeds `jj_cli` alongside the `jj cc` subcommand family while keeping local `GitBackend` repositories working unchanged.
