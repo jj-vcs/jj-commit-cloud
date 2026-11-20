@@ -1,3 +1,5 @@
 /target
+/.jj-cc
+/bin
 **/*.rs.bk
 *.pdb
