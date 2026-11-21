@@ -1,0 +1,9 @@
+[alias]
+xtask = "run --package xtask --"
+
+[target.'cfg(all(target_family = "windows", target_env = "msvc"))']
+linker = "rust-lld.exe"
+rustflags = [
+    "-Ctarget-feature=+crt-static",
+    "-Clink-arg=/STACK:8388608",
+]

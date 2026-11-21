@@ -1,3 +1,17 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -6,14 +20,18 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=../server/src/");
     println!("cargo:rerun-if-changed=../server/Cargo.toml");
+    println!("cargo:rerun-if-changed=../lib/src/");
+    println!("cargo:rerun-if-changed=../lib/Cargo.toml");
+    println!("cargo:rerun-if-changed=../common/src/");
+    println!("cargo:rerun-if-changed=../common/Cargo.toml");
+    println!("cargo:rerun-if-changed=../common/proto/");
 
     let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    
-    // OUT_DIR is target/<profile>/build/testutils-<hash>/out/
+    let profile = env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR should be set");
     let out_path = Path::new(&out_dir);
 
-    // Set a different target directory for the child Cargo build to avoid deadlocks!
+    // Use a separate target directory for the child Cargo invocation to avoid Cargo lock deadlocks.
     let server_target_dir = out_path.join("server_target");
 
     let mut cmd = Command::new(cargo);
@@ -24,32 +42,45 @@ fn main() {
         "--bin",
         "jj-cc-server",
     ]);
+    if profile == "release" {
+        cmd.arg("--release");
+    }
     cmd.env("CARGO_TARGET_DIR", &server_target_dir);
+    // `cargo clippy` runs build scripts with clippy-driver as the rustc wrapper; the nested
+    // build must compile the helper binaries with plain rustc.
+    for var in ["RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "CLIPPY_ARGS"] {
+        cmd.env_remove(var);
+    }
 
     let status = cmd
         .status()
         .expect("Failed to execute cargo build for jj-cc-server");
 
     if !status.success() {
-        panic!("Failed to build jj-cc-server helper binary");
+        panic!("Failed to build jj-cc-server helper binaries");
     }
 
-    // Resolve the main target profile directory (e.g. target/debug/)
-    // out_path is: target/<profile>/build/testutils-<hash>/out/
-    let profile_dir = out_path
-        .parent().unwrap() // testutils-<hash>
-        .parent().unwrap() // build
-        .parent().unwrap(); // <profile> (e.g. debug or release)
+    let exe_suffix = std::env::consts::EXE_SUFFIX;
+    let server_name = format!("jj-cc-server{exe_suffix}");
 
-    let profile_name = profile_dir.file_name().unwrap().to_str().unwrap();
+    let compiled_binary_path = server_target_dir.join(&profile).join(&server_name);
+    assert!(
+        compiled_binary_path.exists(),
+        "Compiled jj-cc-server binary should exist at {}",
+        compiled_binary_path.display()
+    );
 
-    // The binary is compiled under server_target_dir/<profile_name>/jj-cc-server
-    let compiled_binary_path = server_target_dir
-        .join(profile_name)
-        .join("jj-cc-server");
+    println!(
+        "cargo:rustc-env=JJ_CC_SERVER_BIN={}",
+        compiled_binary_path.display()
+    );
 
-    let dest_binary_path = profile_dir.join("jj-cc-server");
-
-    fs::copy(&compiled_binary_path, &dest_binary_path)
-        .expect("Failed to copy compiled jj-cc-server binary to target profile directory");
+    // Also copy into `target/<profile>/` if an ancestor matches `<profile>`
+    // (handles both legacy `build/<pkg>-<hash>/out` and Cargo 1.98+ `build/<pkg>/<hash>/out`).
+    if let Some(profile_dir) = out_path
+        .ancestors()
+        .find(|p| p.file_name().and_then(|n| n.to_str()) == Some(profile.as_str()))
+    {
+        let _ = fs::copy(&compiled_binary_path, profile_dir.join(&server_name));
+    }
 }
