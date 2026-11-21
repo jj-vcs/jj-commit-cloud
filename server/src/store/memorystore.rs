@@ -47,7 +47,10 @@ impl Store for MemoryStore {
 
     async fn put_commit(&self, repo_id: String, commit_id: Vec<u8>, commit: Commit) {
         let mut commits = self.commits.lock().unwrap();
-        commits.entry(repo_id).or_default().insert(commit_id, commit);
+        commits
+            .entry(repo_id)
+            .or_default()
+            .insert(commit_id, commit);
     }
 
     async fn get_tree(&self, repo_id: &str, tree_id: &[u8]) -> Option<Vec<TreeEntry>> {
