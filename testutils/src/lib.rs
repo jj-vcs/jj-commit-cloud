@@ -37,6 +37,9 @@ pub async fn spawn_server() -> ServerGuard {
 }
 
 fn find_server_bin() -> std::path::PathBuf {
+    if let Some(path) = option_env!("JJ_CC_SERVER_BIN") {
+        return std::path::PathBuf::from(path);
+    }
     let current_exe = std::env::current_exe().expect("The current test executable path should be retrievable");
     let target_dir = current_exe
         .parent().expect("The deps directory should exist")

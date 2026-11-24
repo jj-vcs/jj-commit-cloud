@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err)]
+
 use clap::{Parser, ValueEnum};
 use std::net::SocketAddr;
 use std::sync::Arc;

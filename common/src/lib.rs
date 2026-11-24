@@ -1,7 +1,9 @@
+#[allow(clippy::result_large_err)]
 pub mod backend {
     tonic::include_proto!("commit_cloud.backend");
 }
 
+#[allow(clippy::result_large_err)]
 pub mod op_store {
     tonic::include_proto!("commit_cloud.op_store");
 }
