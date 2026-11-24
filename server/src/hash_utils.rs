@@ -90,6 +90,7 @@ pub fn compute_git_commit_hash(commit: &cc_common::backend::Commit) -> Vec<u8> {
 /// Standalone black-box function that computes a Git blob hash using `gix` (Gitoxide).
 pub fn compute_git_blob_hash(content: &[u8]) -> Vec<u8> {
     let hash = gix::objs::compute_hash(gix::hash::Kind::Sha1, gix::objs::Kind::Blob, content)
+        // FIXME: This will panic on a hash collision. Return the `Error` instead.
         .expect("SHA-1 digest computation should succeed");
     hash.as_bytes().to_vec()
 }
