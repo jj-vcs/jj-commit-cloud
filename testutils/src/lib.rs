@@ -48,10 +48,6 @@ pub fn find_server_bin() -> std::path::PathBuf {
     if direct.exists() {
         return direct;
     }
-    let poc_server = target_dir.parent().unwrap().join("jj-commit-cloud-poc/target/debug/jj-cc-server");
-    if poc_server.exists() {
-        return poc_server;
-    }
     direct
 }
 
@@ -64,14 +60,6 @@ fn find_jj_cmd() -> assert_cmd::Command {
     let direct = target_dir.join(format!("jj{}", std::env::consts::EXE_SUFFIX));
     if direct.exists() {
         return assert_cmd::Command::new(direct);
-    }
-    let poc_jj = target_dir.parent().unwrap().join("jj-commit-cloud-poc/target/debug/jj");
-    if poc_jj.exists() {
-        return assert_cmd::Command::new(poc_jj);
-    }
-    let fallback = std::path::PathBuf::from("/usr/local/google/home/srachaba/Projects/jj-commit-cloud-poc/target/debug/jj");
-    if fallback.exists() {
-        return assert_cmd::Command::new(fallback);
     }
     assert_cmd::Command::cargo_bin("jj").expect("The jj CLI binary should have compiled")
 }
@@ -316,10 +304,6 @@ fn find_daemon_bin() -> std::path::PathBuf {
     let direct = target_dir.join(format!("jj-cc-daemon{}", std::env::consts::EXE_SUFFIX));
     if direct.exists() {
         return direct;
-    }
-    let poc_daemon = target_dir.parent().unwrap().join("jj-commit-cloud-poc/target/debug/jj-cc-daemon");
-    if poc_daemon.exists() {
-        return poc_daemon;
     }
     direct
 }
