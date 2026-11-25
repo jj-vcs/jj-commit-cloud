@@ -187,6 +187,182 @@ async fn test_import_git_preserves_existing_unrelated_workspace_history() {
 }
 
 #[tokio::test]
+async fn test_import_git_preserves_non_utc_timezone_offsets() {
+    let ws = testutils::TestWorkspace::init().await;
+    let config_path = ws.repo_path().join(".jj/repo/store/config.toml");
+    let config_str = fs::read_to_string(&config_path).unwrap();
+    let config: toml::Value = toml::from_str(&config_str).unwrap();
+    let project_id = config
+        .get("project_id")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_string();
+    let repo_id = config.get("repo_id").unwrap().as_str().unwrap().to_string();
+
+    let git_temp_dir = tempdir().expect("Failed to create temporary git repo dir");
+    let git_path = git_temp_dir.path();
+
+    let init_status = Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(git_path)
+        .status()
+        .expect("Failed to execute git init");
+    assert!(init_status.success());
+
+    fs::write(git_path.join("git_file.txt"), "hello\n").unwrap();
+    Command::new("git")
+        .args(["add", "git_file.txt"])
+        .current_dir(git_path)
+        .status()
+        .unwrap();
+
+    // Author and committer deliberately use different, non-UTC offsets
+    // (positive half-hour and negative) to catch sign/unit regressions.
+    let commit_status = Command::new("git")
+        .args(["commit", "-m", "commit with timezone offsets"])
+        .env("GIT_AUTHOR_NAME", "Author")
+        .env("GIT_AUTHOR_EMAIL", "author@example.com")
+        .env("GIT_AUTHOR_DATE", "2024-01-02T03:04:05+0530")
+        .env("GIT_COMMITTER_NAME", "Committer")
+        .env("GIT_COMMITTER_EMAIL", "committer@example.com")
+        .env("GIT_COMMITTER_DATE", "2024-03-04T05:06:07-0800")
+        .current_dir(git_path)
+        .status()
+        .unwrap();
+    assert!(commit_status.success());
+
+    let mut cmd = assert_cmd::Command::cargo_bin("jj").expect("jj binary should build");
+    cmd.args([
+        "cc",
+        "import-git",
+        "--git-dir",
+        git_path.to_str().unwrap(),
+        "--project-id",
+        &project_id,
+        "--repo-id",
+        &repo_id,
+        "--server",
+        ws.server_url(),
+    ]);
+    cmd.assert().success();
+
+    let mut log_cmd = ws.jj_cmd();
+    let output = log_cmd
+        .args([
+            "log",
+            "--no-graph",
+            "-r",
+            "description(substring:\"commit with timezone offsets\")",
+            "-T",
+            "author.timestamp() ++ \"|\" ++ committer.timestamp()",
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8_lossy(&output.get_output().stdout);
+    assert_eq!(
+        stdout.trim(),
+        "2024-01-02 03:04:05.000 +05:30|2024-03-04 05:06:07.000 -08:00"
+    );
+}
+
+#[tokio::test]
+async fn test_import_git_rejects_commit_with_missing_timestamp() {
+    let ws = testutils::TestWorkspace::init().await;
+    let config_path = ws.repo_path().join(".jj/repo/store/config.toml");
+    let config_str = fs::read_to_string(&config_path).unwrap();
+    let config: toml::Value = toml::from_str(&config_str).unwrap();
+    let project_id = config
+        .get("project_id")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_string();
+    let repo_id = config.get("repo_id").unwrap().as_str().unwrap().to_string();
+
+    let git_temp_dir = tempdir().expect("Failed to create temporary git repo dir");
+    let git_path = git_temp_dir.path();
+
+    let init_status = Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(git_path)
+        .status()
+        .expect("Failed to execute git init");
+    assert!(init_status.success());
+
+    // The empty tree is always resolvable, so no files are needed.
+    let tree_out = Command::new("git")
+        .args(["hash-object", "-t", "tree", "-w", "--stdin"])
+        .stdin(std::process::Stdio::null())
+        .current_dir(git_path)
+        .output()
+        .unwrap();
+    assert!(tree_out.status.success());
+    let tree_id = String::from_utf8(tree_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // Signatures without a timestamp are malformed; the importer must refuse
+    // them rather than invent a date.
+    let raw_commit = format!(
+        "tree {tree_id}\nauthor A U Thor <a@example.com>\ncommitter A U Thor <a@example.com>\n\nno timestamp\n"
+    );
+    let mut hash_cmd = Command::new("git")
+        .args([
+            "hash-object",
+            "-t",
+            "commit",
+            "-w",
+            "--literally",
+            "--stdin",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .current_dir(git_path)
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(hash_cmd.stdin.as_mut().unwrap(), raw_commit.as_bytes()).unwrap();
+    let commit_out = hash_cmd.wait_with_output().unwrap();
+    assert!(commit_out.status.success());
+    let commit_id = String::from_utf8(commit_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let ref_status = Command::new("git")
+        .args(["update-ref", "refs/heads/main", &commit_id])
+        .current_dir(git_path)
+        .status()
+        .unwrap();
+    assert!(ref_status.success());
+
+    let mut cmd = assert_cmd::Command::cargo_bin("jj").expect("jj binary should build");
+    cmd.args([
+        "cc",
+        "import-git",
+        "--git-dir",
+        git_path.to_str().unwrap(),
+        "--project-id",
+        &project_id,
+        "--repo-id",
+        &repo_id,
+        "--server",
+        ws.server_url(),
+    ]);
+    let output = cmd.assert().failure();
+    let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+    assert!(
+        stderr.contains(&commit_id),
+        "Error should name the offending commit {commit_id}:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("invalid author"),
+        "Error should explain the malformed signature:\n{stderr}"
+    );
+}
+
+#[tokio::test]
 async fn test_import_git_fails_on_unregistered_repo() {
     let server = spawn_server().await;
 
@@ -269,4 +445,3 @@ async fn test_rejects_merge_commit_with_root_commit_as_parent() {
         status.message()
     );
 }
-
