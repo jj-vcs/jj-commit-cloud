@@ -170,6 +170,7 @@ async fn test_working_copy_fails_without_user_identity() {
 }
 
 #[tokio::test]
+#[ignore = "needs jjfsd from the jj-vfs repo and FUSE; run with JJFSD_BIN=/path/to/jjfsd cargo test -p cli --test test_working_copy test_vfs_commit_cloud_working_copy_succeeds -- --ignored"]
 async fn test_vfs_commit_cloud_working_copy_succeeds() {
     // Initialize a real Commit Cloud repository with jj-cc-server
     let ws = testutils::TestWorkspace::init().await;
