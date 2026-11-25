@@ -204,7 +204,9 @@ impl GitImporter {
 
             while let Some(tree_oid) = tree_stack.pop() {
                 if let Ok(tree_obj) = repo.find_object(tree_oid) {
-                    if let Ok(tree_ref) = gix::objs::TreeRef::from_bytes(&tree_obj.data) {
+                    if let Ok(tree_ref) =
+                        gix::objs::TreeRef::from_bytes(&tree_obj.data, repo.object_hash())
+                    {
                         for entry in tree_ref.entries {
                             if entry.mode.is_tree() {
                                 tree_stack.push(entry.oid.to_owned());
@@ -404,16 +406,26 @@ impl GitImporter {
             let commit_ref = object.to_commit_ref();
 
             let tree_oid = commit_ref.tree();
-            let author_sig = commit_ref.author();
-            let committer_sig = commit_ref.committer();
+            let author_sig = commit_ref
+                .author()
+                .map_err(|e| format!("commit {commit_oid}: invalid author: {e}"))?;
+            let committer_sig = commit_ref
+                .committer()
+                .map_err(|e| format!("commit {commit_oid}: invalid committer: {e}"))?;
+            let author_time = author_sig
+                .time()
+                .map_err(|e| format!("commit {commit_oid}: invalid author time: {e}"))?;
+            let committer_time = committer_sig
+                .time()
+                .map_err(|e| format!("commit {commit_oid}: invalid committer time: {e}"))?;
 
             let parent_ids: Vec<Vec<u8>> =
                 commit_ref.parents().map(|p| p.as_bytes().to_vec()).collect();
 
-            let author_time_millis = author_sig.time.seconds * 1000;
-            let author_tz_offset = author_sig.time.offset / 60;
-            let committer_time_millis = committer_sig.time.seconds * 1000;
-            let committer_tz_offset = committer_sig.time.offset / 60;
+            let author_time_millis = author_time.seconds * 1000;
+            let author_tz_offset = author_time.offset / 60;
+            let committer_time_millis = committer_time.seconds * 1000;
+            let committer_tz_offset = committer_time.offset / 60;
 
             (
                 tree_oid,
@@ -512,7 +524,7 @@ impl GitImporter {
         let raw_entries = {
             let repo = thread_safe_repo.to_thread_local();
             let tree_obj = repo.find_object(tree_oid)?;
-            let tree_ref = gix::objs::TreeRef::from_bytes(&tree_obj.data)
+            let tree_ref = gix::objs::TreeRef::from_bytes(&tree_obj.data, repo.object_hash())
                 .map_err(|e| format!("Failed to parse tree: {e}"))?;
 
             let mut raw = Vec::new();

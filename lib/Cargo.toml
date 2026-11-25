@@ -14,7 +14,7 @@ tonic = { version = "0.12.3", features = ["tls", "tls-webpki-roots"] }
 tokio = { version = "1.39", features = ["rt", "rt-multi-thread", "net", "process", "time", "sync", "io-util"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
-gix = "0.68.0"
+gix = "0.85.0"
 tower = "0.4"
 hyper-util = { version = "0.1", features = ["tokio"] }
 
