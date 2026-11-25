@@ -50,10 +50,6 @@ pub fn find_daemon_binary() -> Result<PathBuf, Box<dyn std::error::Error + Send 
             }
         }
     }
-    let fallback = PathBuf::from("/usr/local/google/home/srachaba/Projects/jj-commit-cloud-poc/target/debug/jj-cc-daemon");
-    if fallback.exists() {
-        return Ok(fallback);
-    }
     Err("Could not locate 'jj-cc-daemon' binary. Ensure it is built and in PATH.".into())
 }
 
