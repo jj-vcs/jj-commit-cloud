@@ -64,7 +64,7 @@ fn test_server_fails_when_database_parent_path_is_not_a_directory() {
         expected_io_err
     );
 
-    let mut cmd = assert_cmd::Command::cargo_bin("jj-cc-server").unwrap();
+    let mut cmd = assert_cmd::Command::new(testutils::find_server_bin());
     cmd.args([
         "--port=0",
         "--store-type=sqlite",
@@ -92,7 +92,7 @@ fn test_server_fails_when_sqlite_database_file_permission_denied() {
         expected_rusqlite_err
     );
 
-    let mut cmd = assert_cmd::Command::cargo_bin("jj-cc-server").unwrap();
+    let mut cmd = assert_cmd::Command::new(testutils::find_server_bin());
     cmd.args([
         "--port=0",
         "--store-type=sqlite",
@@ -118,7 +118,7 @@ fn test_server_fails_when_home_directory_is_unwritable_for_default_sqlite_path()
         expected_io_err
     );
 
-    let mut cmd = assert_cmd::Command::cargo_bin("jj-cc-server").unwrap();
+    let mut cmd = assert_cmd::Command::new(testutils::find_server_bin());
     cmd.env("HOME", blocker_file.to_str().unwrap());
     cmd.args(["--port=0", "--store-type=sqlite"]);
 
