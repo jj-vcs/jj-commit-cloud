@@ -248,22 +248,28 @@ impl Drop for VfsMountGuard {
     }
 }
 
+/// Locates the `jjfsd` FUSE daemon, which is built from the separate jj-vfs
+/// repository and is not part of this workspace.
 fn find_jjfsd_bin() -> std::path::PathBuf {
+    if let Some(path) = std::env::var_os("JJFSD_BIN") {
+        return std::path::PathBuf::from(path);
+    }
+    let exe_name = format!("jjfsd{}", std::env::consts::EXE_SUFFIX);
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join(&exe_name);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
     let current_exe = std::env::current_exe().unwrap_or_default();
     let target_dir = current_exe
         .parent()
         .unwrap_or(std::path::Path::new(""))
         .parent()
         .unwrap_or(std::path::Path::new(""));
-    let direct = target_dir.join("jjfsd");
-    if direct.exists() {
-        return direct;
-    }
-    let poc_vfs = std::path::PathBuf::from("/usr/local/google/home/srachaba/Projects/jj-vfs-poc/target/debug/jjfsd");
-    if poc_vfs.exists() {
-        return poc_vfs;
-    }
-    direct
+    target_dir.join(exe_name)
 }
 
 pub async fn spawn_vfs_mount(workspace_path: &std::path::Path) -> VfsMountGuard {
