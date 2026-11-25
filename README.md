@@ -104,6 +104,7 @@ jj log
 * **[System Design](docs/design.md):** End-to-end architecture, how independent projects and shared repository pools work, pluggable `jj_lib` storage backends, life of a command, client workflows, and future directions.
 * **[Data Model and Storage Layout](docs/data-model.md):** Domain entities (projects, repositories, operations, views, workspaces, commits, trees, and blobs), canonical hashing, comparison with local Git storage, and database schemas.
 * **[Cloud Spanner and Cloud Storage Architecture](docs/spanner-and-gcs-design.md):** Separating graph metadata from file byte streams, Spanner table layout, lock-free operation-head concurrency, and cross-region replication-lag recovery.
+* **[Running the Server on Cloud Spanner](docs/spanner.md):** Build jj-cc-server and the jj CLI from a clean clone, create a Cloud Spanner database (or use the Spanner emulator), start the server, and check that two workspaces share one repository and that concurrent writers are serialized, with the expected output of every step.
 * **[Contributing](docs/contributing.md):** Contribution workflow and Contributor License Agreement (CLA) details.
 
 ## License
