@@ -36,7 +36,7 @@ pub async fn spawn_server() -> ServerGuard {
     spawn_server_with_args(&[]).await
 }
 
-fn find_server_bin() -> std::path::PathBuf {
+pub fn find_server_bin() -> std::path::PathBuf {
     if let Some(path) = option_env!("JJ_CC_SERVER_BIN") {
         return std::path::PathBuf::from(path);
     }
@@ -44,13 +44,9 @@ fn find_server_bin() -> std::path::PathBuf {
     let target_dir = current_exe
         .parent().expect("The deps directory should exist")
         .parent().expect("The target profile directory should exist");
-    let direct = target_dir.join("jj-cc-server");
+    let direct = target_dir.join(format!("jj-cc-server{}", std::env::consts::EXE_SUFFIX));
     if direct.exists() {
         return direct;
-    }
-    let poc_server = target_dir.parent().unwrap().join("jj-commit-cloud-poc/target/debug/jj-cc-server");
-    if poc_server.exists() {
-        return poc_server;
     }
     direct
 }
@@ -61,17 +57,9 @@ fn find_jj_cmd() -> assert_cmd::Command {
     }
     let current_exe = std::env::current_exe().unwrap();
     let target_dir = current_exe.parent().unwrap().parent().unwrap();
-    let direct = target_dir.join("jj");
+    let direct = target_dir.join(format!("jj{}", std::env::consts::EXE_SUFFIX));
     if direct.exists() {
         return assert_cmd::Command::new(direct);
-    }
-    let poc_jj = target_dir.parent().unwrap().join("jj-commit-cloud-poc/target/debug/jj");
-    if poc_jj.exists() {
-        return assert_cmd::Command::new(poc_jj);
-    }
-    let fallback = std::path::PathBuf::from("/usr/local/google/home/srachaba/Projects/jj-commit-cloud-poc/target/debug/jj");
-    if fallback.exists() {
-        return assert_cmd::Command::new(fallback);
     }
     assert_cmd::Command::cargo_bin("jj").expect("The jj CLI binary should have compiled")
 }
@@ -260,22 +248,28 @@ impl Drop for VfsMountGuard {
     }
 }
 
+/// Locates the `jjfsd` FUSE daemon, which is built from the separate jj-vfs
+/// repository and is not part of this workspace.
 fn find_jjfsd_bin() -> std::path::PathBuf {
+    if let Some(path) = std::env::var_os("JJFSD_BIN") {
+        return std::path::PathBuf::from(path);
+    }
+    let exe_name = format!("jjfsd{}", std::env::consts::EXE_SUFFIX);
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join(&exe_name);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
     let current_exe = std::env::current_exe().unwrap_or_default();
     let target_dir = current_exe
         .parent()
         .unwrap_or(std::path::Path::new(""))
         .parent()
         .unwrap_or(std::path::Path::new(""));
-    let direct = target_dir.join("jjfsd");
-    if direct.exists() {
-        return direct;
-    }
-    let poc_vfs = std::path::PathBuf::from("/usr/local/google/home/srachaba/Projects/jj-vfs-poc/target/debug/jjfsd");
-    if poc_vfs.exists() {
-        return poc_vfs;
-    }
-    direct
+    target_dir.join(exe_name)
 }
 
 pub async fn spawn_vfs_mount(workspace_path: &std::path::Path) -> VfsMountGuard {
@@ -313,13 +307,9 @@ fn find_daemon_bin() -> std::path::PathBuf {
     let target_dir = current_exe
         .parent().expect("The deps directory should exist")
         .parent().expect("The target profile directory should exist");
-    let direct = target_dir.join("jj-cc-daemon");
+    let direct = target_dir.join(format!("jj-cc-daemon{}", std::env::consts::EXE_SUFFIX));
     if direct.exists() {
         return direct;
-    }
-    let poc_daemon = target_dir.parent().unwrap().join("jj-commit-cloud-poc/target/debug/jj-cc-daemon");
-    if poc_daemon.exists() {
-        return poc_daemon;
     }
     direct
 }
