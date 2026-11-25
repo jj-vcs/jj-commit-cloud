@@ -12,11 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Cloud Spanner implementation of the server `Store`.
+//!
+//! Concurrency and merge invariants: every op-head update reads the repository's
+//! `op_heads` rows, checks them, and writes the new head in one read-write
+//! transaction. Spanner locks the rows a read-write transaction reads, so two
+//! updates that read the same heads cannot both commit: one is aborted, the
+//! transaction runner retries it, and the retry sees the winner's head and fails
+//! its check with `StoreError::CasConflict` (gRPC `Aborted`).
+
 use async_trait::async_trait;
 use cc_common::backend::*;
 use cc_common::op_store::*;
 use cc_common::workspace::WorkspaceState;
 use google_cloud_spanner::client::{DatabaseClient, Spanner};
+use google_cloud_spanner::transaction::ReadWriteTransaction;
 use google_cloud_spanner::key::{Key, KeySet};
 use google_cloud_spanner::mutation::Mutation;
 use google_cloud_spanner::statement::Statement;
@@ -86,6 +96,97 @@ impl SpannerStore {
             db_client: Arc::new(db_client),
         })
     }
+}
+
+
+/// Decides from the current op heads whether an op-head update may go ahead.
+type OpHeadsCheck = Arc<dyn Fn(&[Vec<u8>]) -> StoreResult<()> + Send + Sync>;
+
+impl SpannerStore {
+    /// Reads the op heads, checks them, and replaces `remove` with `add` in one
+    /// read-write transaction. See the module docs for why this is race-free.
+    async fn swap_op_heads(
+        &self,
+        repo_id: String,
+        remove: Vec<Vec<u8>>,
+        add: Vec<u8>,
+        check: OpHeadsCheck,
+    ) -> StoreResult<Vec<Vec<u8>>> {
+        // The transaction runner's future is not `Send`, which `async_trait` requires,
+        // so drive it to completion on a blocking thread.
+        let db_client = self.db_client.clone();
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            handle.block_on(swap_op_heads_in_transaction(
+                db_client, repo_id, remove, add, check,
+            ))
+        })
+        .await
+        .map_err(|e| StoreError::Task(e.to_string()))?
+    }
+}
+
+async fn swap_op_heads_in_transaction(
+    db_client: Arc<DatabaseClient>,
+    repo_id: String,
+    remove: Vec<Vec<u8>>,
+    add: Vec<u8>,
+    check: OpHeadsCheck,
+) -> StoreResult<Vec<Vec<u8>>> {
+    let runner = db_client
+        .read_write_transaction()
+        .build()
+        .await
+        .map_err(|e| StoreError::Write(e.to_string()))?;
+    let outcome = runner
+        .run(move |tx: ReadWriteTransaction| {
+            let (repo_id, remove, add, check) =
+                (repo_id.clone(), remove.clone(), add.clone(), check.clone());
+            async move {
+                let stmt =
+                    Statement::builder("SELECT op_id FROM op_heads WHERE repo_id = @repo_id")
+                        .add_param("repo_id", &repo_id)
+                        .build();
+                let mut rs = tx.execute_query(stmt).await?;
+                let mut current = Vec::new();
+                while let Some(row) = rs.next().await {
+                    let op_id: Vec<u8> = row?.get("op_id");
+                    current.push(op_id);
+                }
+                if current.is_empty() {
+                    current.push(cc_common::ROOT_OPERATION_ID_BYTES.to_vec());
+                }
+                // A rejected check commits nothing; the outer `Ok` keeps the runner
+                // from treating it as a transaction failure.
+                if let Err(e) = check(&current) {
+                    return Ok(Err(e));
+                }
+
+                let mut mutations = Vec::new();
+                for old in &remove {
+                    let key = Key::new(vec![repo_id.clone().into(), old.clone().into()]);
+                    let key_set = KeySet::builder().add_key(key).build();
+                    mutations.push(Mutation::delete("op_heads", key_set));
+                }
+                mutations.push(
+                    Mutation::new_insert_or_update_builder("op_heads")
+                        .set("repo_id")
+                        .to(&repo_id)
+                        .set("op_id")
+                        .to(&add)
+                        .build(),
+                );
+                tx.buffer(mutations)?;
+
+                let root = cc_common::ROOT_OPERATION_ID_BYTES.as_slice();
+                current.retain(|id| !remove.contains(id) && *id != add && id.as_slice() != root);
+                current.push(add.clone());
+                Ok(Ok(current))
+            }
+        })
+        .await
+        .map_err(|e| StoreError::Write(e.to_string()))?;
+    outcome.result
 }
 
 #[async_trait]
@@ -477,73 +578,23 @@ impl Store for SpannerStore {
         ids_to_remove: &[Vec<u8>],
         id_to_add: Vec<u8>,
     ) -> StoreResult<Vec<Vec<u8>>> {
-        let stmt = Statement::builder("SELECT op_id FROM op_heads WHERE repo_id = @repo_id")
-            .add_param("repo_id", &repo_id)
-            .build();
-        let tx = self.db_client.single_use().build();
-        let mut rs = tx
-            .execute_query(stmt)
-            .await
-            .map_err(|e| StoreError::Read(e.to_string()))?;
-        let mut current_heads = Vec::new();
-        while let Some(row_res) = rs.next().await {
-            let row = row_res.map_err(|e| StoreError::Read(e.to_string()))?;
-            let op_id: Vec<u8> = row.get("op_id");
-            current_heads.push(op_id);
-        }
-        if current_heads.is_empty() {
-            current_heads.push(cc_common::ROOT_OPERATION_ID_BYTES.to_vec());
-        }
-
-        if !ids_to_remove.is_empty() {
-            for old in ids_to_remove {
-                if !current_heads.contains(old) {
+        let ids_to_remove = ids_to_remove.to_vec();
+        let check_repo_id = repo_id.clone();
+        let check_ids = ids_to_remove.clone();
+        let check: OpHeadsCheck = Arc::new(move |current: &[Vec<u8>]| {
+            for old in &check_ids {
+                if !current.contains(old) {
                     return Err(StoreError::CasConflict(format!(
                         "write race detected on stale old_op_head_ids: head {} no longer active in repo {}",
                         hex::encode(old),
-                        repo_id
+                        check_repo_id
                     )));
                 }
             }
-        }
-
-        let mut mutations = Vec::new();
-        for old in ids_to_remove {
-            let key = Key::new(vec![repo_id.clone().into(), old.clone().into()]);
-            let key_set = KeySet::builder().add_key(key).build();
-            mutations.push(Mutation::delete("op_heads", key_set));
-        }
-        mutations.push(
-            Mutation::new_insert_or_update_builder("op_heads")
-                .set("repo_id")
-                .to(&repo_id)
-                .set("op_id")
-                .to(&id_to_add)
-                .build(),
-        );
-
-        self.db_client
-            .write_only_transaction()
-            .build()
-            .write(mutations)
+            Ok(())
+        });
+        self.swap_op_heads(repo_id, ids_to_remove, id_to_add, check)
             .await
-            .map_err(|e| StoreError::Write(e.to_string()))?;
-
-        let stmt = Statement::builder("SELECT op_id FROM op_heads WHERE repo_id = @repo_id")
-            .add_param("repo_id", &repo_id)
-            .build();
-        let tx = self.db_client.single_use().build();
-        let mut rs = tx
-            .execute_query(stmt)
-            .await
-            .map_err(|e| StoreError::Read(e.to_string()))?;
-        let mut result = Vec::new();
-        while let Some(row_res) = rs.next().await {
-            let row = row_res.map_err(|e| StoreError::Read(e.to_string()))?;
-            let op_id: Vec<u8> = row.get("op_id");
-            result.push(op_id);
-        }
-        Ok(result)
     }
 
     async fn update_op_heads_compare_and_swap(
@@ -552,56 +603,19 @@ impl Store for SpannerStore {
         expected_exact_heads: &[Vec<u8>],
         new_id: Vec<u8>,
     ) -> StoreResult<Vec<Vec<u8>>> {
-        let stmt = Statement::builder("SELECT op_id FROM op_heads WHERE repo_id = @repo_id")
-            .add_param("repo_id", &repo_id)
-            .build();
-        let tx = self.db_client.single_use().build();
-        let mut rs = tx
-            .execute_query(stmt)
-            .await
-            .map_err(|e| StoreError::Read(e.to_string()))?;
-        let mut current_heads = Vec::new();
-        while let Some(row_res) = rs.next().await {
-            let row = row_res.map_err(|e| StoreError::Read(e.to_string()))?;
-            let op_id: Vec<u8> = row.get("op_id");
-            current_heads.push(op_id);
-        }
-        if current_heads.is_empty() {
-            current_heads.push(cc_common::ROOT_OPERATION_ID_BYTES.to_vec());
-        }
-
-        let current_set: HashSet<Vec<u8>> = current_heads.into_iter().collect();
         let expected_set: HashSet<Vec<u8>> = expected_exact_heads.iter().cloned().collect();
-
-        if current_set != expected_set {
-            return Err(StoreError::CasConflict(format!(
-                "reconciliation CAS conflict for repo {repo_id}: expected heads {expected_set:?}, found {current_set:?}"
-            )));
-        }
-
-        let mut mutations = Vec::new();
-        for old in expected_exact_heads {
-            let key = Key::new(vec![repo_id.clone().into(), old.clone().into()]);
-            let key_set = KeySet::builder().add_key(key).build();
-            mutations.push(Mutation::delete("op_heads", key_set));
-        }
-        mutations.push(
-            Mutation::new_insert_or_update_builder("op_heads")
-                .set("repo_id")
-                .to(&repo_id)
-                .set("op_id")
-                .to(&new_id)
-                .build(),
-        );
-
-        self.db_client
-            .write_only_transaction()
-            .build()
-            .write(mutations)
+        let check_repo_id = repo_id.clone();
+        let check: OpHeadsCheck = Arc::new(move |current: &[Vec<u8>]| {
+            let current_set: HashSet<Vec<u8>> = current.iter().cloned().collect();
+            if current_set != expected_set {
+                return Err(StoreError::CasConflict(format!(
+                    "reconciliation CAS conflict for repo {check_repo_id}: expected heads {expected_set:?}, found {current_set:?}"
+                )));
+            }
+            Ok(())
+        });
+        self.swap_op_heads(repo_id, expected_exact_heads.to_vec(), new_id, check)
             .await
-            .map_err(|e| StoreError::Write(e.to_string()))?;
-
-        Ok(vec![new_id])
     }
 
     async fn get_workspace(
