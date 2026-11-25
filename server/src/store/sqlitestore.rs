@@ -504,6 +504,11 @@ impl Store for SqliteStore {
 
             if !ids_to_remove.is_empty() {
                 for old in &ids_to_remove {
+                    // A workspace joining an existing repo starts from the root op;
+                    // let it fork and leave the merge to reconcile.
+                    if old.as_slice() == cc_common::ROOT_OPERATION_ID_BYTES.as_slice() {
+                        continue;
+                    }
                     if !current_heads.contains(old) {
                         return Err(StoreError::CasConflict(format!(
                             "write race detected on stale old_op_head_ids: head {} no longer active in repo {}",
