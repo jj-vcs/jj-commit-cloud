@@ -55,25 +55,35 @@ async fn test_sqlite_concurrent_write_race_fails_on_stale_old_heads() {
         .await
         .unwrap();
 
-    let root_head = cc_common::ROOT_OPERATION_ID_BYTES.to_vec();
+    // Start from a non-root head: a root-op parent is allowed to fork (a new
+    // workspace joining the repository), so it cannot be stale.
+    let base_head = vec![0x10; 20];
+    op_client_1
+        .update_op_heads(UpdateOpHeadsRequest {
+            repo_id: repo_id.clone(),
+            old_op_head_ids: vec![cc_common::ROOT_OPERATION_ID_BYTES.to_vec()],
+            new_op_head_id: base_head.clone(),
+        })
+        .await
+        .unwrap();
 
-    // Client 1 advances root -> op_1
+    // Client 1 advances base -> op_1
     let op_1 = vec![0x11; 20];
     op_client_1
         .update_op_heads(UpdateOpHeadsRequest {
             repo_id: repo_id.clone(),
-            old_op_head_ids: vec![root_head.clone()],
+            old_op_head_ids: vec![base_head.clone()],
             new_op_head_id: op_1.clone(),
         })
         .await
         .unwrap();
 
-    // Client 2 tries to update using stale root_head
+    // Client 2 tries to update using stale base_head
     let op_2 = vec![0x22; 20];
     let result = op_client_2
         .update_op_heads(UpdateOpHeadsRequest {
             repo_id: repo_id.clone(),
-            old_op_head_ids: vec![root_head.clone()],
+            old_op_head_ids: vec![base_head.clone()],
             new_op_head_id: op_2.clone(),
         })
         .await;

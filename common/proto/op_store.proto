@@ -35,6 +35,13 @@ service OpStoreService {
   // RPCs for reading and updating active operation heads
   // OpHeads track the latest operations in the graph, used to find current state or resolve branch conflicts
   rpc GetOpHeads (GetOpHeadsRequest) returns (GetOpHeadsResponse);
+  // UpdateOpHeads removes old_op_head_ids from the heads and adds new_op_head_id,
+  // atomically. Every old id must still be a head, or the call fails with ABORTED
+  // and changes nothing: of two writers that expect the same head, one wins. The
+  // root operation is the exception: a new workspace joining a repository that
+  // already has operations starts from it, so its first operation is added as a
+  // second head, and ReconcileOpHeads merges the fork (the jj client calls it
+  // whenever it loads the repository).
   rpc UpdateOpHeads (UpdateOpHeadsRequest) returns (UpdateOpHeadsResponse);
   rpc ReconcileOpHeads (ReconcileOpHeadsRequest) returns (ReconcileOpHeadsResponse);
 }

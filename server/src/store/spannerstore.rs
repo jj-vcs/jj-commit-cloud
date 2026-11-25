@@ -583,6 +583,11 @@ impl Store for SpannerStore {
         let check_ids = ids_to_remove.clone();
         let check: OpHeadsCheck = Arc::new(move |current: &[Vec<u8>]| {
             for old in &check_ids {
+                // A workspace joining an existing repo starts from the root op;
+                // let it fork and leave the merge to reconcile.
+                if old.as_slice() == cc_common::ROOT_OPERATION_ID_BYTES.as_slice() {
+                    continue;
+                }
                 if !current.contains(old) {
                     return Err(StoreError::CasConflict(format!(
                         "write race detected on stale old_op_head_ids: head {} no longer active in repo {}",
