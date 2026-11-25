@@ -36,12 +36,15 @@ pub async fn spawn_server() -> ServerGuard {
     spawn_server_with_args(&[]).await
 }
 
-fn find_server_bin() -> std::path::PathBuf {
+pub fn find_server_bin() -> std::path::PathBuf {
+    if let Some(path) = option_env!("JJ_CC_SERVER_BIN") {
+        return std::path::PathBuf::from(path);
+    }
     let current_exe = std::env::current_exe().expect("The current test executable path should be retrievable");
     let target_dir = current_exe
         .parent().expect("The deps directory should exist")
         .parent().expect("The target profile directory should exist");
-    let direct = target_dir.join("jj-cc-server");
+    let direct = target_dir.join(format!("jj-cc-server{}", std::env::consts::EXE_SUFFIX));
     if direct.exists() {
         return direct;
     }
@@ -58,7 +61,7 @@ fn find_jj_cmd() -> assert_cmd::Command {
     }
     let current_exe = std::env::current_exe().unwrap();
     let target_dir = current_exe.parent().unwrap().parent().unwrap();
-    let direct = target_dir.join("jj");
+    let direct = target_dir.join(format!("jj{}", std::env::consts::EXE_SUFFIX));
     if direct.exists() {
         return assert_cmd::Command::new(direct);
     }
@@ -310,7 +313,7 @@ fn find_daemon_bin() -> std::path::PathBuf {
     let target_dir = current_exe
         .parent().expect("The deps directory should exist")
         .parent().expect("The target profile directory should exist");
-    let direct = target_dir.join("jj-cc-daemon");
+    let direct = target_dir.join(format!("jj-cc-daemon{}", std::env::consts::EXE_SUFFIX));
     if direct.exists() {
         return direct;
     }
