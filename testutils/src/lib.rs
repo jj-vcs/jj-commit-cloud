@@ -1,3 +1,17 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -36,6 +50,10 @@ pub async fn spawn_server() -> ServerGuard {
     spawn_server_with_args(&[]).await
 }
 
+pub fn server_binary_path() -> std::path::PathBuf {
+    find_server_bin()
+}
+
 pub fn find_server_bin() -> std::path::PathBuf {
     if let Some(path) = option_env!("JJ_CC_SERVER_BIN") {
         return std::path::PathBuf::from(path);
@@ -67,16 +85,33 @@ fn find_jj_cmd() -> assert_cmd::Command {
     assert_cmd::Command::cargo_bin("jj").expect("The jj CLI binary should have compiled")
 }
 
+pub const SANITIZED_SERVER_ENV_VARS: &[&str] = &[
+    "JJ_CC_SERVER_AUTH_TOKEN",
+    "JJ_CC_SERVER_AUTH_TOKEN_FILE",
+    "JJ_CC_ALLOW_UNAUTHENTICATED",
+];
+
 pub async fn spawn_server_with_args(extra_args: &[&str]) -> ServerGuard {
+    spawn_server_with_env(&[], extra_args).await
+}
+
+pub async fn spawn_server_with_env(env_vars: &[(&str, &str)], extra_args: &[&str]) -> ServerGuard {
     let server_binary_path = find_server_bin();
 
     let mut cmd = Command::new(server_binary_path);
     cmd.arg("--port=0");
+    for var in SANITIZED_SERVER_ENV_VARS {
+        cmd.env_remove(var);
+    }
+    for (k, v) in env_vars {
+        cmd.env(k, v);
+    }
     for arg in extra_args {
         cmd.arg(arg);
     }
 
     let mut child = cmd
+        .kill_on_drop(true)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -89,10 +124,7 @@ pub async fn spawn_server_with_args(extra_args: &[&str]) -> ServerGuard {
 
     let mut reader = BufReader::new(stdout).lines();
 
-    // Timeout of 2 seconds to find the listening address in stdout.
-    // 2 seconds is arbitrary but serves as a safe defensive timeout to prevent
-    // the test from hanging indefinitely if the server hangs.
-    let timeout = tokio::time::sleep(Duration::from_secs(2));
+    let timeout = tokio::time::sleep(Duration::from_secs(10));
     tokio::pin!(timeout);
 
     let server_addr = loop {
@@ -113,6 +145,9 @@ pub async fn spawn_server_with_args(extra_args: &[&str]) -> ServerGuard {
             }
         }
     };
+
+    // Keep draining stdout in the background so the child process never blocks on a full pipe.
+    tokio::spawn(async move { while let Ok(Some(_)) = reader.next_line().await {} });
 
     let url = format!("http://{}", server_addr);
 

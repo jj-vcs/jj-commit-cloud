@@ -27,6 +27,8 @@ jj-lib = "0.43.0"
 futures = "0.3"
 rand = "0.8"
 pollster = "0.3"
+sha2 = "0.10"
+subtle = "2.6"
 
 [dev-dependencies]
 assert_cmd = "2.0"

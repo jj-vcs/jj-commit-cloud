@@ -1,7 +1,30 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Entrypoint for `jj-cc-server`, wiring gRPC `BackendService`, `OpStoreService`,
+//! `WorkspaceService`, and `tonic_health` with optional constant-time Bearer token
+//! authentication.
+//!
+//! # Cross-Process and RPC Boundaries
+//! Wraps `BackendService`, `OpStoreService`, and `WorkspaceService` in
+//! [`BearerAuthInterceptor`] while leaving `tonic_health` open for unauthenticated
+//! liveness/readiness probes, and refuses to bind non-loopback `--host` interfaces without
+//! authentication unless `--allow-unauthenticated` is explicitly enabled.
+
 #![allow(clippy::result_large_err)]
 
 use clap::{Parser, ValueEnum};
-use std::net::SocketAddr;
 use std::sync::Arc;
 use tonic::transport::Server;
 use tracing::{info, warn};
@@ -11,6 +34,7 @@ use cc_common::backend::backend_service_server::BackendServiceServer;
 use cc_common::op_store::op_store_service_server::OpStoreServiceServer;
 use cc_common::workspace::workspace_service_server::WorkspaceServiceServer;
 
+pub mod auth;
 mod backend;
 pub mod error_util;
 mod hash_utils;
@@ -20,6 +44,7 @@ pub mod reconcile_op_heads;
 pub mod store;
 mod workspace;
 
+use auth::{BearerAuthInterceptor, load_tokens_from_file, resolve_listen_addrs, scrub_tokens};
 use backend::CommitCloudBackendService;
 use op_store::CommitCloudOpStoreService;
 use store::{MemoryStore, Store};
@@ -33,7 +58,7 @@ enum StoreType {
     Spanner,
 }
 
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 #[command(name = "jj-cc-server", about = "Jujutsu Commit Cloud Server")]
 struct Args {
     /// Host interface to bind to
@@ -55,6 +80,26 @@ struct Args {
     /// Spanner database resource path (e.g. projects/<project>/instances/<instance>/databases/<db>)
     #[arg(long, env = "SPANNER_DATABASE")]
     spanner_db: Option<String>,
+
+    /// Comma-separated graphic-ASCII Bearer token(s) required on gRPC requests (prefer
+    /// `--auth-token-file` on shared hosts where CLI arguments appear in process listings)
+    #[arg(
+        long = "auth-token",
+        env = "JJ_CC_SERVER_AUTH_TOKEN",
+        value_delimiter = ',',
+        hide_env_values = true
+    )]
+    auth_tokens: Vec<String>,
+
+    /// Path to a UTF-8 file containing newline- or comma-separated graphic-ASCII Bearer
+    /// token(s) (whitespace-delimited `#` comments and blank lines are ignored)
+    #[arg(long = "auth-token-file", env = "JJ_CC_SERVER_AUTH_TOKEN_FILE")]
+    auth_token_file: Option<std::path::PathBuf>,
+
+    /// Allow binding to a non-loopback `--host` without Bearer authentication (for example
+    /// behind Cloud Run IAM, Identity-Aware Proxy, or an isolated container network)
+    #[arg(long, env = "JJ_CC_ALLOW_UNAUTHENTICATED")]
+    allow_unauthenticated: bool,
 }
 
 pub struct CommitCloudServerImpl {
@@ -100,19 +145,19 @@ pub fn resolve_sqlite_path(
     custom_path: Option<std::path::PathBuf>,
 ) -> Result<std::path::PathBuf, std::io::Error> {
     if let Some(path) = custom_path {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    std::io::Error::new(
-                        e.kind(),
-                        format!(
-                            "Failed to create parent directory '{}' for SQLite database: {}",
-                            parent.display(),
-                            e
-                        ),
-                    )
-                })?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "Failed to create parent directory '{}' for SQLite database: {}",
+                        parent.display(),
+                        e
+                    ),
+                )
+            })?;
         }
         Ok(path)
     } else {
@@ -137,7 +182,51 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let args = Args::parse();
+    let mut args = Args::parse();
+
+    let mut combined_tokens = std::mem::take(&mut args.auth_tokens);
+    if let Some(token_file) = &args.auth_token_file {
+        match load_tokens_from_file(token_file) {
+            Ok(file_tokens) => combined_tokens.extend(file_tokens),
+            Err(err) => {
+                scrub_tokens(&mut combined_tokens);
+                return Err(err.into());
+            }
+        }
+    }
+    let has_combined_tokens = !combined_tokens.is_empty();
+    let auth_res = BearerAuthInterceptor::try_from_tokens(&combined_tokens);
+    scrub_tokens(&mut combined_tokens);
+    drop(combined_tokens);
+    let auth = auth_res?;
+
+    let cli_auth_flag = std::env::args_os().any(|a| {
+        let s = a.to_string_lossy();
+        s == "--auth-token" || s.starts_with("--auth-token=")
+    });
+    let auth_requested = has_combined_tokens
+        || cli_auth_flag
+        || args.auth_token_file.is_some()
+        || std::env::var_os("JJ_CC_SERVER_AUTH_TOKEN").is_some();
+    if auth_requested && !auth.is_enabled() {
+        return Err(
+            "--auth-token (or JJ_CC_SERVER_AUTH_TOKEN) is set but contains no non-empty token; unset it to run without authentication"
+                .into(),
+        );
+    }
+    let listen_addrs = resolve_listen_addrs(
+        &args.host,
+        args.port,
+        auth.is_enabled(),
+        args.allow_unauthenticated,
+    )
+    .await?;
+    if auth.is_enabled() {
+        info!("Bearer token authentication enabled for gRPC services");
+    } else {
+        warn!("Bearer token authentication disabled: gRPC services accept any caller");
+    }
+
     let store: Arc<dyn Store> = match args.store_type {
         StoreType::Memory => Arc::new(MemoryStore::default()),
         StoreType::Sqlite => {
@@ -160,30 +249,44 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
-
     let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter
         .set_service_status("", tonic_health::ServingStatus::Serving)
         .await;
     health_reporter
+        .set_serving::<BackendServiceServer<CommitCloudBackendService>>()
+        .await;
+    health_reporter
         .set_serving::<OpStoreServiceServer<CommitCloudOpStoreService>>()
         .await;
+    health_reporter
+        .set_serving::<WorkspaceServiceServer<CommitCloudWorkspaceService>>()
+        .await;
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = tokio::net::TcpListener::bind(listen_addrs.as_slice()).await?;
     let local_addr = listener.local_addr()?;
     info!("jj-cc-server listening on {}", local_addr);
 
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
     let backend_service = CommitCloudBackendService::new(store.clone());
     let op_store_service = CommitCloudOpStoreService::new(store.clone());
-    let workspace_service = CommitCloudWorkspaceService::new(store.clone());
+    let workspace_service = CommitCloudWorkspaceService::new(store);
 
     Server::builder()
+        .http2_max_header_list_size(64 * 1024)
         .add_service(health_service)
-        .add_service(BackendServiceServer::new(backend_service))
-        .add_service(OpStoreServiceServer::new(op_store_service))
-        .add_service(WorkspaceServiceServer::new(workspace_service))
+        .add_service(tonic::service::interceptor::InterceptedService::new(
+            BackendServiceServer::new(backend_service),
+            auth.clone(),
+        ))
+        .add_service(tonic::service::interceptor::InterceptedService::new(
+            OpStoreServiceServer::new(op_store_service),
+            auth.clone(),
+        ))
+        .add_service(tonic::service::interceptor::InterceptedService::new(
+            WorkspaceServiceServer::new(workspace_service),
+            auth,
+        ))
         .serve_with_incoming_shutdown(incoming, async {
             match tokio::signal::ctrl_c().await {
                 Ok(()) => {
@@ -225,7 +328,6 @@ mod tests {
     fn test_default_sqlite_path_failure_when_dir_creation_fails() {
         let temp_dir = tempdir().unwrap();
         let blocker_file = temp_dir.path().join(".jj-cc-server");
-        // Create a regular file where the directory should be, causing create_dir_all to fail
         std::fs::write(&blocker_file, "blocking file").unwrap();
 
         let result = get_default_sqlite_path_from_home(Some(temp_dir.path()));

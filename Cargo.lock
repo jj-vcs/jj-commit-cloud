@@ -3145,6 +3145,8 @@ dependencies = [
  "prost 0.13.5",
  "rand 0.8.6",
  "rusqlite",
+ "sha2 0.10.9",
+ "subtle",
  "tempfile",
  "testutils",
  "tokio",
