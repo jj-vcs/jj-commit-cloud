@@ -1,10 +1,10 @@
+use crate::util::CommitCloudConfig;
+use hyper_util::rt::TokioIo;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::net::UnixStream;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
-use hyper_util::rt::TokioIo;
-use crate::util::CommitCloudConfig;
 
 pub fn get_default_daemon_socket(server_url: &str) -> PathBuf {
     use std::collections::hash_map::DefaultHasher;
@@ -94,7 +94,11 @@ pub async fn spawn_daemon(
         tokio::time::sleep(Duration::from_millis(15)).await;
     }
 
-    Err(format!("Timed out waiting for daemon to start at {}", socket_path.display()).into())
+    Err(format!(
+        "Timed out waiting for daemon to start at {}",
+        socket_path.display()
+    )
+    .into())
 }
 
 pub async fn connect_channel(
@@ -137,21 +141,30 @@ pub async fn connect_channel(
 
 pub async fn connect_backend_client(
     config: &CommitCloudConfig,
-) -> Result<cc_common::backend::backend_service_client::BackendServiceClient<Channel>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<
+    cc_common::backend::backend_service_client::BackendServiceClient<Channel>,
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     let channel = connect_channel(config).await?;
     Ok(cc_common::backend::backend_service_client::BackendServiceClient::new(channel))
 }
 
 pub async fn connect_op_store_client(
     config: &CommitCloudConfig,
-) -> Result<cc_common::op_store::op_store_service_client::OpStoreServiceClient<Channel>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<
+    cc_common::op_store::op_store_service_client::OpStoreServiceClient<Channel>,
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     let channel = connect_channel(config).await?;
     Ok(cc_common::op_store::op_store_service_client::OpStoreServiceClient::new(channel))
 }
 
 pub async fn connect_workspace_client(
     config: &CommitCloudConfig,
-) -> Result<cc_common::workspace::workspace_service_client::WorkspaceServiceClient<Channel>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<
+    cc_common::workspace::workspace_service_client::WorkspaceServiceClient<Channel>,
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     let channel = connect_channel(config).await?;
     Ok(cc_common::workspace::workspace_service_client::WorkspaceServiceClient::new(channel))
 }

@@ -73,7 +73,11 @@ pub trait Store: Send + Sync {
         commit: Commit,
     ) -> StoreResult<()>;
 
-    async fn get_tree(&self, project_id: &str, tree_id: &[u8]) -> StoreResult<Option<Vec<TreeEntry>>>;
+    async fn get_tree(
+        &self,
+        project_id: &str,
+        tree_id: &[u8],
+    ) -> StoreResult<Option<Vec<TreeEntry>>>;
     async fn put_tree(
         &self,
         project_id: String,
@@ -90,7 +94,12 @@ pub trait Store: Send + Sync {
     ) -> StoreResult<()>;
 
     async fn get_operation(&self, repo_id: &str, op_id: &[u8]) -> StoreResult<Option<Operation>>;
-    async fn put_operation(&self, repo_id: String, op_id: Vec<u8>, op: Operation) -> StoreResult<()>;
+    async fn put_operation(
+        &self,
+        repo_id: String,
+        op_id: Vec<u8>,
+        op: Operation,
+    ) -> StoreResult<()>;
 
     async fn get_view(&self, repo_id: &str, view_id: &[u8]) -> StoreResult<Option<View>>;
     async fn put_view(&self, repo_id: String, view_id: Vec<u8>, view: View) -> StoreResult<()>;

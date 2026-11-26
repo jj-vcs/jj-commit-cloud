@@ -412,10 +412,7 @@ async fn test_rejects_merge_commit_with_root_commit_as_parent() {
     let invalid_merge = Commit {
         commit_id: vec![],
         change_id: ROOT_CHANGE_ID_BYTES.to_vec(),
-        parent_commit_ids: vec![
-            ROOT_COMMIT_ID_BYTES.to_vec(),
-            vec![1u8; 20],
-        ],
+        parent_commit_ids: vec![ROOT_COMMIT_ID_BYTES.to_vec(), vec![1u8; 20]],
         root_tree_id: vec![EMPTY_TREE_ID_BYTES.to_vec()],
         description: "invalid merge with root commit".to_string(),
         author: None,

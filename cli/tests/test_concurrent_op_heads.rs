@@ -3,12 +3,12 @@ use std::sync::Arc;
 use tempfile::NamedTempFile;
 use tokio::sync::Barrier;
 
-use cc_common::backend::backend_service_client::BackendServiceClient;
 use cc_common::backend::RegisterRepositoryRequest;
+use cc_common::backend::backend_service_client::BackendServiceClient;
 use cc_common::op_store::op_store_service_client::OpStoreServiceClient;
 use cc_common::op_store::{
-    GetOpHeadsRequest, Operation, OperationMetadata, ReadOperationRequest,
-    ReconcileOpHeadsRequest, UpdateOpHeadsRequest, WriteOperationRequest,
+    GetOpHeadsRequest, Operation, OperationMetadata, ReadOperationRequest, ReconcileOpHeadsRequest,
+    UpdateOpHeadsRequest, WriteOperationRequest,
 };
 use testutils::{spawn_server, spawn_sqlite_server};
 
@@ -27,7 +27,6 @@ async fn register_test_repo(server_url: &str) -> String {
         .expect("Failed to register repository");
     response.into_inner().repo_id
 }
-
 
 /// Verifies that write races on stale op heads fail with Status::Aborted on SQLite backend.
 #[tokio::test]
@@ -65,12 +64,14 @@ async fn test_sqlite_concurrent_write_race_fails_on_stale_old_heads() {
         })
         .await;
 
-    assert!(result.is_err(), "Expected SQLite stale op_heads update to fail with CAS conflict");
+    assert!(
+        result.is_err(),
+        "Expected SQLite stale op_heads update to fail with CAS conflict"
+    );
     let status = result.unwrap_err();
     assert_eq!(status.code(), tonic::Code::Aborted);
     assert!(status.message().contains("CAS conflict"));
 }
-
 
 /// Stress test: 20 concurrent tasks firing simultaneous UpdateOpHeads RPCs against SQLite backend.
 #[tokio::test]
@@ -105,7 +106,12 @@ async fn test_stress_concurrent_op_heads_writes_sqlite() {
                 })
                 .await;
 
-            assert!(response.is_ok(), "SQLite Worker {} update_op_heads failed: {:?}", worker_idx, response.err());
+            assert!(
+                response.is_ok(),
+                "SQLite Worker {} update_op_heads failed: {:?}",
+                worker_idx,
+                response.err()
+            );
             worker_op
         }));
     }
@@ -129,7 +135,11 @@ async fn test_stress_concurrent_op_heads_writes_sqlite() {
 
     let final_set: HashSet<Vec<u8>> = final_heads.into_iter().collect();
     for op in &inserted_ops {
-        assert!(final_set.contains(op), "Expected op head {:?} in SQLite", op);
+        assert!(
+            final_set.contains(op),
+            "Expected op head {:?} in SQLite",
+            op
+        );
     }
 }
 

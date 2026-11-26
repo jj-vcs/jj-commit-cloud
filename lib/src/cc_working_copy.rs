@@ -18,7 +18,7 @@ use jj_lib::working_copy::{
 };
 
 use crate::client::connect_workspace_client;
-use crate::util::{run_async, CommitCloudConfig};
+use crate::util::{CommitCloudConfig, run_async};
 
 pub struct CommitCloudWorkingCopy {
     inner: Box<dyn WorkingCopy>,
@@ -242,12 +242,11 @@ impl WorkingCopyFactory for CommitCloudWorkingCopyFactory {
             settings,
         )?;
 
-        let config = CommitCloudConfig::load_from_store(&state_path).map_err(|e| {
-            WorkingCopyStateError {
+        let config =
+            CommitCloudConfig::load_from_store(&state_path).map_err(|e| WorkingCopyStateError {
                 message: format!("Failed to load config: {}", e),
                 err: e,
-            }
-        })?;
+            })?;
 
         let ws_name = workspace_name.as_str().to_string();
         let op_id_bytes = operation_id.as_bytes().to_vec();
@@ -256,7 +255,9 @@ impl WorkingCopyFactory for CommitCloudWorkingCopyFactory {
             .ok()
             .and_then(|t| t.tree_ids().as_resolved().map(|id| id.as_bytes().to_vec()))
             .unwrap_or_default();
-        let commit_id_bytes = std::fs::read(state_path.join("commit_id")).ok().unwrap_or_default();
+        let commit_id_bytes = std::fs::read(state_path.join("commit_id"))
+            .ok()
+            .unwrap_or_default();
 
         let config_clone = config.clone();
         let repo_id = config.repo_id.clone();
@@ -299,12 +300,11 @@ impl WorkingCopyFactory for CommitCloudWorkingCopyFactory {
             settings,
         )?;
 
-        let config = CommitCloudConfig::load_from_store(&state_path).map_err(|e| {
-            WorkingCopyStateError {
+        let config =
+            CommitCloudConfig::load_from_store(&state_path).map_err(|e| WorkingCopyStateError {
                 message: format!("Failed to load config: {}", e),
                 err: e,
-            }
-        })?;
+            })?;
 
         Ok(Box::new(CommitCloudWorkingCopy::new(
             local_wc, config, state_path, user,

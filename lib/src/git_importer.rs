@@ -1,7 +1,7 @@
 use cc_common::backend::backend_service_client::BackendServiceClient;
 use cc_common::backend::{
-    tree_value, Commit, File, Signature, Timestamp, TreeEntry, TreeValue, WriteCommitRequest,
-    WriteFileRequest, WriteTreeRequest,
+    Commit, File, Signature, Timestamp, TreeEntry, TreeValue, WriteCommitRequest, WriteFileRequest,
+    WriteTreeRequest, tree_value,
 };
 use cc_common::op_store::op_store_service_client::OpStoreServiceClient;
 use cc_common::op_store::{
@@ -80,10 +80,16 @@ impl GitImporter {
                 repo_id: repo_id.clone(),
             }))
             .await
-            .map_err(|e| format!("Target repository '{}' is not registered on the server: {e}", repo_id))?;
+            .map_err(|e| {
+                format!(
+                    "Target repository '{}' is not registered on the server: {e}",
+                    repo_id
+                )
+            })?;
 
         // Ensure Jujutsu Root Commit exists on server in project CAS
-        self.write_root_commit(&mut backend_client, &project_id).await?;
+        self.write_root_commit(&mut backend_client, &project_id)
+            .await?;
 
         // Discover HEAD commit IDs and collect commits & blobs to upload
         let mut blob_map: HashMap<gix::hash::ObjectId, Vec<u8>> = HashMap::new();
@@ -91,8 +97,13 @@ impl GitImporter {
             self.collect_git_objects(&thread_safe_repo, &dot_git, &mut blob_map)?;
 
         // Concurrently upload file blobs to project CAS
-        self.upload_blobs(&mut backend_client, &project_id, blobs_to_upload, &mut blob_map)
-            .await?;
+        self.upload_blobs(
+            &mut backend_client,
+            &project_id,
+            blobs_to_upload,
+            &mut blob_map,
+        )
+        .await?;
 
         // Convert and upload commit graph to project CAS
         let mut tree_map: HashMap<gix::hash::ObjectId, Vec<u8>> = HashMap::new();
@@ -109,7 +120,8 @@ impl GitImporter {
         }
 
         // Update Op Store View and Operations for repo_id
-        self.publish_op_head(&mut op_client, &repo_id, &head_commit_ids).await?;
+        self.publish_op_head(&mut op_client, &repo_id, &head_commit_ids)
+            .await?;
 
         Ok(repo_id)
     }
@@ -240,7 +252,9 @@ impl GitImporter {
                         walk_refs(&path, out);
                     } else if path.is_file() {
                         if let Ok(content) = std::fs::read_to_string(&path) {
-                            if let Ok(oid) = gix::hash::ObjectId::from_hex(content.trim().as_bytes()) {
+                            if let Ok(oid) =
+                                gix::hash::ObjectId::from_hex(content.trim().as_bytes())
+                            {
                                 let bytes = oid.as_bytes().to_vec();
                                 if !out.contains(&bytes) {
                                     out.push(bytes);
@@ -361,10 +375,7 @@ impl GitImporter {
                         }))
                         .await?
                         .into_inner();
-                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
-                        blob_oid,
-                        write_res.file_id,
-                    ))
+                    Ok::<_, Box<dyn std::error::Error + Send + Sync>>((blob_oid, write_res.file_id))
                 }
             }))
             .buffer_unordered(CONCURRENT_BLOB_UPLOADS);
@@ -419,8 +430,10 @@ impl GitImporter {
                 .time()
                 .map_err(|e| format!("commit {commit_oid}: invalid committer time: {e}"))?;
 
-            let parent_ids: Vec<Vec<u8>> =
-                commit_ref.parents().map(|p| p.as_bytes().to_vec()).collect();
+            let parent_ids: Vec<Vec<u8>> = commit_ref
+                .parents()
+                .map(|p| p.as_bytes().to_vec())
+                .collect();
 
             let author_time_millis = author_time.seconds * 1000;
             let author_tz_offset = author_time.offset / 60;

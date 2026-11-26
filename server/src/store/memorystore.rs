@@ -67,7 +67,9 @@ impl Store for MemoryStore {
 
     async fn get_commit(&self, project_id: &str, commit_id: &[u8]) -> StoreResult<Option<Commit>> {
         let commits = self.commits.lock().unwrap();
-        Ok(commits.get(project_id).and_then(|m| m.get(commit_id).cloned()))
+        Ok(commits
+            .get(project_id)
+            .and_then(|m| m.get(commit_id).cloned()))
     }
 
     async fn list_project_commit_ids(&self, project_id: &str) -> StoreResult<Vec<CommitId>> {
@@ -85,11 +87,18 @@ impl Store for MemoryStore {
         commit: Commit,
     ) -> StoreResult<()> {
         let mut commits = self.commits.lock().unwrap();
-        commits.entry(project_id).or_default().insert(commit_id, commit);
+        commits
+            .entry(project_id)
+            .or_default()
+            .insert(commit_id, commit);
         Ok(())
     }
 
-    async fn get_tree(&self, project_id: &str, tree_id: &[u8]) -> StoreResult<Option<Vec<TreeEntry>>> {
+    async fn get_tree(
+        &self,
+        project_id: &str,
+        tree_id: &[u8],
+    ) -> StoreResult<Option<Vec<TreeEntry>>> {
         let trees = self.trees.lock().unwrap();
         Ok(trees.get(project_id).and_then(|m| m.get(tree_id).cloned()))
     }
@@ -101,7 +110,10 @@ impl Store for MemoryStore {
         entries: Vec<TreeEntry>,
     ) -> StoreResult<()> {
         let mut trees = self.trees.lock().unwrap();
-        trees.entry(project_id).or_default().insert(tree_id, entries);
+        trees
+            .entry(project_id)
+            .or_default()
+            .insert(tree_id, entries);
         Ok(())
     }
 
@@ -117,7 +129,10 @@ impl Store for MemoryStore {
         content: Vec<u8>,
     ) -> StoreResult<()> {
         let mut files = self.files.lock().unwrap();
-        files.entry(project_id).or_default().insert(file_id, content);
+        files
+            .entry(project_id)
+            .or_default()
+            .insert(file_id, content);
         Ok(())
     }
 
@@ -221,16 +236,15 @@ impl Store for MemoryStore {
         workspace_name: &str,
     ) -> StoreResult<Option<WorkspaceState>> {
         let workspaces = self.workspaces.lock().unwrap();
-        Ok(workspaces
-            .get(repo_id)
-            .and_then(|ws| ws.get(&(user.to_string(), workspace_name.to_string())).cloned()))
+        Ok(workspaces.get(repo_id).and_then(|ws| {
+            ws.get(&(user.to_string(), workspace_name.to_string()))
+                .cloned()
+        }))
     }
 
     async fn put_workspace(&self, workspace: WorkspaceState) -> StoreResult<()> {
         let mut workspaces = self.workspaces.lock().unwrap();
-        let repo_workspaces = workspaces
-            .entry(workspace.repo_id.clone())
-            .or_default();
+        let repo_workspaces = workspaces.entry(workspace.repo_id.clone()).or_default();
         repo_workspaces.insert(
             (workspace.user.clone(), workspace.workspace_name.clone()),
             workspace,

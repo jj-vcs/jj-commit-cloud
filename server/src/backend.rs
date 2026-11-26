@@ -184,10 +184,7 @@ impl BackendService for CommitCloudBackendService {
         }
 
         if let Some(entries) = self.store.get_tree(&project_id, &tree_id).await? {
-            return Ok(tonic::Response::new(ReadTreeResponse {
-                tree_id,
-                entries,
-            }));
+            return Ok(tonic::Response::new(ReadTreeResponse { tree_id, entries }));
         }
         Err(tonic::Status::not_found(
             "tree should have been present in cloud database",

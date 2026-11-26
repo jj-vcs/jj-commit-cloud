@@ -34,14 +34,11 @@ pub async fn reconcile_repo_op_heads(
     const BASE_BACKOFF_MS: u64 = 25;
     const MAX_JITTER_MS: u64 = 15;
 
-    let project_id = store
-        .get_repo_project_id(repo_id)
-        .await?
-        .ok_or_else(|| {
-            tonic::Status::not_found(format!(
-                "repository should have been registered before reconciling op heads: {repo_id}"
-            ))
-        })?;
+    let project_id = store.get_repo_project_id(repo_id).await?.ok_or_else(|| {
+        tonic::Status::not_found(format!(
+            "repository should have been registered before reconciling op heads: {repo_id}"
+        ))
+    })?;
 
     for attempt in 0..MAX_RETRIES {
         let heads = store
@@ -74,10 +71,11 @@ pub async fn reconcile_repo_op_heads(
 
                 let server_backend =
                     Box::new(ServerBackend::new(store_clone.clone(), project_id_owned));
-                let jj_store =
-                    JjStore::new(server_backend, signer, merge_options.clone());
-                let op_store: Arc<dyn OpStore> =
-                    Arc::new(ServerOpStore::new(store_clone.clone(), repo_id_owned.clone()));
+                let jj_store = JjStore::new(server_backend, signer, merge_options.clone());
+                let op_store: Arc<dyn OpStore> = Arc::new(ServerOpStore::new(
+                    store_clone.clone(),
+                    repo_id_owned.clone(),
+                ));
                 let op_heads_store: Arc<dyn OpHeadsStore> =
                     Arc::new(ServerOpHeadsStore::new(store_clone, repo_id_owned));
 
@@ -148,8 +146,7 @@ mod tests {
     use crate::store::memorystore::MemoryStore;
     use cc_common::conversions::op_store::{operation_from_proto, view_from_proto};
     use cc_common::op_store::{
-        Operation as ProtoOperation, OperationMetadata as ProtoOperationMetadata,
-        View as ProtoView,
+        Operation as ProtoOperation, OperationMetadata as ProtoOperationMetadata, View as ProtoView,
     };
     use jj_lib::op_store::OperationId;
     use std::collections::HashSet;
@@ -177,7 +174,10 @@ mod tests {
     async fn test_reconcile_repo_op_heads_single_head_is_noop() {
         let store = Arc::new(MemoryStore::new());
         let repo_id = "test-single-head-repo";
-        store.register_repo(repo_id.to_string(), "default".to_string(), None).await.unwrap();
+        store
+            .register_repo(repo_id.to_string(), "default".to_string(), None)
+            .await
+            .unwrap();
 
         let root_op_bytes = cc_common::ROOT_OPERATION_ID_BYTES.to_vec();
         let result = reconcile_repo_op_heads(store.clone(), repo_id)
@@ -193,8 +193,14 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         let repo_id_jj = "repo-jj-direct";
         let repo_id_server = "repo-server-reconcile";
-        store.register_repo(repo_id_jj.to_string(), "default".to_string(), None).await.unwrap();
-        store.register_repo(repo_id_server.to_string(), "default".to_string(), None).await.unwrap();
+        store
+            .register_repo(repo_id_jj.to_string(), "default".to_string(), None)
+            .await
+            .unwrap();
+        store
+            .register_repo(repo_id_server.to_string(), "default".to_string(), None)
+            .await
+            .unwrap();
 
         let root_op_bytes = cc_common::ROOT_OPERATION_ID_BYTES.to_vec();
 
@@ -217,11 +223,19 @@ mod tests {
         };
         let view_a_bytes = crate::hash_utils::hash_view(&view_a_proto);
         store
-            .put_view(repo_id_jj.to_string(), view_a_bytes.clone(), view_a_proto.clone())
+            .put_view(
+                repo_id_jj.to_string(),
+                view_a_bytes.clone(),
+                view_a_proto.clone(),
+            )
             .await
             .unwrap();
         store
-            .put_view(repo_id_server.to_string(), view_a_bytes.clone(), view_a_proto)
+            .put_view(
+                repo_id_server.to_string(),
+                view_a_bytes.clone(),
+                view_a_proto,
+            )
             .await
             .unwrap();
 
@@ -244,19 +258,35 @@ mod tests {
         };
         let view_b_bytes = crate::hash_utils::hash_view(&view_b_proto);
         store
-            .put_view(repo_id_jj.to_string(), view_b_bytes.clone(), view_b_proto.clone())
+            .put_view(
+                repo_id_jj.to_string(),
+                view_b_bytes.clone(),
+                view_b_proto.clone(),
+            )
             .await
             .unwrap();
         store
-            .put_view(repo_id_server.to_string(), view_b_bytes.clone(), view_b_proto)
+            .put_view(
+                repo_id_server.to_string(),
+                view_b_bytes.clone(),
+                view_b_proto,
+            )
             .await
             .unwrap();
 
         // Operation A
         let op_a_bytes = vec![0x0A; 20];
-        let op_a_proto = make_test_proto_op(view_a_bytes.clone(), vec![root_op_bytes.clone()], "branch a");
+        let op_a_proto = make_test_proto_op(
+            view_a_bytes.clone(),
+            vec![root_op_bytes.clone()],
+            "branch a",
+        );
         store
-            .put_operation(repo_id_jj.to_string(), op_a_bytes.clone(), op_a_proto.clone())
+            .put_operation(
+                repo_id_jj.to_string(),
+                op_a_bytes.clone(),
+                op_a_proto.clone(),
+            )
             .await
             .unwrap();
         store
@@ -266,9 +296,17 @@ mod tests {
 
         // Operation B
         let op_b_bytes = vec![0x0B; 20];
-        let op_b_proto = make_test_proto_op(view_b_bytes.clone(), vec![root_op_bytes.clone()], "branch b");
+        let op_b_proto = make_test_proto_op(
+            view_b_bytes.clone(),
+            vec![root_op_bytes.clone()],
+            "branch b",
+        );
         store
-            .put_operation(repo_id_jj.to_string(), op_b_bytes.clone(), op_b_proto.clone())
+            .put_operation(
+                repo_id_jj.to_string(),
+                op_b_bytes.clone(),
+                op_b_proto.clone(),
+            )
             .await
             .unwrap();
         store
@@ -278,7 +316,11 @@ mod tests {
 
         // Set divergent op heads [op_a, op_b] in both repositories
         store
-            .update_op_heads_append_new_remove_old(repo_id_jj.to_string(), &[root_op_bytes.clone()], op_a_bytes.clone())
+            .update_op_heads_append_new_remove_old(
+                repo_id_jj.to_string(),
+                &[root_op_bytes.clone()],
+                op_a_bytes.clone(),
+            )
             .await
             .unwrap();
         store
@@ -287,25 +329,38 @@ mod tests {
             .unwrap();
 
         store
-            .update_op_heads_append_new_remove_old(repo_id_server.to_string(), &[root_op_bytes.clone()], op_a_bytes.clone())
+            .update_op_heads_append_new_remove_old(
+                repo_id_server.to_string(),
+                &[root_op_bytes.clone()],
+                op_a_bytes.clone(),
+            )
             .await
             .unwrap();
         store
-            .update_op_heads_append_new_remove_old(repo_id_server.to_string(), &[], op_b_bytes.clone())
+            .update_op_heads_append_new_remove_old(
+                repo_id_server.to_string(),
+                &[],
+                op_b_bytes.clone(),
+            )
             .await
             .unwrap();
 
         // Direct jj-lib resolution on repo_id_jj
         let index_store = Arc::new(ServerIndexStore);
         let submodule_store = Arc::new(ServerSubmoduleStore);
-        let user_settings = UserSettings::from_config(jj_lib::config::StackedConfig::with_defaults()).unwrap();
+        let user_settings =
+            UserSettings::from_config(jj_lib::config::StackedConfig::with_defaults()).unwrap();
         let signer = Signer::from_settings(&user_settings).unwrap();
         let merge_options = MergeOptions::from_settings(&user_settings).unwrap();
 
         let jj_backend = Box::new(ServerBackend::new(store.clone(), "default".to_string()));
         let jj_store = JjStore::new(jj_backend, signer, merge_options);
-        let jj_op_store: Arc<dyn OpStore> = Arc::new(ServerOpStore::new(store.clone(), repo_id_jj.to_string()));
-        let jj_op_heads_store: Arc<dyn OpHeadsStore> = Arc::new(ServerOpHeadsStore::new(store.clone(), repo_id_jj.to_string()));
+        let jj_op_store: Arc<dyn OpStore> =
+            Arc::new(ServerOpStore::new(store.clone(), repo_id_jj.to_string()));
+        let jj_op_heads_store: Arc<dyn OpHeadsStore> = Arc::new(ServerOpHeadsStore::new(
+            store.clone(),
+            repo_id_jj.to_string(),
+        ));
 
         let repo_loader = RepoLoader::new(
             user_settings,
@@ -316,7 +371,10 @@ mod tests {
             submodule_store,
         );
 
-        let jj_lib_repo = repo_loader.load_at_head().await.expect("jj-lib direct resolution failed");
+        let jj_lib_repo = repo_loader
+            .load_at_head()
+            .await
+            .expect("jj-lib direct resolution failed");
         let jj_lib_op = jj_lib_repo.operation().clone();
         let jj_lib_view = jj_lib_repo.view().store_view().clone();
 
@@ -361,12 +419,26 @@ mod tests {
         assert_eq!(server_view.wc_commit_ids, jj_lib_view.wc_commit_ids);
 
         // Verify that both divergent bookmarks were successfully resolved in the merged view
-        assert!(server_view.local_bookmarks.contains_key(&jj_lib::ref_name::RefNameBuf::from("branch-a")));
-        assert!(server_view.local_bookmarks.contains_key(&jj_lib::ref_name::RefNameBuf::from("branch-b")));
+        assert!(
+            server_view
+                .local_bookmarks
+                .contains_key(&jj_lib::ref_name::RefNameBuf::from("branch-a"))
+        );
+        assert!(
+            server_view
+                .local_bookmarks
+                .contains_key(&jj_lib::ref_name::RefNameBuf::from("branch-b"))
+        );
 
         // Operation metadata description matches standard jj-lib reconciliation message
-        assert_eq!(server_op.metadata.description, jj_lib_op.metadata().description);
-        assert_eq!(server_op.metadata.description, "reconcile divergent operations");
+        assert_eq!(
+            server_op.metadata.description,
+            jj_lib_op.metadata().description
+        );
+        assert_eq!(
+            server_op.metadata.description,
+            "reconcile divergent operations"
+        );
 
         // The server repo op heads store now holds strictly the single merged operation head
         let final_heads = store.get_op_heads(repo_id_server).await.unwrap().unwrap();
@@ -382,7 +454,10 @@ mod tests {
     async fn test_reconcile_repo_op_heads_fails_after_exhausting_retries_on_missing_operation() {
         let store = Arc::new(MemoryStore::new());
         let repo_id = "test-reconcile-failure-repo";
-        store.register_repo(repo_id.to_string(), "default".to_string(), None).await.unwrap();
+        store
+            .register_repo(repo_id.to_string(), "default".to_string(), None)
+            .await
+            .unwrap();
 
         let root_op_bytes = cc_common::ROOT_OPERATION_ID_BYTES.to_vec();
         let root_view_bytes = cc_common::ROOT_VIEW_ID_BYTES.to_vec();
@@ -422,7 +497,8 @@ mod tests {
         // Call reconcile_repo_op_heads - should fail all 3 retries because op_b is missing
         let result = reconcile_repo_op_heads(store.clone(), repo_id).await;
 
-        let status = result.expect_err("Reconciliation should fail when operation object is missing");
+        let status =
+            result.expect_err("Reconciliation should fail when operation object is missing");
         assert_eq!(status.code(), tonic::Code::Internal);
 
         // Verify that op heads were NOT modified since reconciliation failed

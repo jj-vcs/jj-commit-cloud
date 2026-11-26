@@ -359,8 +359,7 @@ impl Store for SpannerStore {
         if let Some(row_res) = rs.next().await {
             let row = row_res.map_err(|e| StoreError::Read(e.to_string()))?;
             let data: Vec<u8> = row.get("data");
-            let op =
-                Operation::decode(&data[..]).map_err(|e| StoreError::Decode(e.to_string()))?;
+            let op = Operation::decode(&data[..]).map_err(|e| StoreError::Decode(e.to_string()))?;
             Ok(Some(op))
         } else {
             Ok(None)

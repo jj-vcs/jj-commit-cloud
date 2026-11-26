@@ -7,7 +7,7 @@ use std::fmt::Debug;
 use std::path::Path;
 
 use crate::client::connect_op_store_client;
-use crate::util::{run_async, CommitCloudConfig};
+use crate::util::{CommitCloudConfig, run_async};
 
 #[derive(Debug)]
 pub struct CommitCloudOpHeadsStore {

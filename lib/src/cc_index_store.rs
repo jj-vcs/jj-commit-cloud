@@ -9,7 +9,7 @@ use jj_lib::operation::Operation;
 use jj_lib::store::Store;
 
 use crate::client::connect_backend_client;
-use crate::util::{run_async, CommitCloudConfig};
+use crate::util::{CommitCloudConfig, run_async};
 
 #[derive(Debug)]
 pub struct CommitCloudIndexStore {

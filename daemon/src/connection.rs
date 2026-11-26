@@ -35,7 +35,10 @@ impl RemoteConnectionManager {
             return Ok(channel.clone());
         }
 
-        info!("Opening lazy gRPC connection to Commit Cloud server at '{}'", self.server_url);
+        info!(
+            "Opening lazy gRPC connection to Commit Cloud server at '{}'",
+            self.server_url
+        );
         let endpoint = match Endpoint::from_shared(self.server_url.clone()) {
             Ok(ep) => ep
                 .connect_timeout(Duration::from_secs(10))

@@ -1,5 +1,5 @@
-use cc_lib::cc_working_copy::CommitCloudWorkingCopyFactory;
 use cc_lib::StoreFactoriesExt;
+use cc_lib::cc_working_copy::CommitCloudWorkingCopyFactory;
 use jj_cli::cli_util::{CliRunner, CommandHelper};
 use jj_cli::command_error::CommandError;
 use jj_lib::repo::StoreFactories;
