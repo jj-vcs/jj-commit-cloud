@@ -22,5 +22,7 @@ ENV PORT=8080
 ENV SPANNER_DATABASE=projects/your-project-id/instances/your-spanner-instance/databases/commit_cloud
 EXPOSE 8080
 
-# Bind to 0.0.0.0 and listen on Cloud Run's injected PORT using the Spanner database backend
+# Bind to 0.0.0.0 and listen on Cloud Run's injected PORT using the Spanner database backend.
+# Non-loopback --host 0.0.0.0 requires JJ_CC_SERVER_AUTH_TOKEN, JJ_CC_SERVER_AUTH_TOKEN_FILE,
+# or JJ_CC_ALLOW_UNAUTHENTICATED=true (for example behind Cloud Run IAM or IAP).
 CMD ["sh", "-c", "jj-cc-server --host 0.0.0.0 --port ${PORT:-8080} --store-type spanner --spanner-db ${SPANNER_DATABASE}"]
