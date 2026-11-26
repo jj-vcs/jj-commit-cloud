@@ -4,11 +4,12 @@ Use these rules when reading, editing, testing, or reviewing code in [jj-commit-
 
 ## Workspace Crates and Service Surfaces
 
-* **Protocol Definitions ([common/](common/), `cc-common`):** Compiles `BackendService` ([common/proto/backend.proto](common/proto/backend.proto)) and `OpStoreService` ([common/proto/op_store.proto](common/proto/op_store.proto)) into `tonic` stubs and defines digest-length and virtual-root constants.
-* **Client Storage Backends ([lib/](lib/), `cc-lib`):** Implements `jj_lib` storage traits (`CommitCloudBackend`, `CommitCloudOpStore`, `CommitCloudOpHeadsStore`) over gRPC.
-* **Commit Cloud Server ([server/](server/), `jj-commit-cloud-server`, binary jj-cc-server):** Serves gRPC endpoints, computes canonical object digests via [gitoxide](https://github.com/GitoxideLabs/gitoxide), and keeps repository state behind the `Store` trait (in-memory only on `main` via `MemoryStore`).
+* **Protocol Definitions ([common/](common/), `cc-common`):** Compiles `BackendService` ([common/proto/backend.proto](common/proto/backend.proto)), `OpStoreService` ([common/proto/op_store.proto](common/proto/op_store.proto)), and `WorkspaceService` ([common/proto/workspace.proto](common/proto/workspace.proto)) into `tonic` stubs, defines proto/`jj_lib` conversions, and exports digest-length and virtual-root constants.
+* **Client Storage Backends ([lib/](lib/), `cc-lib`):** Implements `jj_lib` storage traits (`CommitCloudBackend`, `CommitCloudOpStore`, `CommitCloudOpHeadsStore`, `CommitCloudIndexStore`, `CommitCloudWorkingCopy`) over gRPC with optional Unix domain socket routing through jj-cc-daemon.
+* **Commit Cloud Server ([server/](server/), `jj-commit-cloud-server`, binary jj-cc-server):** Serves gRPC endpoints, computes canonical object digests via [gitoxide](https://github.com/GitoxideLabs/gitoxide), reconciles divergent operation heads, and persists repository state behind the `Store` trait (`MemoryStore`, `SqliteStore`, `SpannerStore`).
 * **Custom CLI ([cli/](cli/), binary jj):** Embeds `jj_cli` alongside the `jj cc` subcommand family while keeping local `GitBackend` repositories working unchanged.
-* **Integration Test Utilities ([testutils/](testutils/)):** Builds and spawns ephemeral jj-cc-server instances for automated tests.
+* **Local Proxy Daemon ([daemon/](daemon/), `jj-commit-cloud-daemon`, binary jj-cc-daemon):** Runs a local Unix domain socket gRPC proxy forwarding `BackendService`, `OpStoreService`, and `WorkspaceService` calls over a shared upstream connection.
+* **Integration Test Utilities ([testutils/](testutils/)):** Builds and spawns ephemeral jj-cc-server and jj-cc-daemon instances for automated tests.
 
 ## Codebase, Proto, and Comment Conventions
 
@@ -20,10 +21,10 @@ Use these rules when reading, editing, testing, or reviewing code in [jj-commit-
 * **Proto-First Service Contracts:** In `.proto` files under [common/proto/](common/proto/), document idempotency requirements, transaction isolation expectations, pagination cursor invariants, and gRPC status codes on `service`, `rpc`, and `message` definitions rather than burying them in Rust handlers.
 * **Write "Why", Not "What" Comments:** Omit line-by-line comments that restate Rust syntax.
 * **Keep Agent Docs Compact:** Keep `AGENTS.md` files under 1,500 tokens with no manual line-number maps or perishable file lists, and extend crate, proto, or binary lists in the commits that add them.
-* **Actionable CLI Errors:** Teach [jj](https://github.com/jj-vcs/jj)'s mental model in CLI error messages - working-copy-as-a-commit (`@`), bookmarks, algebraic conflicts (`Merge<TreeId>`), and the operation log (`jj op log` and `jj undo`) - with runnable remediation commands.
+* **Actionable CLI Errors:** Teach [jj](https://github.com/jj-vcs/jj)'s mental model in CLI error messages (working-copy-as-a-commit `@`, bookmarks, algebraic conflicts `Merge<TreeId>`, and the operation log via `jj op log` and `jj undo`) with runnable remediation commands.
 
 ## Build, Test, and Version Control
 
-* **Build and Test Prerequisites:** Compiling `cc-common` ([common/build.rs](common/build.rs)) requires `protoc` on `PATH`, and `cargo test` builds jj-cc-server through a nested `cargo build` in [testutils/build.rs](testutils/build.rs).
+* **Build and Test Prerequisites:** Compiling `cc-common` ([common/build.rs](common/build.rs)) honors `PROTOC` or `protoc` from `PATH` when available and falls back to `protoc-bin-vendored` otherwise. Running `cargo test` builds jj-cc-server and jj-cc-daemon through a nested `cargo build` in [testutils/build.rs](testutils/build.rs).
 * **No Co-Author or Attribution Trailers:** Commit messages carry no `Co-authored-by:` trailer and no other trailer that credits a tool, a coding agent, or a person. Every author of a commit must have signed the Google CLA, and the CLA check blocks the merge of a pull request whose commits name an author who has not, including a coding agent. Remove any such trailer that a tool adds by default; fix an existing commit with `jj describe` before pushing.
-* **Auto-Format Modified Files With `jj fix`:** Run `jj fix -s @` - or plain `jj fix` across a commit stack - after editing Rust source files so formatting stays scoped to modified files without introducing rebase conflicts, and reserve `cargo fmt --all` for standalone workspace-wide formatting commits. Configure `fix.tools.rustfmt` once per checkout with `jj config set --repo fix.tools.rustfmt '{ command = ["rustfmt", "--edition", "2024", "--emit", "stdout"], patterns = ["glob:**/*.rs"] }'`.
+* **Auto-Format Modified Files With `jj fix`:** Run `jj fix -s @` (or plain `jj fix` across a commit stack) after editing Rust source files so formatting stays scoped to modified files without introducing rebase conflicts, and reserve `cargo fmt --all` for standalone workspace-wide formatting commits. Configure `fix.tools.rustfmt` once per checkout with `jj config set --repo fix.tools.rustfmt '{ command = ["rustfmt", "--edition", "2024", "--emit", "stdout"], patterns = ["glob:**/*.rs"] }'`.
