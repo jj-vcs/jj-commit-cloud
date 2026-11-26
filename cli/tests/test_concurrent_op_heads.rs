@@ -36,6 +36,7 @@ async fn register_test_repo(server_url: &str) -> String {
             project_id: "test-project".to_string(),
             repo_id: None,
             name: None,
+            hash_algorithm: cc_common::backend::HashAlgorithm::Sha1 as i32,
         }))
         .await
         .expect("Failed to register repository");
@@ -55,20 +56,54 @@ async fn test_sqlite_concurrent_write_race_fails_on_stale_old_heads() {
         .await
         .unwrap();
 
+    let root_head = cc_common::ROOT_OPERATION_ID_BYTES.to_vec();
+    let make_op = |parent: Vec<u8>, desc: &str| cc_common::op_store::Operation {
+        parents: vec![parent],
+        view_id: cc_common::ROOT_VIEW_ID_BYTES.to_vec(),
+        metadata: Some(cc_common::op_store::OperationMetadata {
+            start_time_millis: 1000,
+            end_time_millis: 1000,
+            description: desc.to_string(),
+            hostname: "test".to_string(),
+            username: "test".to_string(),
+            is_snapshot: false,
+            workspace_name: None,
+            attributes: Default::default(),
+        }),
+        commit_predecessors: vec![],
+        commit_predecessors_set: false,
+    };
+
     // Start from a non-root head: a root-op parent is allowed to fork (a new
     // workspace joining the repository), so it cannot be stale.
-    let base_head = vec![0x10; 20];
+    let base_head = op_client_1
+        .write_operation(cc_common::op_store::WriteOperationRequest {
+            repo_id: repo_id.clone(),
+            operation: Some(make_op(root_head.clone(), "base op")),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .operation_id;
     op_client_1
         .update_op_heads(UpdateOpHeadsRequest {
             repo_id: repo_id.clone(),
-            old_op_head_ids: vec![cc_common::ROOT_OPERATION_ID_BYTES.to_vec()],
+            old_op_head_ids: vec![root_head],
             new_op_head_id: base_head.clone(),
         })
         .await
         .unwrap();
 
-    // Client 1 advances base -> op_1
-    let op_1 = vec![0x11; 20];
+    // Client 1 persists op_1 and advances base_head -> op_1
+    let op_1 = op_client_1
+        .write_operation(cc_common::op_store::WriteOperationRequest {
+            repo_id: repo_id.clone(),
+            operation: Some(make_op(base_head.clone(), "op 1")),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .operation_id;
     op_client_1
         .update_op_heads(UpdateOpHeadsRequest {
             repo_id: repo_id.clone(),
@@ -78,8 +113,16 @@ async fn test_sqlite_concurrent_write_race_fails_on_stale_old_heads() {
         .await
         .unwrap();
 
-    // Client 2 tries to update using stale base_head
-    let op_2 = vec![0x22; 20];
+    // Client 2 persists op_2 and tries to update using stale base_head
+    let op_2 = op_client_2
+        .write_operation(cc_common::op_store::WriteOperationRequest {
+            repo_id: repo_id.clone(),
+            operation: Some(make_op(base_head.clone(), "op 2")),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .operation_id;
     let result = op_client_2
         .update_op_heads(UpdateOpHeadsRequest {
             repo_id: repo_id.clone(),
@@ -118,10 +161,34 @@ async fn test_stress_concurrent_op_heads_writes_sqlite() {
                 .await
                 .expect("Failed to connect client in worker");
 
+            let worker_op = op_client
+                .write_operation(cc_common::op_store::WriteOperationRequest {
+                    repo_id: repo_id.clone(),
+                    operation: Some(cc_common::op_store::Operation {
+                        parents: vec![cc_common::ROOT_OPERATION_ID_BYTES.to_vec()],
+                        view_id: cc_common::ROOT_VIEW_ID_BYTES.to_vec(),
+                        metadata: Some(cc_common::op_store::OperationMetadata {
+                            start_time_millis: (worker_idx as i64) + 1,
+                            end_time_millis: (worker_idx as i64) + 1,
+                            description: format!("worker {worker_idx}"),
+                            hostname: "test".to_string(),
+                            username: "test".to_string(),
+                            is_snapshot: false,
+                            workspace_name: None,
+                            attributes: Default::default(),
+                        }),
+                        commit_predecessors: vec![],
+                        commit_predecessors_set: false,
+                    }),
+                })
+                .await
+                .expect("write_operation should succeed")
+                .into_inner()
+                .operation_id;
+
             // Synchronize all tasks to hit the SQLite database simultaneously
             barrier.wait().await;
 
-            let worker_op = vec![(worker_idx + 1) as u8; 20];
             let response = op_client
                 .update_op_heads(UpdateOpHeadsRequest {
                     repo_id,
@@ -146,7 +213,6 @@ async fn test_stress_concurrent_op_heads_writes_sqlite() {
         inserted_ops.insert(op_id);
     }
 
-    // Verify all 20 heads were safely written into SQLite without lock errors
     let mut op_client = OpStoreServiceClient::connect(server.url().to_string())
         .await
         .unwrap();
@@ -197,7 +263,6 @@ async fn test_reconcile_op_heads_idempotent_on_single_head() {
 
     let root_head = cc_common::ROOT_OPERATION_ID_BYTES.to_vec();
 
-    // On single root head, ReconcileOpHeads returns root immediately
     let response = op_client
         .reconcile_op_heads(ReconcileOpHeadsRequest {
             repo_id: repo_id.clone(),
@@ -224,7 +289,6 @@ async fn test_cli_command_auto_reconciles_divergent_op_heads() {
         .await
         .expect("Failed to connect op client");
 
-    // Fetch current single head
     let current_heads = op_client
         .get_op_heads(GetOpHeadsRequest {
             repo_id: repo_id.clone(),
@@ -236,7 +300,6 @@ async fn test_cli_command_auto_reconciles_divergent_op_heads() {
     assert_eq!(current_heads.len(), 1);
     let base_head = current_heads[0].clone();
 
-    // Read base operation to get its view_id
     let base_op = op_client
         .read_operation(ReadOperationRequest {
             repo_id: repo_id.clone(),
@@ -250,7 +313,6 @@ async fn test_cli_command_auto_reconciles_divergent_op_heads() {
 
     let base_view_id = base_op.view_id;
 
-    // Create and write two divergent operations pointing to base_head
     let op_a_proto = make_test_operation(
         base_view_id.clone(),
         vec![base_head.clone()],
@@ -281,8 +343,7 @@ async fn test_cli_command_auto_reconciles_divergent_op_heads() {
         .into_inner()
         .operation_id;
 
-    // Inject divergent heads on server:
-    // Branch A replaces base_head with op_branch_a
+    // Publish two divergent heads: Branch A replaces base_head while Branch B adds concurrently.
     op_client
         .update_op_heads(UpdateOpHeadsRequest {
             repo_id: repo_id.clone(),
@@ -292,7 +353,6 @@ async fn test_cli_command_auto_reconciles_divergent_op_heads() {
         .await
         .unwrap();
 
-    // Branch B adds op_branch_b concurrently
     op_client
         .update_op_heads(UpdateOpHeadsRequest {
             repo_id: repo_id.clone(),
@@ -302,7 +362,6 @@ async fn test_cli_command_auto_reconciles_divergent_op_heads() {
         .await
         .unwrap();
 
-    // Verify the server store now has 2 divergent heads
     let raw_heads = op_client
         .get_op_heads(GetOpHeadsRequest {
             repo_id: repo_id.clone(),
@@ -322,7 +381,6 @@ async fn test_cli_command_auto_reconciles_divergent_op_heads() {
         .assert()
         .success();
 
-    // Verify that the server's op heads were automatically collapsed down to 1 merged head
     let post_heads = op_client
         .get_op_heads(GetOpHeadsRequest {
             repo_id: repo_id.clone(),
@@ -336,7 +394,6 @@ async fn test_cli_command_auto_reconciles_divergent_op_heads() {
     assert_ne!(final_head, &op_branch_a);
     assert_ne!(final_head, &op_branch_b);
 
-    // Verify the merged operation in the server operation log
     let _merged_op = op_client
         .read_operation(ReadOperationRequest {
             repo_id: repo_id.clone(),

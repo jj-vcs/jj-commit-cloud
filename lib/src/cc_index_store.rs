@@ -63,17 +63,49 @@ impl IndexStore for CommitCloudIndexStore {
         let project_id = self.config.project_id.clone();
         let project_commit_ids: Vec<CommitId> = run_async(move || async move {
             let mut client = connect_backend_client(&config).await?;
-            let res = client
-                .list_project_commits(tonic::Request::new(
-                    cc_common::backend::ListProjectCommitsRequest { project_id },
-                ))
-                .await?
-                .into_inner();
-            Ok(res
-                .commit_ids
-                .into_iter()
-                .map(|b| CommitId::from_bytes(&b))
-                .collect())
+            let mut all_ids = Vec::new();
+            let mut page_token: Vec<u8> = Vec::new();
+            let mut seen_tokens: std::collections::HashSet<Vec<u8>> =
+                std::collections::HashSet::new();
+            loop {
+                let res = client
+                    .list_commits(tonic::Request::new(
+                        cc_common::backend::ListCommitsRequest {
+                            project_id: project_id.clone(),
+                            page_size: 5000,
+                            page_token: page_token.clone(),
+                            since_token: Vec::new(),
+                        },
+                    ))
+                    .await?
+                    .into_inner();
+                let page_empty = res.commit_ids.is_empty();
+                for b in res.commit_ids {
+                    if b.len() != cc_common::COMMIT_ID_LENGTH {
+                        return Err(format!(
+                            "ListCommits returned invalid commit_id length {}",
+                            b.len()
+                        )
+                        .into());
+                    }
+                    all_ids.push(CommitId::from_bytes(&b));
+                }
+                if res.next_page_token.is_empty() {
+                    break;
+                }
+                if page_empty {
+                    return Err(
+                        "ListCommits returned empty page with non-empty next_page_token".into(),
+                    );
+                }
+                if !seen_tokens.insert(res.next_page_token.clone()) {
+                    return Err(
+                        "ListCommits returned cyclic or non-advancing next_page_token".into(),
+                    );
+                }
+                page_token = res.next_page_token;
+            }
+            Ok(all_ids)
         })
         .map_err(IndexStoreError::Read)?;
 

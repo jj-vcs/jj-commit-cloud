@@ -48,6 +48,15 @@ impl OpStoreService for DaemonOpStoreProxy {
             .await
     }
 
+    async fn resolve_operation_prefix(
+        &self,
+        request: Request<ResolveOperationPrefixRequest>,
+    ) -> Result<Response<ResolveOperationPrefixResponse>, Status> {
+        self.conn_manager
+            .with_op_store(|mut c| async move { c.resolve_operation_prefix(request).await })
+            .await
+    }
+
     async fn read_view(
         &self,
         request: Request<ReadViewRequest>,
@@ -90,6 +99,15 @@ impl OpStoreService for DaemonOpStoreProxy {
     ) -> Result<Response<ReconcileOpHeadsResponse>, Status> {
         self.conn_manager
             .with_op_store(|mut c| async move { c.reconcile_op_heads(request).await })
+            .await
+    }
+
+    async fn publish_operation(
+        &self,
+        request: Request<PublishOperationRequest>,
+    ) -> Result<Response<PublishOperationResponse>, Status> {
+        self.conn_manager
+            .with_op_store(|mut c| async move { c.publish_operation(request).await })
             .await
     }
 }

@@ -77,8 +77,18 @@ impl Store for MemoryStore {
         project_id: String,
         _name: Option<String>,
     ) -> StoreResult<()> {
-        self.projects.lock().unwrap().insert(project_id.clone());
-        self.repos.lock().unwrap().insert(repo_id, project_id);
+        let mut projects = self.projects.lock().unwrap();
+        let mut repos = self.repos.lock().unwrap();
+        if let Some(existing_project_id) = repos.get(&repo_id) {
+            if existing_project_id != &project_id {
+                return Err(StoreError::AlreadyExists(format!(
+                    "repository '{repo_id}' is already registered under project '{existing_project_id}', not '{project_id}'"
+                )));
+            }
+            return Ok(());
+        }
+        projects.insert(project_id.clone());
+        repos.insert(repo_id, project_id);
         Ok(())
     }
 

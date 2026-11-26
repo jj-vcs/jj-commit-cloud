@@ -63,12 +63,18 @@ impl CommitCloudOpHeadsStore {
         run_async(move || async move {
             let mut client = connect_op_store_client(&config).await?;
             let response = client.get_op_heads(GetOpHeadsRequest { repo_id }).await?;
-            let head_ids: Vec<OperationId> = response
-                .into_inner()
-                .op_head_ids
-                .into_iter()
-                .map(|b| OperationId::from_bytes(&b))
-                .collect();
+            let raw_heads = response.into_inner().op_head_ids;
+            let mut head_ids = Vec::with_capacity(raw_heads.len());
+            for b in raw_heads {
+                if b.len() != cc_common::OPERATION_ID_LENGTH {
+                    return Err(format!(
+                        "GetOpHeads returned invalid op_head_id length {}",
+                        b.len()
+                    )
+                    .into());
+                }
+                head_ids.push(OperationId::from_bytes(&b));
+            }
             Ok(head_ids)
         })
         .map_err(|e| OpHeadsStoreError::Read(e.into()))
@@ -82,11 +88,39 @@ impl CommitCloudOpHeadsStore {
 
         run_async(move || async move {
             let mut client = connect_op_store_client(&config).await?;
-            let response = client
+            let resp = client
                 .reconcile_op_heads(ReconcileOpHeadsRequest { repo_id })
-                .await?;
-            let head = OperationId::from_bytes(&response.into_inner().op_head);
-            Ok(vec![head])
+                .await?
+                .into_inner();
+            if resp.client_resolution_required {
+                if resp.current_op_head_ids.is_empty() {
+                    return Err(
+                        "ReconcileOpHeads set client_resolution_required with empty current_op_head_ids"
+                            .into(),
+                    );
+                }
+                let mut heads = Vec::with_capacity(resp.current_op_head_ids.len());
+                for b in resp.current_op_head_ids {
+                    if b.len() != cc_common::OPERATION_ID_LENGTH {
+                        return Err(format!(
+                            "ReconcileOpHeads returned invalid op_head_id length {}",
+                            b.len()
+                        )
+                        .into());
+                    }
+                    heads.push(OperationId::from_bytes(&b));
+                }
+                Ok(heads)
+            } else {
+                if resp.op_head.len() != cc_common::OPERATION_ID_LENGTH {
+                    return Err(format!(
+                        "ReconcileOpHeads returned invalid op_head length {}",
+                        resp.op_head.len()
+                    )
+                    .into());
+                }
+                Ok(vec![OperationId::from_bytes(&resp.op_head)])
+            }
         })
         .map_err(|e| OpHeadsStoreError::Read(e.into()))
     }

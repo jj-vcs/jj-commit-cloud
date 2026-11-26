@@ -111,6 +111,11 @@ impl RemoteConnectionManager {
         *guard = None;
     }
 
+    #[cfg(test)]
+    pub async fn has_cached_channel(&self) -> bool {
+        self.channel.lock().await.is_some()
+    }
+
     pub fn is_connection_error(status: &Status) -> bool {
         matches!(
             status.code(),

@@ -23,6 +23,7 @@ impl From<StoreError> for tonic::Status {
         match err {
             StoreError::Decode(_) => tonic::Status::data_loss(msg),
             StoreError::CasConflict(_) => tonic::Status::aborted(msg),
+            StoreError::AlreadyExists(_) => tonic::Status::already_exists(msg),
             StoreError::Read(_)
             | StoreError::Write(_)
             | StoreError::Encode(_)
