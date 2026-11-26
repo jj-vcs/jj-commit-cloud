@@ -71,6 +71,7 @@ impl DaemonSandbox {
     pub fn jj_cmd(&self) -> assert_cmd::Command {
         let mut cmd = find_jj_cmd();
         cmd.env(DAEMON_SOCKET_DIR_ENV, self.dir.path());
+        cmd.env("JJ_CC_CACHE_DIR", self.dir.path().join("cache"));
         cmd
     }
 }
@@ -477,10 +478,12 @@ impl Drop for DaemonGuard {
 pub async fn spawn_daemon(server_url: &str) -> DaemonGuard {
     let temp_dir = tempfile::tempdir().expect("Failed to create tempdir for daemon socket");
     let socket_path = temp_dir.path().join("daemon.sock");
+    let cache_dir = temp_dir.path().join("cache");
     let daemon_bin = find_daemon_bin();
     let mut cmd = tokio::process::Command::new(daemon_bin);
     cmd.arg("--server").arg(server_url);
     cmd.arg("--socket").arg(&socket_path);
+    cmd.arg("--cache-dir").arg(&cache_dir);
     let child = cmd.spawn().expect("Failed to spawn jj-cc-daemon");
 
     let mut ready = false;

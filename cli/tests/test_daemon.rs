@@ -13,7 +13,10 @@
 // limitations under the License.
 
 use cc_common::backend::backend_service_client::BackendServiceClient;
-use cc_common::backend::{ReadCommitRequest, RegisterRepositoryRequest, WriteCommitRequest};
+use cc_common::backend::{
+    File, ReadCommitRequest, ReadTreeRequest, RegisterRepositoryRequest, TreeEntry, TreeValue,
+    WriteCommitRequest, WriteFileRequest, WriteTreeRequest, tree_value,
+};
 use cc_common::op_store::op_store_service_client::OpStoreServiceClient;
 use cc_common::op_store::{ReadOperationRequest, WriteOperationRequest};
 use cc_common::workspace::workspace_service_client::WorkspaceServiceClient;
@@ -303,4 +306,242 @@ async fn test_daemon_auto_spawn_on_cli_command() {
         .success();
     let stdout = String::from_utf8_lossy(&output.get_output().stdout);
     assert!(stdout.contains("auto spawn commit"));
+}
+
+#[tokio::test]
+async fn test_daemon_cold_and_warm_read_tree_against_server() {
+    let server = spawn_server().await;
+    let daemon = spawn_daemon(server.url()).await;
+
+    // Write project, files, and trees directly to `jj-cc-server` so `jj-cc-daemon` is cold.
+    let direct_channel = Endpoint::from_shared(server.url().to_string())
+        .unwrap()
+        .connect()
+        .await
+        .expect("Failed to connect directly to jj-cc-server");
+    let mut direct_client = BackendServiceClient::new(direct_channel);
+
+    let reg_resp = direct_client
+        .register_repository(RegisterRepositoryRequest {
+            project_id: "cold-tree-project".to_string(),
+            repo_id: None,
+            name: Some("cold-tree-repo".to_string()),
+            hash_algorithm: cc_common::backend::HashAlgorithm::Sha1 as i32,
+        })
+        .await
+        .expect("Failed to register repo directly on server")
+        .into_inner();
+    let project_id = reg_resp.project_id;
+
+    let file_a_bytes = b"alpha file content".to_vec();
+    let file_a_id = direct_client
+        .write_file(WriteFileRequest {
+            project_id: project_id.clone(),
+            content: file_a_bytes.clone(),
+        })
+        .await
+        .expect("Failed to write file a directly on server")
+        .into_inner()
+        .file_id;
+
+    let file_foo_bytes = b"foo.rs payload".to_vec();
+    let file_foo_id = direct_client
+        .write_file(WriteFileRequest {
+            project_id: project_id.clone(),
+            content: file_foo_bytes.clone(),
+        })
+        .await
+        .expect("Failed to write file foo.rs directly on server")
+        .into_inner()
+        .file_id;
+
+    let tree_id = direct_client
+        .write_tree(WriteTreeRequest {
+            project_id: project_id.clone(),
+            path: String::new(),
+            entries: vec![
+                TreeEntry {
+                    name: "foo.rs".to_string(),
+                    value: Some(TreeValue {
+                        value: Some(tree_value::Value::File(File {
+                            id: file_foo_id.clone(),
+                            executable: false,
+                            copy_id: Vec::new(),
+                            size_bytes: None,
+                        })),
+                    }),
+                },
+                TreeEntry {
+                    name: "foo".to_string(),
+                    value: Some(TreeValue {
+                        value: Some(tree_value::Value::TreeId(
+                            cc_common::EMPTY_TREE_ID_BYTES.to_vec(),
+                        )),
+                    }),
+                },
+                TreeEntry {
+                    name: "a.txt".to_string(),
+                    value: Some(TreeValue {
+                        value: Some(tree_value::Value::File(File {
+                            id: file_a_id.clone(),
+                            executable: true,
+                            copy_id: Vec::new(),
+                            size_bytes: None,
+                        })),
+                    }),
+                },
+            ],
+        })
+        .await
+        .expect("Failed to write tree directly on server")
+        .into_inner()
+        .tree_id;
+
+    let second_tree_id = direct_client
+        .write_tree(WriteTreeRequest {
+            project_id: project_id.clone(),
+            path: String::new(),
+            entries: vec![TreeEntry {
+                name: "only.txt".to_string(),
+                value: Some(TreeValue {
+                    value: Some(tree_value::Value::File(File {
+                        id: file_a_id.clone(),
+                        executable: false,
+                        copy_id: Vec::new(),
+                        size_bytes: None,
+                    })),
+                }),
+            }],
+        })
+        .await
+        .expect("Failed to write second tree directly on server")
+        .into_inner()
+        .tree_id;
+
+    // Connect to `jj-cc-daemon` over UDS.
+    let socket_path = daemon.socket_path().to_path_buf();
+    let daemon_channel = Endpoint::try_from("http://[::]:50051")
+        .unwrap()
+        .connect_with_connector(service_fn(move |_: Uri| {
+            let path = socket_path.clone();
+            async move {
+                let stream = UnixStream::connect(path).await?;
+                Ok::<_, std::io::Error>(TokioIo::new(stream))
+            }
+        }))
+        .await
+        .expect("Failed to connect to daemon over UDS");
+    let mut daemon_client = BackendServiceClient::new(daemon_channel);
+
+    // 1. Cold unpaginated ReadTree through daemon falls back to `page_size: 0` against
+    // `jj-cc-server` and returns the full tree in UTF-8 order with populated file sizes.
+    let cold_resp = daemon_client
+        .read_tree(ReadTreeRequest {
+            project_id: project_id.clone(),
+            tree_id: tree_id.clone(),
+            path: String::new(),
+            page_size: 0,
+            page_token: String::new(),
+        })
+        .await
+        .expect("Cold ReadTree through daemon should succeed against jj-cc-server")
+        .into_inner();
+    assert_eq!(cold_resp.tree_id, tree_id);
+    assert!(cold_resp.next_page_token.is_empty());
+    let cold_names: Vec<&str> = cold_resp.entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(cold_names, vec!["a.txt", "foo", "foo.rs"]);
+    match cold_resp.entries[0]
+        .value
+        .as_ref()
+        .and_then(|v| v.value.as_ref())
+    {
+        Some(tree_value::Value::File(f)) => {
+            assert_eq!(f.id, file_a_id);
+            assert!(f.executable);
+            assert_eq!(f.size_bytes, Some(file_a_bytes.len() as u64));
+        }
+        other => panic!("expected file entry for a.txt, got {other:?}"),
+    }
+    match cold_resp.entries[2]
+        .value
+        .as_ref()
+        .and_then(|v| v.value.as_ref())
+    {
+        Some(tree_value::Value::File(f)) => {
+            assert_eq!(f.id, file_foo_id);
+            assert_eq!(f.size_bytes, Some(file_foo_bytes.len() as u64));
+        }
+        other => panic!("expected file entry for foo.rs, got {other:?}"),
+    }
+
+    // 2. Warm cached unpaginated read matches identically.
+    let warm_resp = daemon_client
+        .read_tree(ReadTreeRequest {
+            project_id: project_id.clone(),
+            tree_id: tree_id.clone(),
+            path: String::new(),
+            page_size: 0,
+            page_token: String::new(),
+        })
+        .await
+        .expect("Warm cached ReadTree through daemon should succeed")
+        .into_inner();
+    assert_eq!(warm_resp, cold_resp);
+
+    // 3. Warm cached paginated reads succeed locally from the daemon cache even though
+    // `jj-cc-server` rejects `page_size > 0` with `UNIMPLEMENTED`.
+    let page1 = daemon_client
+        .read_tree(ReadTreeRequest {
+            project_id: project_id.clone(),
+            tree_id: tree_id.clone(),
+            path: String::new(),
+            page_size: 2,
+            page_token: String::new(),
+        })
+        .await
+        .expect("Warm paginated ReadTree page 1 must be served from daemon cache")
+        .into_inner();
+    assert_eq!(
+        page1
+            .entries
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a.txt", "foo"]
+    );
+    assert_eq!(page1.next_page_token, "foo");
+
+    let page2 = daemon_client
+        .read_tree(ReadTreeRequest {
+            project_id: project_id.clone(),
+            tree_id,
+            path: String::new(),
+            page_size: 2,
+            page_token: page1.next_page_token,
+        })
+        .await
+        .expect("Warm paginated ReadTree page 2 must be served from daemon cache")
+        .into_inner();
+    assert_eq!(
+        page2
+            .entries
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["foo.rs"]
+    );
+    assert!(page2.next_page_token.is_empty());
+
+    // 4. Cold paginated ReadTree on an uncached tree still propagates `UNIMPLEMENTED` from server.
+    let cold_paginated_err = daemon_client
+        .read_tree(ReadTreeRequest {
+            project_id,
+            tree_id: second_tree_id,
+            path: String::new(),
+            page_size: 1,
+            page_token: String::new(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(cold_paginated_err.code(), tonic::Code::Unimplemented);
 }

@@ -3940,14 +3940,24 @@ dependencies = [
 name = "jj-commit-cloud-daemon"
 version = "0.1.0"
 dependencies = [
- "async-trait",
+ "bytes",
  "cc-common",
  "clap",
- "hyper-util",
+ "futures 0.3.32",
+ "getrandom 0.2.17",
+ "hex",
+ "libc",
+ "lru 0.16.4",
+ "prost 0.13.5",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2 0.10.9",
+ "tempfile",
  "tokio",
- "tokio-stream",
  "tonic 0.12.3",
- "tower 0.4.13",
+ "tonic-health",
  "tracing",
  "tracing-subscriber",
 ]
@@ -4394,6 +4404,9 @@ name = "lru"
 version = "0.16.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f66e8d5d03f609abc3a39e6f08e4164ebf1447a732906d39eb9b99b7919ef39"
+dependencies = [
+ "hashbrown 0.16.1",
+]
 
 [[package]]
 name = "lru"
@@ -6778,6 +6791,7 @@ dependencies = [
  "percent-encoding",
  "pin-project",
  "prost 0.13.5",
+ "rustls-native-certs",
  "rustls-pemfile",
  "socket2 0.5.10",
  "tokio",
