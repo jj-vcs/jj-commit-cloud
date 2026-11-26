@@ -84,9 +84,20 @@ fn main() {
         compiled_binary_path.display()
     );
 
+    let compiled_daemon_path = server_target_dir.join(&profile).join(&daemon_name);
+    assert!(
+        compiled_daemon_path.exists(),
+        "Compiled jj-cc-daemon binary should exist at {}",
+        compiled_daemon_path.display()
+    );
+
     println!(
         "cargo:rustc-env=JJ_CC_SERVER_BIN={}",
         compiled_binary_path.display()
+    );
+    println!(
+        "cargo:rustc-env=JJ_CC_DAEMON_BIN={}",
+        compiled_daemon_path.display()
     );
 
     // Also copy into `target/<profile>/` if an ancestor matches `<profile>`

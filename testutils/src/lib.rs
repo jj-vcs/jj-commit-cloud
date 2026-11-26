@@ -40,10 +40,13 @@ pub fn find_server_bin() -> std::path::PathBuf {
     if let Some(path) = option_env!("JJ_CC_SERVER_BIN") {
         return std::path::PathBuf::from(path);
     }
-    let current_exe = std::env::current_exe().expect("The current test executable path should be retrievable");
+    let current_exe =
+        std::env::current_exe().expect("The current test executable path should be retrievable");
     let target_dir = current_exe
-        .parent().expect("The deps directory should exist")
-        .parent().expect("The target profile directory should exist");
+        .parent()
+        .expect("The deps directory should exist")
+        .parent()
+        .expect("The target profile directory should exist");
     let direct = target_dir.join(format!("jj-cc-server{}", std::env::consts::EXE_SUFFIX));
     if direct.exists() {
         return direct;
@@ -79,12 +82,15 @@ pub async fn spawn_server_with_args(extra_args: &[&str]) -> ServerGuard {
         .spawn()
         .expect("The jj-cc-server process should have spawned");
 
-    let stdout = child.stdout.take().expect("The stdout pipe should have been captured from the child process");
+    let stdout = child
+        .stdout
+        .take()
+        .expect("The stdout pipe should have been captured from the child process");
 
     let mut reader = BufReader::new(stdout).lines();
 
-    // Timeout of 2 seconds to find the listening address in stdout. 
-    // 2 seconds is arbitrary but serves as a safe defensive timeout to prevent 
+    // Timeout of 2 seconds to find the listening address in stdout.
+    // 2 seconds is arbitrary but serves as a safe defensive timeout to prevent
     // the test from hanging indefinitely if the server hangs.
     let timeout = tokio::time::sleep(Duration::from_secs(2));
     tokio::pin!(timeout);
@@ -127,11 +133,12 @@ pub struct TestWorkspace {
 }
 
 impl TestWorkspace {
-    /// Spawns a new dynamic-port `jj-cc-server` instance and initializes a temporary 
+    /// Spawns a new dynamic-port `jj-cc-server` instance and initializes a temporary
     /// Commit Cloud repository workspace using `jj cc init`.
     pub async fn init() -> Self {
         let server = spawn_server().await;
-        let temp_dir = tempfile::tempdir().expect("temporary directory should have been created for testing");
+        let temp_dir =
+            tempfile::tempdir().expect("temporary directory should have been created for testing");
         let repo_path = temp_dir.path();
 
         let mut init_cmd = find_jj_cmd();
@@ -162,10 +169,12 @@ impl TestWorkspace {
     }
 
     pub async fn init_sqlite() -> Self {
-        let db_dir = tempfile::tempdir().expect("temporary directory should have been created for sqlite db");
+        let db_dir = tempfile::tempdir()
+            .expect("temporary directory should have been created for sqlite db");
         let db_path = db_dir.path().join("commit_cloud.db");
         let server = spawn_sqlite_server(&db_path).await;
-        let temp_dir = tempfile::tempdir().expect("temporary directory should have been created for testing");
+        let temp_dir =
+            tempfile::tempdir().expect("temporary directory should have been created for testing");
         let repo_path = temp_dir.path();
 
         let mut init_cmd = find_jj_cmd();
@@ -303,10 +312,16 @@ pub async fn spawn_vfs_mount(workspace_path: &std::path::Path) -> VfsMountGuard 
 }
 
 fn find_daemon_bin() -> std::path::PathBuf {
-    let current_exe = std::env::current_exe().expect("The current test executable path should be retrievable");
+    if let Some(path) = option_env!("JJ_CC_DAEMON_BIN") {
+        return std::path::PathBuf::from(path);
+    }
+    let current_exe =
+        std::env::current_exe().expect("The current test executable path should be retrievable");
     let target_dir = current_exe
-        .parent().expect("The deps directory should exist")
-        .parent().expect("The target profile directory should exist");
+        .parent()
+        .expect("The deps directory should exist")
+        .parent()
+        .expect("The target profile directory should exist");
     let direct = target_dir.join(format!("jj-cc-daemon{}", std::env::consts::EXE_SUFFIX));
     if direct.exists() {
         return direct;
