@@ -8,7 +8,7 @@ name = "jj-cc-server"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1.39", features = ["rt-multi-thread", "macros", "net", "signal", "process"] }
+tokio = { version = "1.39", features = ["rt-multi-thread", "macros", "net", "signal", "process", "time"] }
 clap = { version = "4", features = ["derive", "env"] }
 tonic = "0.12"
 tonic-health = "0.12"

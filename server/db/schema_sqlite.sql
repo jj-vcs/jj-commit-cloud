@@ -109,6 +109,7 @@ CREATE TABLE IF NOT EXISTS workspaces (
     commit_id BLOB NOT NULL,
     operation_id BLOB NOT NULL,
     tree_id BLOB NOT NULL,
+    proto_data BLOB,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (repo_id, user, workspace_name),
     FOREIGN KEY (repo_id) REFERENCES repos(repo_id)

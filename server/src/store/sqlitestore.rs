@@ -12,12 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! SQLite [`Store`] backend for local and single-node deployments.
+//!
+//! # Authority and Crash-Safety Ordering
+//! `ensure_workspace_proto_column` upgrades legacy SQLite `workspaces` tables by adding the
+//! nullable `proto_data` column before serving reads or writes. Workspace CAS writes hold
+//! the connection mutex across read-verify-upsert and return `StoreError::CasConflict` on
+//! mismatch.
+
 use async_trait::async_trait;
 use cc_common::backend::*;
 use cc_common::op_store::*;
 use cc_common::workspace::WorkspaceState;
 use prost::Message;
 use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -71,11 +80,12 @@ impl SqliteStore {
 
     // Reconnects to the SQLite database using the stored path if the connection drops or fails.
     pub fn reconnect(&self) -> Result<(), rusqlite::Error> {
-        let new_conn = match &self.path {
+        let mut new_conn = match &self.path {
             Some(path) => Connection::open(path)?,
             None => Connection::open_in_memory()?,
         };
         new_conn.execute_batch(SQLITE_DATABASE_SCHEMA)?;
+        Self::ensure_workspace_proto_column(&mut new_conn)?;
         let mut conn = self.conn.lock().unwrap();
         *conn = new_conn;
         Ok(())
@@ -93,8 +103,36 @@ impl SqliteStore {
     }
 
     fn init_tables(&self) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
         conn.execute_batch(SQLITE_DATABASE_SCHEMA)?;
+        Self::ensure_workspace_proto_column(&mut conn)?;
+        Ok(())
+    }
+
+    fn ensure_workspace_proto_column(conn: &mut Connection) -> Result<(), rusqlite::Error> {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let has_col = {
+            let mut stmt = tx.prepare("PRAGMA table_info(workspaces)")?;
+            let mut rows = stmt.query([])?;
+            let mut found = false;
+            while let Some(row) = rows.next()? {
+                let name: String = row.get(1)?;
+                if name == "proto_data" {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if !has_col {
+            match tx.execute("ALTER TABLE workspaces ADD COLUMN proto_data BLOB", []) {
+                Ok(_) => {}
+                Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+                    if msg.to_ascii_lowercase().contains("duplicate column name") => {}
+                Err(err) => return Err(err),
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 }
@@ -218,6 +256,22 @@ impl Store for SqliteStore {
         .map_err(|e| StoreError::Task(e.to_string()))?
     }
 
+    async fn has_commit(&self, project_id: &str, commit_id: &[u8]) -> StoreResult<bool> {
+        let conn = self.conn.clone();
+        let project_id = project_id.to_string();
+        let commit_id = commit_id.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT 1 FROM commits WHERE project_id = ?1 AND commit_id = ?2")
+                .map_err(|e| StoreError::Read(e.to_string()))?;
+            stmt.exists(params![project_id, commit_id])
+                .map_err(|e| StoreError::Read(e.to_string()))
+        })
+        .await
+        .map_err(|e| StoreError::Task(e.to_string()))?
+    }
+
     async fn list_project_commit_ids(&self, project_id: &str) -> StoreResult<Vec<CommitId>> {
         let conn = self.conn.clone();
         let project_id = project_id.to_string();
@@ -288,6 +342,37 @@ impl Store for SqliteStore {
                 }
                 None => Ok(None),
             }
+        })
+        .await
+        .map_err(|e| StoreError::Task(e.to_string()))?
+    }
+
+    async fn find_existing_trees(
+        &self,
+        project_id: &str,
+        tree_ids: &[Vec<u8>],
+    ) -> StoreResult<HashSet<Vec<u8>>> {
+        if tree_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let conn = self.conn.clone();
+        let project_id = project_id.to_string();
+        let ids = tree_ids.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT 1 FROM trees WHERE project_id = ?1 AND tree_id = ?2")
+                .map_err(|e| StoreError::Read(e.to_string()))?;
+            let mut found = HashSet::with_capacity(ids.len());
+            for id in ids {
+                if stmt
+                    .exists(params![&project_id, &id])
+                    .map_err(|e| StoreError::Read(e.to_string()))?
+                {
+                    found.insert(id);
+                }
+            }
+            Ok(found)
         })
         .await
         .map_err(|e| StoreError::Task(e.to_string()))?
@@ -422,6 +507,22 @@ impl Store for SqliteStore {
                 )),
                 None => Ok(None),
             }
+        })
+        .await
+        .map_err(|e| StoreError::Task(e.to_string()))?
+    }
+
+    async fn has_view(&self, repo_id: &str, view_id: &[u8]) -> StoreResult<bool> {
+        let conn = self.conn.clone();
+        let repo_id = repo_id.to_string();
+        let view_id = view_id.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT 1 FROM views WHERE repo_id = ?1 AND view_id = ?2")
+                .map_err(|e| StoreError::Read(e.to_string()))?;
+            stmt.exists(params![repo_id, view_id])
+                .map_err(|e| StoreError::Read(e.to_string()))
         })
         .await
         .map_err(|e| StoreError::Task(e.to_string()))?
@@ -629,43 +730,90 @@ impl Store for SqliteStore {
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
             let mut stmt = conn
-                .prepare("SELECT commit_id, operation_id, tree_id FROM workspaces WHERE repo_id = ?1 AND user = ?2 AND workspace_name = ?3")
+                .prepare("SELECT commit_id, operation_id, tree_id, proto_data FROM workspaces WHERE repo_id = ?1 AND user = ?2 AND workspace_name = ?3")
                 .map_err(|e| StoreError::Read(e.to_string()))?;
-            let res: Option<(Vec<u8>, Vec<u8>, Vec<u8>)> = stmt
+            let res: Option<(Vec<u8>, Vec<u8>, Vec<u8>, Option<Vec<u8>>)> = stmt
                 .query_row(params![repo_id, user, workspace_name], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
                 })
                 .optional()
                 .map_err(|e| StoreError::Read(e.to_string()))?;
-            Ok(res.map(|(commit_id, operation_id, tree_id)| WorkspaceState {
-                repo_id,
-                user,
-                workspace_name,
-                commit_id,
-                operation_id,
-                tree_id,
-            }))
+            match res {
+                Some((commit_id, operation_id, tree_id, proto_data)) => {
+                    Ok(Some(super::decode_workspace_row(
+                        repo_id,
+                        user,
+                        workspace_name,
+                        commit_id,
+                        operation_id,
+                        tree_id,
+                        proto_data,
+                    )?))
+                }
+                None => Ok(None),
+            }
         })
         .await
         .map_err(|e| StoreError::Task(e.to_string()))?
     }
 
-    async fn put_workspace(&self, workspace: WorkspaceState) -> StoreResult<()> {
+    #[allow(deprecated)]
+    async fn put_workspace_cas(
+        &self,
+        workspace: WorkspaceState,
+        expected_operation_id: Option<&[u8]>,
+    ) -> StoreResult<()> {
         let conn = self.conn.clone();
+        let expected = expected_operation_id.map(|b| b.to_vec());
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
-            conn.execute(
-                "INSERT OR REPLACE INTO workspaces (repo_id, user, workspace_name, commit_id, operation_id, tree_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            let mut conn = conn.lock().unwrap();
+            let normalized = super::normalize_workspace_record(workspace);
+            let proto_data = normalized.encode_to_vec();
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| StoreError::Write(e.to_string()))?;
+            if expected.is_some() {
+                let existing: Option<(Vec<u8>, Vec<u8>, Vec<u8>, Option<Vec<u8>>)> = tx
+                    .query_row(
+                        "SELECT commit_id, operation_id, tree_id, proto_data FROM workspaces WHERE repo_id = ?1 AND user = ?2 AND workspace_name = ?3",
+                        params![normalized.repo_id, normalized.user, normalized.workspace_name],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )
+                    .optional()
+                    .map_err(|e| StoreError::Read(e.to_string()))?;
+                let existing_ws = match existing {
+                    Some((commit_id, operation_id, tree_id, data)) => {
+                        Some(super::decode_workspace_row(
+                            normalized.repo_id.clone(),
+                            normalized.user.clone(),
+                            normalized.workspace_name.clone(),
+                            commit_id,
+                            operation_id,
+                            tree_id,
+                            data,
+                        )?)
+                    }
+                    None => None,
+                };
+                super::verify_workspace_cas(existing_ws.as_ref(), &normalized, expected.as_deref())?;
+                if existing_ws.as_ref() == Some(&normalized) {
+                    return Ok(());
+                }
+            }
+            tx.execute(
+                "INSERT OR REPLACE INTO workspaces (repo_id, user, workspace_name, commit_id, operation_id, tree_id, proto_data) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
-                    workspace.repo_id,
-                    workspace.user,
-                    workspace.workspace_name,
-                    workspace.commit_id,
-                    workspace.operation_id,
-                    workspace.tree_id,
+                    normalized.repo_id,
+                    normalized.user,
+                    normalized.workspace_name,
+                    normalized.commit_id,
+                    normalized.operation_id,
+                    normalized.tree_id,
+                    proto_data,
                 ],
             )
             .map_err(|e| StoreError::Write(e.to_string()))?;
+            tx.commit().map_err(|e| StoreError::Write(e.to_string()))?;
             Ok(())
         })
         .await
@@ -702,25 +850,119 @@ impl Store for SqliteStore {
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock().unwrap();
             let mut stmt = conn
-                .prepare("SELECT user, workspace_name, commit_id, operation_id, tree_id FROM workspaces WHERE repo_id = ?1")
+                .prepare("SELECT user, workspace_name, commit_id, operation_id, tree_id, proto_data FROM workspaces WHERE repo_id = ?1 ORDER BY user, workspace_name")
                 .map_err(|e| StoreError::Read(e.to_string()))?;
             let rows = stmt
                 .query_map(params![repo_id], |row| {
-                    Ok(WorkspaceState {
-                        repo_id: repo_id.clone(),
-                        user: row.get(0)?,
-                        workspace_name: row.get(1)?,
-                        commit_id: row.get(2)?,
-                        operation_id: row.get(3)?,
-                        tree_id: row.get(4)?,
-                    })
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                        row.get::<_, Option<Vec<u8>>>(5)?,
+                    ))
                 })
                 .map_err(|e| StoreError::Read(e.to_string()))?;
             let mut workspaces = Vec::new();
             for r in rows {
-                workspaces.push(r.map_err(|e| StoreError::Read(e.to_string()))?);
+                let (user, workspace_name, commit_id, operation_id, tree_id, proto_data) =
+                    r.map_err(|e| StoreError::Read(e.to_string()))?;
+                workspaces.push(super::decode_workspace_row(
+                    repo_id.clone(),
+                    user,
+                    workspace_name,
+                    commit_id,
+                    operation_id,
+                    tree_id,
+                    proto_data,
+                )?);
             }
             Ok(workspaces)
+        })
+        .await
+        .map_err(|e| StoreError::Task(e.to_string()))?
+    }
+
+    async fn list_workspaces_page(
+        &self,
+        repo_id: &str,
+        after: Option<(&str, &str)>,
+        limit: usize,
+        max_bytes: Option<usize>,
+    ) -> StoreResult<(Vec<WorkspaceState>, bool)> {
+        if limit == 0 {
+            return Ok((Vec::new(), false));
+        }
+        let conn = self.conn.clone();
+        let repo_id = repo_id.to_string();
+        let after = after.map(|(u, w)| (u.to_string(), w.to_string()));
+        let fetch_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().unwrap();
+            let mut stmt = match &after {
+                Some(_) => conn.prepare(
+                    "SELECT user, workspace_name, commit_id, operation_id, tree_id, proto_data \
+                     FROM workspaces \
+                     WHERE repo_id = ?1 AND (user, workspace_name) > (?2, ?3) \
+                     ORDER BY user ASC, workspace_name ASC \
+                     LIMIT ?4",
+                ),
+                None => conn.prepare(
+                    "SELECT user, workspace_name, commit_id, operation_id, tree_id, proto_data \
+                     FROM workspaces \
+                     WHERE repo_id = ?1 \
+                     ORDER BY user ASC, workspace_name ASC \
+                     LIMIT ?2",
+                ),
+            }
+            .map_err(|e| StoreError::Read(e.to_string()))?;
+            let mut rows = match &after {
+                Some((after_user, after_ws)) => {
+                    stmt.query(params![repo_id, after_user, after_ws, fetch_limit])
+                }
+                None => stmt.query(params![repo_id, fetch_limit]),
+            }
+            .map_err(|e| StoreError::Read(e.to_string()))?;
+
+            let mut workspaces = Vec::new();
+            let mut response_bytes = 0usize;
+            let mut has_more = false;
+            while let Some(row) = rows.next().map_err(|e| StoreError::Read(e.to_string()))? {
+                if workspaces.len() >= limit {
+                    has_more = true;
+                    break;
+                }
+                let user: String = row.get(0).map_err(|e| StoreError::Read(e.to_string()))?;
+                let workspace_name: String =
+                    row.get(1).map_err(|e| StoreError::Read(e.to_string()))?;
+                let commit_id: Vec<u8> = row.get(2).map_err(|e| StoreError::Read(e.to_string()))?;
+                let operation_id: Vec<u8> =
+                    row.get(3).map_err(|e| StoreError::Read(e.to_string()))?;
+                let tree_id: Vec<u8> = row.get(4).map_err(|e| StoreError::Read(e.to_string()))?;
+                let proto_data: Option<Vec<u8>> =
+                    row.get(5).map_err(|e| StoreError::Read(e.to_string()))?;
+                let ws = super::decode_workspace_row(
+                    repo_id.clone(),
+                    user,
+                    workspace_name,
+                    commit_id,
+                    operation_id,
+                    tree_id,
+                    proto_data,
+                )?;
+                let entry_bytes = super::workspace_list_entry_bytes(&ws);
+                if let Some(budget) = max_bytes
+                    && !workspaces.is_empty()
+                    && response_bytes.saturating_add(entry_bytes) > budget
+                {
+                    has_more = true;
+                    break;
+                }
+                response_bytes = response_bytes.saturating_add(entry_bytes);
+                workspaces.push(ws);
+            }
+            Ok((workspaces, has_more))
         })
         .await
         .map_err(|e| StoreError::Task(e.to_string()))?
@@ -1539,6 +1781,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(deprecated)]
     async fn test_sqlite_put_and_read_workspace_succeeds() {
         let store = SqliteStore::in_memory().unwrap();
         store
@@ -1564,6 +1807,10 @@ mod tests {
             commit_id: vec![1, 2, 3, 4],
             operation_id: vec![5, 6, 7, 8],
             tree_id: vec![9, 10, 11, 12],
+            sparse_patterns: vec!["".to_string()],
+            tree_ids: vec![vec![9, 10, 11, 12]],
+            conflict_labels: Vec::new(),
+            sparse_patterns_set: true,
         };
 
         store.put_workspace(ws.clone()).await.unwrap();
@@ -1580,5 +1827,319 @@ mod tests {
         let all = store.list_workspaces("repo-1").await.unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].workspace_name, "default");
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_legacy_workspaces_table_without_proto_data_upgrades_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("legacy.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "
+                CREATE TABLE projects (project_id TEXT PRIMARY KEY, name TEXT);
+                CREATE TABLE repos (repo_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, name TEXT);
+                CREATE TABLE workspaces (
+                    repo_id TEXT NOT NULL,
+                    user TEXT NOT NULL,
+                    workspace_name TEXT NOT NULL,
+                    commit_id BLOB NOT NULL,
+                    operation_id BLOB NOT NULL,
+                    tree_id BLOB NOT NULL,
+                    PRIMARY KEY (repo_id, user, workspace_name)
+                );
+                INSERT INTO projects (project_id) VALUES ('proj-legacy');
+                INSERT INTO repos (repo_id, project_id) VALUES ('repo-legacy', 'proj-legacy');
+                ",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO workspaces (repo_id, user, workspace_name, commit_id, operation_id, tree_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    "repo-legacy",
+                    "alice",
+                    "default",
+                    vec![0x11u8; cc_common::COMMIT_ID_LENGTH],
+                    vec![0x22u8; cc_common::OPERATION_ID_LENGTH],
+                    vec![0x33u8; cc_common::EMPTY_TREE_ID_BYTES.len()],
+                ],
+            )
+            .unwrap();
+        }
+
+        let store = SqliteStore::open(&db_path).unwrap();
+        let ws = store
+            .get_workspace("repo-legacy", "alice", "default")
+            .await
+            .unwrap()
+            .expect("legacy workspace row should decode after migration");
+        assert_eq!(ws.commit_id, vec![0x11u8; cc_common::COMMIT_ID_LENGTH]);
+        assert_eq!(
+            ws.operation_id,
+            vec![0x22u8; cc_common::OPERATION_ID_LENGTH]
+        );
+        assert_eq!(
+            ws.tree_ids,
+            vec![vec![0x33u8; cc_common::EMPTY_TREE_ID_BYTES.len()]]
+        );
+        assert_eq!(ws.sparse_patterns, vec!["".to_string()]);
+        assert!(ws.sparse_patterns_set);
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_concurrent_legacy_proto_column_migration_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("legacy_concurrent.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "
+                CREATE TABLE projects (project_id TEXT PRIMARY KEY, name TEXT);
+                CREATE TABLE repos (repo_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, name TEXT);
+                CREATE TABLE workspaces (
+                    repo_id TEXT NOT NULL,
+                    user TEXT NOT NULL,
+                    workspace_name TEXT NOT NULL,
+                    commit_id BLOB NOT NULL,
+                    operation_id BLOB NOT NULL,
+                    tree_id BLOB NOT NULL,
+                    PRIMARY KEY (repo_id, user, workspace_name)
+                );
+                INSERT INTO projects (project_id) VALUES ('proj-legacy');
+                INSERT INTO repos (repo_id, project_id) VALUES ('repo-legacy', 'proj-legacy');
+                ",
+            )
+            .unwrap();
+        }
+
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let db_path = db_path.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                SqliteStore::open(&db_path)
+            }));
+        }
+        for h in handles {
+            let _store = h
+                .join()
+                .unwrap()
+                .expect("concurrent legacy open must succeed");
+        }
+    }
+
+    #[tokio::test]
+    #[allow(deprecated)]
+    async fn test_sqlite_list_workspaces_page_keyset_pagination() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .register_repo("repo-1".to_string(), "proj-1".to_string(), None)
+            .await
+            .unwrap();
+        store
+            .register_repo("repo-2".to_string(), "proj-1".to_string(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .list_workspaces_page("repo-1", None, 10, None)
+                .await
+                .unwrap(),
+            (Vec::new(), false)
+        );
+
+        let make_ws = |repo_id: &str, user: &str, ws_name: &str| WorkspaceState {
+            repo_id: repo_id.to_string(),
+            user: user.to_string(),
+            workspace_name: ws_name.to_string(),
+            commit_id: cc_common::ROOT_COMMIT_ID_BYTES.to_vec(),
+            operation_id: cc_common::ROOT_OPERATION_ID_BYTES.to_vec(),
+            tree_id: cc_common::EMPTY_TREE_ID_BYTES.to_vec(),
+            sparse_patterns: vec![String::new()],
+            tree_ids: vec![cc_common::EMPTY_TREE_ID_BYTES.to_vec()],
+            conflict_labels: Vec::new(),
+            sparse_patterns_set: true,
+        };
+
+        let fixtures = [
+            ("repo-1", "bob", "ws-2"),
+            ("repo-1", "alice", "z-ws"),
+            ("repo-1", "alice", "a-ws"),
+            ("repo-1", "bob", "ws-1"),
+            ("repo-1", "", "default"),
+            ("repo-1", "carol", "main"),
+            ("repo-2", "alice", "isolated"),
+        ];
+        for (repo, user, ws) in fixtures {
+            store.put_workspace(make_ws(repo, user, ws)).await.unwrap();
+        }
+
+        assert_eq!(
+            store
+                .list_workspaces_page("repo-1", None, 0, None)
+                .await
+                .unwrap(),
+            (Vec::new(), false)
+        );
+
+        let (p1, has_more1) = store
+            .list_workspaces_page("repo-1", None, 2, None)
+            .await
+            .unwrap();
+        let keys1: Vec<(&str, &str)> = p1
+            .iter()
+            .map(|w| (w.user.as_str(), w.workspace_name.as_str()))
+            .collect();
+        assert_eq!(keys1, vec![("", "default"), ("alice", "a-ws")]);
+        assert!(has_more1);
+
+        let (p2, has_more2) = store
+            .list_workspaces_page("repo-1", Some(("alice", "a-ws")), 2, None)
+            .await
+            .unwrap();
+        let keys2: Vec<(&str, &str)> = p2
+            .iter()
+            .map(|w| (w.user.as_str(), w.workspace_name.as_str()))
+            .collect();
+        assert_eq!(keys2, vec![("alice", "z-ws"), ("bob", "ws-1")]);
+        assert!(has_more2);
+
+        let (p3, has_more3) = store
+            .list_workspaces_page("repo-1", Some(("bob", "ws-1")), 5, None)
+            .await
+            .unwrap();
+        let keys3: Vec<(&str, &str)> = p3
+            .iter()
+            .map(|w| (w.user.as_str(), w.workspace_name.as_str()))
+            .collect();
+        assert_eq!(keys3, vec![("bob", "ws-2"), ("carol", "main")]);
+        assert!(!has_more3);
+
+        assert_eq!(
+            store
+                .list_workspaces_page("repo-1", Some(("carol", "main")), 5, None)
+                .await
+                .unwrap(),
+            (Vec::new(), false)
+        );
+        assert_eq!(
+            store
+                .list_workspaces_page("repo-1", Some(("zzz", "zzz")), 5, None)
+                .await
+                .unwrap(),
+            (Vec::new(), false)
+        );
+
+        let (after_gap, has_more_gap) = store
+            .list_workspaces_page("repo-1", Some(("alice", "m-deleted")), 2, None)
+            .await
+            .unwrap();
+        let gap_keys: Vec<(&str, &str)> = after_gap
+            .iter()
+            .map(|w| (w.user.as_str(), w.workspace_name.as_str()))
+            .collect();
+        assert_eq!(gap_keys, vec![("alice", "z-ws"), ("bob", "ws-1")]);
+        assert!(has_more_gap);
+
+        // Tight byte budget always returns at least one record and sets has_more = true.
+        let (single, has_more_budget) = store
+            .list_workspaces_page("repo-1", None, 10, Some(1))
+            .await
+            .unwrap();
+        assert_eq!(single.len(), 1);
+        assert!(has_more_budget);
+
+        // Verify SQLite uses a primary-key range seek for the row-value cursor predicate.
+        let plan: String = {
+            let conn = store.conn.lock().unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "EXPLAIN QUERY PLAN \
+                     SELECT user, workspace_name, commit_id, operation_id, tree_id, proto_data \
+                     FROM workspaces \
+                     WHERE repo_id = ?1 AND (user, workspace_name) > (?2, ?3) \
+                     ORDER BY user ASC, workspace_name ASC \
+                     LIMIT ?4",
+                )
+                .unwrap();
+            stmt.query_map(params!["repo-1", "alice", "a-ws", 2i64], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n")
+        };
+        assert!(
+            plan.contains("SEARCH workspaces USING INDEX")
+                && (plan.contains("user>?") || plan.contains("(user,workspace_name)>"))
+                && !plan.contains("USE TEMP B-TREE"),
+            "expected primary-key B-tree seek on (repo_id, user, workspace_name), got: {plan}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_lightweight_existence_checks_avoid_decoding_payloads() {
+        let store = SqliteStore::in_memory().unwrap();
+        store
+            .register_repo("repo-1".to_string(), "proj-1".to_string(), None)
+            .await
+            .unwrap();
+
+        let c1 = vec![0x11; 20];
+        let v1 = vec![0x22; 16];
+        let t1 = vec![0x33; 20];
+        let t2 = vec![0x44; 20];
+        let t_missing = vec![0x55; 20];
+
+        assert!(!store.has_commit("proj-1", &c1).await.unwrap());
+        assert!(!store.has_view("repo-1", &v1).await.unwrap());
+        assert!(
+            store
+                .find_existing_trees("proj-1", &[t1.clone(), t2.clone()])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Insert raw rows (including undecodable bytes) to prove existence checks do not decode blobs.
+        {
+            let conn = store.conn.lock().unwrap();
+            let invalid_proto = vec![0xFFu8, 0xFF, 0xFF, 0xFF];
+            conn.execute(
+                "INSERT INTO commits (project_id, commit_id, data) VALUES (?1, ?2, ?3)",
+                params!["proj-1", &c1, &invalid_proto],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO views (repo_id, view_id, data) VALUES (?1, ?2, ?3)",
+                params!["repo-1", &v1, &invalid_proto],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO trees (project_id, tree_id, data) VALUES (?1, ?2, ?3)",
+                params!["proj-1", &t1, &invalid_proto],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO trees (project_id, tree_id, data) VALUES (?1, ?2, ?3)",
+                params!["proj-1", &t2, &invalid_proto],
+            )
+            .unwrap();
+        }
+
+        assert!(store.has_commit("proj-1", &c1).await.unwrap());
+        assert!(!store.has_commit("proj-other", &c1).await.unwrap());
+        assert!(store.has_view("repo-1", &v1).await.unwrap());
+        assert!(!store.has_view("repo-other", &v1).await.unwrap());
+        let found = store
+            .find_existing_trees("proj-1", &[t1.clone(), t_missing, t2.clone()])
+            .await
+            .unwrap();
+        assert_eq!(found, HashSet::from([t1, t2]));
     }
 }
