@@ -42,6 +42,8 @@ enum CcCommands {
     Clone(commands::clone::CcCloneArgs),
     /// Import commits, trees, blobs, symlinks, and branches from a Git repository
     ImportGit(commands::import_git::ImportGitArgs),
+    /// Export commits, trees, blobs, symlinks, and bookmarks to a Git repository
+    ExportGit(commands::export_git::ExportGitArgs),
     /// Inspect or manage cloud-tracked workspace states on the server
     Workspace(commands::workspace::WorkspaceArgs),
     /// Manage the local two-tier caching `jj-cc-daemon` gRPC proxy
@@ -84,6 +86,9 @@ async fn run_custom_command(
                 commands::clone::cmd_cc_clone(ui, command_helper, &args).await
             }
             CcCommands::ImportGit(args) => commands::import_git::cmd_import_git(&args).await,
+            CcCommands::ExportGit(args) => {
+                commands::export_git::cmd_export_git(command_helper, &args).await
+            }
             CcCommands::Workspace(args) => {
                 commands::workspace::cmd_cc_workspace(ui, command_helper, &args).await
             }
