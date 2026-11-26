@@ -194,7 +194,7 @@ impl OpStore for ServerOpStore {
             .map_err(|e| OpStoreError::Other(e.into()))?
         {
             validate_stored_operation(id, &op).map_err(|e| OpStoreError::Other(e.into()))?;
-            let converted = operation_from_proto(op);
+            let converted = operation_from_proto(op)?;
             OPERATION_CACHE
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -225,7 +225,7 @@ impl OpStore for ServerOpStore {
                 commit_predecessors: vec![],
                 commit_predecessors_set: true,
             };
-            let converted = operation_from_proto(root_op);
+            let converted = operation_from_proto(root_op)?;
             OPERATION_CACHE
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -279,7 +279,7 @@ impl OpStore for ServerOpStore {
             .map_err(|e| OpStoreError::Other(e.into()))?
         {
             validate_stored_view(id, &view).map_err(|e| OpStoreError::Other(e.into()))?;
-            return Ok(view_from_proto(view));
+            return view_from_proto(view);
         }
 
         if id.as_bytes() == cc_common::ROOT_VIEW_ID_BYTES {
@@ -289,7 +289,7 @@ impl OpStore for ServerOpStore {
                 local_bookmarks: HashMap::new(),
                 remote_bookmarks: HashMap::new(),
             };
-            return Ok(view_from_proto(root_view));
+            return view_from_proto(root_view);
         }
 
         Err(OpStoreError::ObjectNotFound {

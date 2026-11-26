@@ -359,7 +359,7 @@ impl Backend for ServerBackend {
                 other => BackendError::Other(other.into()),
             })?;
         validate_stored_commit(id, &mut proto_commit).map_err(|e| BackendError::Other(e.into()))?;
-        Ok(commit_from_proto(proto_commit))
+        commit_from_proto(proto_commit)
     }
 
     async fn write_commit(

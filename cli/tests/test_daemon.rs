@@ -12,546 +12,554 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use cc_common::backend::backend_service_client::BackendServiceClient;
-use cc_common::backend::{
-    File, ReadCommitRequest, ReadTreeRequest, RegisterRepositoryRequest, TreeEntry, TreeValue,
-    WriteCommitRequest, WriteFileRequest, WriteTreeRequest, tree_value,
-};
-use cc_common::op_store::op_store_service_client::OpStoreServiceClient;
-use cc_common::op_store::{ReadOperationRequest, WriteOperationRequest};
-use cc_common::workspace::workspace_service_client::WorkspaceServiceClient;
-use cc_common::workspace::{
-    DeleteWorkspaceRequest, GetWorkspaceRequest, UpdateWorkspaceRequest, WorkspaceState,
-};
-use hyper_util::rt::TokioIo;
 use std::fs;
-use testutils::{TestWorkspace, spawn_daemon, spawn_server};
-use tokio::net::UnixStream;
-use tonic::transport::{Endpoint, Uri};
-use tower::service_fn;
+use std::path::{Path, PathBuf};
 
-#[tokio::test]
-async fn test_daemon_command_toggles_config() {
-    let ws = TestWorkspace::init().await;
+use assert_cmd::Command;
+use cc_lib::daemon_client::read_daemon_stats;
+use cc_lib::util::CommitCloudConfig;
 
-    // Check initial status
-    let mut cmd = ws.jj_cmd();
-    let assert = cmd.args(["cc", "daemon", "--status"]).assert().success();
-    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
-    assert!(
-        stdout.contains("Enabled: true"),
-        "Daemon should be enabled by default"
-    );
+fn jj_daemon_cmd(cwd: &Path, xdg: &Path, daemon_dir: &Path, cache_dir: &Path) -> Command {
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("jj");
+    cmd.current_dir(cwd)
+        .env("XDG_CONFIG_HOME", xdg)
+        .env("JJ_CC_DAEMON_DIR", daemon_dir)
+        .env("JJ_CC_CACHE_DIR", cache_dir)
+        .env("JJ_CC_DAEMON_CONFIG", xdg.join("daemon.toml"))
+        .env("JJ_CC_DAEMON_BIN", testutils::daemon_binary_path())
+        .env("JJ_CC_DAEMON_IDLE_SECS", "30")
+        .env("JJ_USER", "Daemon Tester")
+        .env("JJ_EMAIL", "daemon@example.com");
+    cmd
+}
 
-    // Disable daemon
-    let mut cmd = ws.jj_cmd();
-    cmd.args(["cc", "daemon", "--disable"]).assert().success();
+struct DaemonStopGuard {
+    cwd: PathBuf,
+    xdg: PathBuf,
+    daemon_dir: PathBuf,
+    cache_dir: PathBuf,
+}
 
-    let config_path = ws.repo_path().join(".jj/repo/store/config.toml");
-    let content = fs::read_to_string(&config_path).unwrap();
-    assert!(
-        content.contains("use_daemon = false"),
-        "config.toml should have use_daemon = false"
-    );
+impl DaemonStopGuard {
+    fn new(cwd: &Path, xdg: &Path, daemon_dir: &Path, cache_dir: &Path) -> Self {
+        Self {
+            cwd: cwd.to_path_buf(),
+            xdg: xdg.to_path_buf(),
+            daemon_dir: daemon_dir.to_path_buf(),
+            cache_dir: cache_dir.to_path_buf(),
+        }
+    }
+}
 
-    // Check status again
-    let mut cmd = ws.jj_cmd();
-    let assert = cmd.args(["cc", "daemon", "--status"]).assert().success();
-    let stdout = String::from_utf8_lossy(&assert.get_output().stdout);
-    assert!(
-        stdout.contains("Enabled: false"),
-        "Daemon should now be disabled"
-    );
-
-    // Re-enable daemon
-    let mut cmd = ws.jj_cmd();
-    cmd.args(["cc", "daemon", "--enable"]).assert().success();
-
-    let content = fs::read_to_string(&config_path).unwrap();
-    assert!(
-        content.contains("use_daemon = true"),
-        "config.toml should have use_daemon = true"
-    );
+impl Drop for DaemonStopGuard {
+    fn drop(&mut self) {
+        if self.daemon_dir.join("daemon.json").exists() {
+            let _ = jj_daemon_cmd(&self.cwd, &self.xdg, &self.daemon_dir, &self.cache_dir)
+                .args(["cc", "daemon", "stop"])
+                .ok();
+        }
+    }
 }
 
 #[tokio::test]
-async fn test_daemon_routes_rpc_calls_over_uds() {
-    let server = spawn_server().await;
-    let daemon = spawn_daemon(server.url()).await;
+async fn test_daemon_autospawn_two_tier_cache_exceeds_80_percent_warm_hit_rate_and_persists_l2() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let xdg = dir.path().join("xdg");
+    let daemon_dir = dir.path().join("daemon_state");
+    let cache_dir = dir.path().join("daemon_cache");
+    fs::create_dir_all(&xdg).unwrap();
+    let _daemon_guard = DaemonStopGuard::new(dir.path(), &xdg, &daemon_dir, &cache_dir);
 
-    let socket_path = daemon.socket_path().to_path_buf();
-    let channel = Endpoint::try_from("http://[::]:50051")
-        .unwrap()
-        .connect_with_connector(service_fn(move |_: Uri| {
-            let path = socket_path.clone();
-            async move {
-                let stream = UnixStream::connect(path).await?;
-                Ok::<_, std::io::Error>(TokioIo::new(stream))
-            }
-        }))
-        .await
-        .expect("Failed to connect to daemon over UDS");
+    let server = testutils::spawn_sqlite_server(&dir.path().join("daemon_test.db")).await;
 
-    let mut backend_client = BackendServiceClient::new(channel.clone());
-    let mut op_store_client = OpStoreServiceClient::new(channel.clone());
-    let mut workspace_client = WorkspaceServiceClient::new(channel);
+    jj_daemon_cmd(dir.path(), &xdg, &daemon_dir, &cache_dir)
+        .args(["cc", "daemon", "enable"])
+        .assert()
+        .success();
 
-    // Test BackendService over daemon UDS
-    let reg_resp = backend_client
-        .register_repository(RegisterRepositoryRequest {
-            project_id: "daemon-test-project".to_string(),
-            repo_id: None,
-            name: Some("daemon-test-repo".to_string()),
-            hash_algorithm: cc_common::backend::HashAlgorithm::Sha1 as i32,
-        })
-        .await
-        .expect("Failed to register repo via daemon")
-        .into_inner();
-    let project_id = reg_resp.project_id;
-    let repo_id = reg_resp.repo_id;
-    assert!(!project_id.is_empty());
-    assert!(!repo_id.is_empty());
-
-    let test_commit = cc_common::backend::Commit {
-        parent_commit_ids: vec![cc_common::ROOT_COMMIT_ID_BYTES.to_vec()],
-        predecessors: vec![],
-        root_tree_id: vec![cc_common::EMPTY_TREE_ID_BYTES.to_vec()],
-        change_id: vec![4; cc_common::CHANGE_ID_LENGTH],
-        description: "Commit through daemon".to_string(),
-        author: None,
-        committer: None,
-        commit_id: vec![],
-        conflict_labels: vec![],
-        secure_sig: None,
-        raw_git_commit: vec![],
-        external_ids: Default::default(),
-    };
-
-    let write_commit_resp = backend_client
-        .write_commit(WriteCommitRequest {
-            project_id: project_id.clone(),
-            commit: Some(test_commit.clone()),
-        })
-        .await
-        .expect("Failed to write commit via daemon")
-        .into_inner();
-    let written_commit_id = write_commit_resp.commit_id;
-    assert!(!written_commit_id.is_empty());
-
-    let read_commit_resp = backend_client
-        .read_commit(ReadCommitRequest {
-            project_id: project_id.clone(),
-            commit_id: written_commit_id.clone(),
-        })
-        .await
-        .expect("Failed to read commit via daemon")
-        .into_inner();
-    assert_eq!(
-        read_commit_resp.commit.unwrap().description,
-        "Commit through daemon"
-    );
-
-    // Test OpStoreService over daemon UDS
-    let test_op = cc_common::op_store::Operation {
-        parents: vec![cc_common::ROOT_OPERATION_ID_BYTES.to_vec()],
-        view_id: cc_common::ROOT_VIEW_ID_BYTES.to_vec(),
-        metadata: None,
-        commit_predecessors: vec![],
-        commit_predecessors_set: false,
-    };
-
-    let write_op_resp = op_store_client
-        .write_operation(WriteOperationRequest {
-            repo_id: repo_id.clone(),
-            operation: Some(test_op),
-        })
-        .await
-        .expect("Failed to write operation via daemon")
-        .into_inner();
-    let op_id = write_op_resp.operation_id;
-    assert!(!op_id.is_empty());
-
-    let read_op_resp = op_store_client
-        .read_operation(ReadOperationRequest {
-            repo_id: repo_id.clone(),
-            operation_id: op_id,
-        })
-        .await
-        .expect("Failed to read operation via daemon")
-        .into_inner();
-    assert_eq!(
-        read_op_resp.operation.unwrap().view_id,
-        cc_common::ROOT_VIEW_ID_BYTES.to_vec()
-    );
-
-    // Test WorkspaceService over daemon UDS
-    #[allow(deprecated)]
-    let ws_state = WorkspaceState {
-        repo_id: repo_id.clone(),
-        user: "daemon.user@example.com".to_string(),
-        workspace_name: "default".to_string(),
-        commit_id: written_commit_id.clone(),
-        operation_id: cc_common::ROOT_OPERATION_ID_BYTES.to_vec(),
-        tree_id: cc_common::EMPTY_TREE_ID_BYTES.to_vec(),
-        sparse_patterns: vec![String::new()],
-        tree_ids: vec![cc_common::EMPTY_TREE_ID_BYTES.to_vec()],
-        conflict_labels: Vec::new(),
-        sparse_patterns_set: true,
-    };
-
-    let update_resp = workspace_client
-        .update_workspace(UpdateWorkspaceRequest {
-            workspace: Some(ws_state.clone()),
-            expected_operation_id: None,
-        })
-        .await
-        .expect("Failed to update workspace via daemon")
-        .into_inner();
-    assert!(update_resp.success);
-    assert_eq!(
-        update_resp.workspace.as_ref().map(|w| &w.commit_id),
-        Some(&written_commit_id)
-    );
-
-    let get_ws_resp = workspace_client
-        .get_workspace(GetWorkspaceRequest {
-            repo_id: repo_id.clone(),
-            user: "daemon.user@example.com".to_string(),
-            workspace_name: "default".to_string(),
-        })
-        .await
-        .expect("Failed to get workspace via daemon")
-        .into_inner();
-    assert!(get_ws_resp.workspace.is_some());
-    assert_eq!(get_ws_resp.workspace.unwrap().commit_id, written_commit_id);
-
-    let del_ws_resp = workspace_client
-        .delete_workspace(DeleteWorkspaceRequest {
-            repo_id: repo_id.clone(),
-            user: "daemon.user@example.com".to_string(),
-            workspace_name: "default".to_string(),
-        })
-        .await
-        .expect("Failed to delete workspace via daemon")
-        .into_inner();
-    assert!(del_ws_resp.existed);
-}
-
-#[tokio::test]
-async fn test_daemon_auto_spawn_on_cli_command() {
-    let server = spawn_server().await;
-    let temp_dir = tempfile::tempdir().unwrap();
-
-    // In the server's sandbox, so the auto-started daemon stops with it.
-    let socket_path = server.daemon_socket_dir().join("auto_spawn.sock");
-    assert!(!socket_path.exists());
-
-    let mut init_cmd = server.jj_cmd();
-    init_cmd
-        .current_dir(temp_dir.path())
-        .env("JJ_USER", "Test User")
-        .env("JJ_EMAIL", "test.user@example.com")
+    // Initializing ws1 auto-spawns `jj-cc-daemon` on demand.
+    let ws1 = dir.path().join("ws1");
+    jj_daemon_cmd(dir.path(), &xdg, &daemon_dir, &cache_dir)
         .args([
             "cc",
             "init",
-            "--create",
-            "--project-id",
-            "auto-spawn-project",
             "--server",
             server.url(),
-            ".",
-        ]);
-    init_cmd.assert().success();
-
-    // Set custom socket in config.toml to test auto-spawning to that specific path
-    let config_path = temp_dir.path().join(".jj/repo/store/config.toml");
-    let config_str = fs::read_to_string(&config_path).unwrap();
-    let mut config: toml::Value = toml::from_str(&config_str).unwrap();
-    config.as_table_mut().unwrap().insert(
-        "daemon_socket".to_string(),
-        toml::Value::String(socket_path.to_str().unwrap().to_string()),
-    );
-    fs::write(&config_path, toml::to_string_pretty(&config).unwrap()).unwrap();
-
-    // Verify socket does not exist yet before any commands run
-    assert!(!socket_path.exists());
-
-    // Run describe command - should auto-spawn the daemon at the specified socket
-    let test_file = temp_dir.path().join("test.txt");
-    fs::write(&test_file, "auto spawned daemon test").unwrap();
-
-    let mut describe_cmd = server.jj_cmd();
-    describe_cmd
-        .current_dir(temp_dir.path())
-        .env("JJ_USER", "Test User")
-        .env("JJ_EMAIL", "test.user@example.com")
-        .args(["describe", "-m", "auto spawn commit"])
+            ws1.to_str().unwrap(),
+        ])
         .assert()
         .success();
-
-    // Verify socket was created and is active
     assert!(
-        socket_path.exists(),
-        "Daemon socket should have been auto-spawned"
+        daemon_dir.join("daemon.json").is_file(),
+        "jj-cc-daemon should auto-spawn and write daemon.json"
+    );
+    assert!(
+        daemon_dir.join("daemon.log").is_file(),
+        "auto-spawned jj-cc-daemon should redirect logs to daemon.log"
     );
 
-    // Run log command to verify it communicates through the auto-spawned daemon
-    let mut log_cmd = server.jj_cmd();
-    let output = log_cmd
-        .current_dir(temp_dir.path())
-        .env("JJ_USER", "Test User")
-        .env("JJ_EMAIL", "test.user@example.com")
-        .args(["log"])
+    fs::create_dir_all(ws1.join("src")).unwrap();
+    fs::write(ws1.join("src/main.rs"), "fn main() { println!(\"v1\"); }\n").unwrap();
+    fs::write(ws1.join("src/util.rs"), "pub fn helper() -> usize { 42 }\n").unwrap();
+    let payload: Vec<u8> = (0..(256 * 1024)).map(|i| (i % 251) as u8).collect();
+    fs::write(ws1.join("src/data.bin"), &payload).unwrap();
+
+    jj_daemon_cmd(&ws1, &xdg, &daemon_dir, &cache_dir)
+        .args(["commit", "-m", "initial commit via daemon"])
         .assert()
         .success();
-    let stdout = String::from_utf8_lossy(&output.get_output().stdout);
-    assert!(stdout.contains("auto spawn commit"));
+
+    let cfg = CommitCloudConfig::load_from_store(&ws1).unwrap();
+
+    // Clone ws2 on the same host and run repeated reads to warm the daemon cache.
+    let ws2 = dir.path().join("ws2");
+    jj_daemon_cmd(dir.path(), &xdg, &daemon_dir, &cache_dir)
+        .args([
+            "cc",
+            "clone",
+            "--server",
+            server.url(),
+            &cfg.repo_id,
+            ws2.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    assert_eq!(fs::read(ws2.join("src/data.bin")).unwrap(), payload);
+
+    for _ in 0..4 {
+        jj_daemon_cmd(&ws2, &xdg, &daemon_dir, &cache_dir)
+            .args(["log", "-r", "::@", "-T", "commit_id ++ \"\\n\""])
+            .assert()
+            .success();
+        jj_daemon_cmd(&ws2, &xdg, &daemon_dir, &cache_dir)
+            .args(["diff", "-r", "@-"])
+            .assert()
+            .success();
+        jj_daemon_cmd(&ws2, &xdg, &daemon_dir, &cache_dir)
+            .args(["file", "show", "-r", "@-", "src/main.rs"])
+            .assert()
+            .success();
+    }
+
+    let status_out = String::from_utf8(
+        jj_daemon_cmd(&ws2, &xdg, &daemon_dir, &cache_dir)
+            .args(["cc", "daemon", "status"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(status_out.contains("RUNNING"));
+
+    // Stopping the daemon flushes final stats; restarting it starts with a cold L1 RAM
+    // cache over the surviving L2 disk CAS so subsequent reads exercise L2 hits.
+    jj_daemon_cmd(dir.path(), &xdg, &daemon_dir, &cache_dir)
+        .args(["cc", "daemon", "stop"])
+        .assert()
+        .success();
+    assert!(!daemon_dir.join("daemon.json").exists());
+
+    let stats = read_daemon_stats(&daemon_dir).expect("daemon.stats.json should exist");
+    assert!(
+        stats.hit_ratio_percent() > 80.0,
+        "expected >80% warm cache hit ratio (C1), got {:.1}% ({stats:?})",
+        stats.hit_ratio_percent()
+    );
+
+    jj_daemon_cmd(dir.path(), &xdg, &daemon_dir, &cache_dir)
+        .args(["cc", "daemon", "start", "--idle-timeout-secs", "30"])
+        .assert()
+        .success();
+    jj_daemon_cmd(&ws2, &xdg, &daemon_dir, &cache_dir)
+        .args(["diff", "-r", "@-"])
+        .assert()
+        .success();
+
+    jj_daemon_cmd(dir.path(), &xdg, &daemon_dir, &cache_dir)
+        .args(["cc", "daemon", "stop"])
+        .assert()
+        .success();
+
+    let restarted_stats =
+        read_daemon_stats(&daemon_dir).expect("restarted daemon.stats.json should exist");
+    assert!(
+        restarted_stats.l2_hits > 0,
+        "restarted daemon should serve warm objects from surviving L2 disk CAS ({restarted_stats:?})"
+    );
 }
 
 #[tokio::test]
-async fn test_daemon_cold_and_warm_read_tree_against_server() {
-    let server = spawn_server().await;
-    let daemon = spawn_daemon(server.url()).await;
+async fn test_daemon_preserves_repo_path_component_sort_order_and_isolates_unrelated_projects() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let xdg = dir.path().join("xdg");
+    let daemon_dir = dir.path().join("daemon_state");
+    let cache_dir = dir.path().join("daemon_cache");
+    fs::create_dir_all(&xdg).unwrap();
+    let _daemon_guard = DaemonStopGuard::new(dir.path(), &xdg, &daemon_dir, &cache_dir);
 
-    // Write project, files, and trees directly to `jj-cc-server` so `jj-cc-daemon` is cold.
-    let direct_channel = Endpoint::from_shared(server.url().to_string())
+    let server = testutils::spawn_sqlite_server(&dir.path().join("daemon_sort_iso.db")).await;
+
+    jj_daemon_cmd(dir.path(), &xdg, &daemon_dir, &cache_dir)
+        .args(["cc", "daemon", "enable"])
+        .assert()
+        .success();
+
+    let ws_a = dir.path().join("ws_a");
+    jj_daemon_cmd(dir.path(), &xdg, &daemon_dir, &cache_dir)
+        .args([
+            "cc",
+            "init",
+            "--server",
+            server.url(),
+            "--project-id",
+            "proj-alpha",
+            "--create",
+            ws_a.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // Regression: directory `foo/` coexisting with `foo-bar.rs` ('-' = 45) and `foo.rs` ('.' =
+    // 46). Git hashes sort `"foo-bar.rs" < "foo.rs" < "foo/"`, whereas
+    // `jj_lib::backend::Tree::from_sorted_entries` requires strict UTF-8 component order `"foo" <
+    // "foo-bar.rs" < "foo.rs"`.
+    fs::create_dir_all(ws_a.join("src/foo")).unwrap();
+    fs::write(ws_a.join("src/foo/mod.rs"), "pub fn sub() {}\n").unwrap();
+    fs::write(ws_a.join("src/foo-bar.rs"), "pub fn dash() {}\n").unwrap();
+    fs::write(ws_a.join("src/foo.rs"), "pub fn dot() {}\n").unwrap();
+
+    jj_daemon_cmd(&ws_a, &xdg, &daemon_dir, &cache_dir)
+        .args(["commit", "-m", "tree sort collision via daemon"])
+        .assert()
+        .success();
+
+    // Reading back from the daemon's write-through cache must preserve `RepoPathComponent` sort
+    // order.
+    for rel in ["src/foo/mod.rs", "src/foo-bar.rs", "src/foo.rs"] {
+        jj_daemon_cmd(&ws_a, &xdg, &daemon_dir, &cache_dir)
+            .args(["file", "show", "-r", "@-", rel])
+            .assert()
+            .success();
+    }
+    jj_daemon_cmd(&ws_a, &xdg, &daemon_dir, &cache_dir)
+        .args(["diff", "-r", "@-"])
+        .assert()
+        .success();
+
+    // Regression: an unrelated project (`proj-beta`) sharing the same local `jj-cc-daemon`
+    // must NOT be able to read `proj-alpha`'s cached file blobs.
+    let ws_b = dir.path().join("ws_b");
+    jj_daemon_cmd(dir.path(), &xdg, &daemon_dir, &cache_dir)
+        .args([
+            "cc",
+            "init",
+            "--server",
+            server.url(),
+            "--project-id",
+            "proj-beta",
+            "--create",
+            ws_b.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let cfg_a = CommitCloudConfig::load_from_store(&ws_a).unwrap();
+    let cfg_b = CommitCloudConfig::load_from_store(&ws_b).unwrap();
+    let commit_hex = String::from_utf8(
+        jj_daemon_cmd(&ws_a, &xdg, &daemon_dir, &cache_dir)
+            .args(["log", "--no-graph", "-r", "@-", "-T", "commit_id"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    let commit_bytes = hex::decode(commit_hex).unwrap();
+
+    let (_, channel) = cc_lib::daemon_client::connect_existing_daemon(&daemon_dir)
+        .await
+        .unwrap()
+        .expect("daemon should be listening");
+
+    let mut daemon_backend =
+        cc_common::backend::backend_service_client::BackendServiceClient::new(channel);
+    let mut read_commit_req = tonic::Request::new(cc_common::backend::ReadCommitRequest {
+        project_id: cfg_a.effective_project_id().to_string(),
+        commit_id: commit_bytes,
+    });
+    read_commit_req
+        .metadata_mut()
+        .insert("x-jj-cc-upstream", server.url().parse().unwrap());
+    let root_tree_id = daemon_backend
+        .read_commit(read_commit_req)
+        .await
+        .unwrap()
+        .into_inner()
+        .commit
+        .unwrap()
+        .root_tree_id[0]
+        .clone();
+
+    let mut read_root_req = tonic::Request::new(cc_common::backend::ReadTreeRequest {
+        project_id: cfg_a.effective_project_id().to_string(),
+        path: "src".to_string(),
+        tree_id: root_tree_id,
+        page_size: 0,
+        page_token: String::new(),
+    });
+    read_root_req
+        .metadata_mut()
+        .insert("x-jj-cc-upstream", server.url().parse().unwrap());
+    let root_entries = daemon_backend
+        .read_tree(read_root_req)
+        .await
+        .unwrap()
+        .into_inner()
+        .entries;
+    let src_tree_id = root_entries
+        .iter()
+        .find(|e| e.name == "src")
+        .and_then(|e| e.value.as_ref())
+        .and_then(|v| match v.value.as_ref() {
+            Some(cc_common::backend::tree_value::Value::TreeId(id)) => Some(id.clone()),
+            _ => None,
+        })
+        .expect("src tree entry");
+
+    let mut read_src_req = tonic::Request::new(cc_common::backend::ReadTreeRequest {
+        project_id: cfg_a.effective_project_id().to_string(),
+        path: "src".to_string(),
+        tree_id: src_tree_id,
+        page_size: 0,
+        page_token: String::new(),
+    });
+    read_src_req
+        .metadata_mut()
+        .insert("x-jj-cc-upstream", server.url().parse().unwrap());
+    let src_entries = daemon_backend
+        .read_tree(read_src_req)
+        .await
+        .unwrap()
+        .into_inner()
+        .entries;
+    let src_names: Vec<&str> = src_entries.iter().map(|e| e.name.as_str()).collect();
+    assert_eq!(src_names, vec!["foo", "foo-bar.rs", "foo.rs"]);
+
+    let foo_rs_file = src_entries
+        .iter()
+        .find(|e| e.name == "foo.rs")
+        .and_then(|e| e.value.as_ref())
+        .and_then(|v| match v.value.as_ref() {
+            Some(cc_common::backend::tree_value::Value::File(f)) => Some(f.clone()),
+            _ => None,
+        })
+        .expect("foo.rs file entry");
+    assert_eq!(
+        foo_rs_file.size_bytes,
+        Some("pub fn dot() {}\n".len() as u64)
+    );
+
+    // Probe `foo_rs_file.id` through the daemon using `cfg_b`'s project (`proj-beta`): must be
+    // NOT_FOUND.
+    let mut unauthorized_read = tonic::Request::new(cc_common::backend::ReadFileRequest {
+        project_id: cfg_b.effective_project_id().to_string(),
+        file_id: foo_rs_file.id,
+        offset: 0,
+        max_bytes: 0,
+    });
+    unauthorized_read
+        .metadata_mut()
+        .insert("x-jj-cc-upstream", server.url().parse().unwrap());
+    let err = daemon_backend
+        .read_file(unauthorized_read)
+        .await
+        .expect_err("proj-beta must not read proj-alpha's cached blob from daemon");
+    assert_eq!(err.code(), tonic::Code::NotFound);
+
+    jj_daemon_cmd(dir.path(), &xdg, &daemon_dir, &cache_dir)
+        .args(["cc", "daemon", "stop"])
+        .assert()
+        .success();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_daemon_stop_does_not_signal_unrelated_process_from_stale_daemon_json() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let xdg = dir.path().join("xdg");
+    let daemon_dir = dir.path().join("daemon_state");
+    let cache_dir = dir.path().join("daemon_cache");
+    fs::create_dir_all(&xdg).unwrap();
+    cc_lib::daemon_client::ensure_private_state_dir(&daemon_dir).unwrap();
+
+    let mut innocent = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    let stale_json = format!(
+        r#"{{"pid":{},"socket_path":"{}","tcp_addr":null,"cache_dir":"{}","stats_path":"{}","default_upstream":null,"started_unix_secs":1}}"#,
+        innocent.id(),
+        daemon_dir.join("daemon.sock").display(),
+        cache_dir.display(),
+        daemon_dir.join("daemon.stats.json").display(),
+    );
+    fs::write(daemon_dir.join("daemon.json"), stale_json).unwrap();
+
+    jj_daemon_cmd(dir.path(), &xdg, &daemon_dir, &cache_dir)
+        .args(["cc", "daemon", "stop"])
+        .assert()
+        .success();
+
+    assert!(
+        innocent.try_wait().unwrap().is_none(),
+        "jj cc daemon stop must never kill a recycled PID when the daemon socket is dead"
+    );
+    let _ = innocent.kill();
+    let _ = innocent.wait();
+    assert!(
+        !daemon_dir.join("daemon.json").exists(),
+        "stale daemon.json should be cleaned up"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_daemon_falls_back_to_direct_connection_when_state_dir_mode_is_unsafe() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let xdg = dir.path().join("xdg");
+    let daemon_dir = dir.path().join("insecure_state");
+    let cache_dir = dir.path().join("daemon_cache");
+    fs::create_dir_all(&xdg).unwrap();
+    fs::create_dir_all(&daemon_dir).unwrap();
+    fs::set_permissions(&daemon_dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let server = testutils::spawn_sqlite_server(&dir.path().join("daemon_fallback.db")).await;
+
+    jj_daemon_cmd(dir.path(), &xdg, &daemon_dir, &cache_dir)
+        .args(["cc", "daemon", "enable"])
+        .assert()
+        .success();
+
+    let ws = dir.path().join("ws");
+    jj_daemon_cmd(dir.path(), &xdg, &daemon_dir, &cache_dir)
+        .args(["cc", "init", "--server", server.url(), ws.to_str().unwrap()])
+        .assert()
+        .success();
+    assert!(
+        !daemon_dir.join("daemon.json").exists(),
+        "daemon mode must be refused on 0755 state_dir while commands fall back directly"
+    );
+}
+
+#[tokio::test]
+async fn test_daemon_rejects_non_loopback_listen_and_authenticates_tcp_with_secret() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let xdg = dir.path().join("xdg");
+    let daemon_dir = dir.path().join("daemon_state");
+    let cache_dir = dir.path().join("daemon_cache");
+    fs::create_dir_all(&xdg).unwrap();
+    let _daemon_guard = DaemonStopGuard::new(dir.path(), &xdg, &daemon_dir, &cache_dir);
+
+    jj_daemon_cmd(dir.path(), &xdg, &daemon_dir, &cache_dir)
+        .args(["cc", "daemon", "start", "--listen", "0.0.0.0:0"])
+        .assert()
+        .failure();
+
+    let server = testutils::spawn_sqlite_server(&dir.path().join("daemon_tcp.db")).await;
+
+    jj_daemon_cmd(dir.path(), &xdg, &daemon_dir, &cache_dir)
+        .args(["cc", "daemon", "enable"])
+        .assert()
+        .success();
+
+    jj_daemon_cmd(dir.path(), &xdg, &daemon_dir, &cache_dir)
+        .args([
+            "cc",
+            "daemon",
+            "start",
+            "--listen",
+            "127.0.0.1:0",
+            "--idle-timeout-secs",
+            "30",
+        ])
+        .assert()
+        .success();
+
+    let info = cc_lib::daemon_client::read_daemon_runtime_info(&daemon_dir).expect("daemon.json");
+    let secret = info.secret.clone().expect("secret");
+    assert!(!secret.is_empty());
+    let tcp_url = info.tcp_addr.clone().expect("tcp_addr");
+
+    // Unauthenticated TCP callers must be rejected.
+    let unauth_ch = tonic::transport::Endpoint::from_shared(tcp_url.clone())
         .unwrap()
         .connect()
         .await
-        .expect("Failed to connect directly to jj-cc-server");
-    let mut direct_client = BackendServiceClient::new(direct_channel);
-
-    let reg_resp = direct_client
-        .register_repository(RegisterRepositoryRequest {
-            project_id: "cold-tree-project".to_string(),
-            repo_id: None,
-            name: Some("cold-tree-repo".to_string()),
-            hash_algorithm: cc_common::backend::HashAlgorithm::Sha1 as i32,
-        })
-        .await
-        .expect("Failed to register repo directly on server")
-        .into_inner();
-    let project_id = reg_resp.project_id;
-
-    let file_a_bytes = b"alpha file content".to_vec();
-    let file_a_id = direct_client
-        .write_file(WriteFileRequest {
-            project_id: project_id.clone(),
-            content: file_a_bytes.clone(),
-        })
-        .await
-        .expect("Failed to write file a directly on server")
-        .into_inner()
-        .file_id;
-
-    let file_foo_bytes = b"foo.rs payload".to_vec();
-    let file_foo_id = direct_client
-        .write_file(WriteFileRequest {
-            project_id: project_id.clone(),
-            content: file_foo_bytes.clone(),
-        })
-        .await
-        .expect("Failed to write file foo.rs directly on server")
-        .into_inner()
-        .file_id;
-
-    let tree_id = direct_client
-        .write_tree(WriteTreeRequest {
-            project_id: project_id.clone(),
+        .unwrap();
+    let mut unauth_client =
+        cc_common::backend::backend_service_client::BackendServiceClient::new(unauth_ch);
+    let unauth_err = unauth_client
+        .read_tree(tonic::Request::new(cc_common::backend::ReadTreeRequest {
+            project_id: "r".to_string(),
             path: String::new(),
-            entries: vec![
-                TreeEntry {
-                    name: "foo.rs".to_string(),
-                    value: Some(TreeValue {
-                        value: Some(tree_value::Value::File(File {
-                            id: file_foo_id.clone(),
-                            executable: false,
-                            copy_id: Vec::new(),
-                            size_bytes: None,
-                        })),
-                    }),
-                },
-                TreeEntry {
-                    name: "foo".to_string(),
-                    value: Some(TreeValue {
-                        value: Some(tree_value::Value::TreeId(
-                            cc_common::EMPTY_TREE_ID_BYTES.to_vec(),
-                        )),
-                    }),
-                },
-                TreeEntry {
-                    name: "a.txt".to_string(),
-                    value: Some(TreeValue {
-                        value: Some(tree_value::Value::File(File {
-                            id: file_a_id.clone(),
-                            executable: true,
-                            copy_id: Vec::new(),
-                            size_bytes: None,
-                        })),
-                    }),
-                },
-            ],
-        })
-        .await
-        .expect("Failed to write tree directly on server")
-        .into_inner()
-        .tree_id;
-
-    let second_tree_id = direct_client
-        .write_tree(WriteTreeRequest {
-            project_id: project_id.clone(),
-            path: String::new(),
-            entries: vec![TreeEntry {
-                name: "only.txt".to_string(),
-                value: Some(TreeValue {
-                    value: Some(tree_value::Value::File(File {
-                        id: file_a_id.clone(),
-                        executable: false,
-                        copy_id: Vec::new(),
-                        size_bytes: None,
-                    })),
-                }),
-            }],
-        })
-        .await
-        .expect("Failed to write second tree directly on server")
-        .into_inner()
-        .tree_id;
-
-    // Connect to `jj-cc-daemon` over UDS.
-    let socket_path = daemon.socket_path().to_path_buf();
-    let daemon_channel = Endpoint::try_from("http://[::]:50051")
-        .unwrap()
-        .connect_with_connector(service_fn(move |_: Uri| {
-            let path = socket_path.clone();
-            async move {
-                let stream = UnixStream::connect(path).await?;
-                Ok::<_, std::io::Error>(TokioIo::new(stream))
-            }
+            tree_id: cc_common::EMPTY_TREE_ID_BYTES.to_vec(),
+            page_size: 0,
+            page_token: String::new(),
         }))
         .await
-        .expect("Failed to connect to daemon over UDS");
-    let mut daemon_client = BackendServiceClient::new(daemon_channel);
+        .unwrap_err();
+    assert_eq!(unauth_err.code(), tonic::Code::Unauthenticated);
 
-    // 1. Cold unpaginated ReadTree through daemon falls back to `page_size: 0` against
-    // `jj-cc-server` and returns the full tree in UTF-8 order with populated file sizes.
-    let cold_resp = daemon_client
-        .read_tree(ReadTreeRequest {
-            project_id: project_id.clone(),
-            tree_id: tree_id.clone(),
-            path: String::new(),
-            page_size: 0,
-            page_token: String::new(),
-        })
-        .await
-        .expect("Cold ReadTree through daemon should succeed against jj-cc-server")
-        .into_inner();
-    assert_eq!(cold_resp.tree_id, tree_id);
-    assert!(cold_resp.next_page_token.is_empty());
-    let cold_names: Vec<&str> = cold_resp.entries.iter().map(|e| e.name.as_str()).collect();
-    assert_eq!(cold_names, vec!["a.txt", "foo", "foo.rs"]);
-    match cold_resp.entries[0]
-        .value
-        .as_ref()
-        .and_then(|v| v.value.as_ref())
-    {
-        Some(tree_value::Value::File(f)) => {
-            assert_eq!(f.id, file_a_id);
-            assert!(f.executable);
-            assert_eq!(f.size_bytes, Some(file_a_bytes.len() as u64));
-        }
-        other => panic!("expected file entry for a.txt, got {other:?}"),
-    }
-    match cold_resp.entries[2]
-        .value
-        .as_ref()
-        .and_then(|v| v.value.as_ref())
-    {
-        Some(tree_value::Value::File(f)) => {
-            assert_eq!(f.id, file_foo_id);
-            assert_eq!(f.size_bytes, Some(file_foo_bytes.len() as u64));
-        }
-        other => panic!("expected file entry for foo.rs, got {other:?}"),
-    }
-
-    // 2. Warm cached unpaginated read matches identically.
-    let warm_resp = daemon_client
-        .read_tree(ReadTreeRequest {
-            project_id: project_id.clone(),
-            tree_id: tree_id.clone(),
-            path: String::new(),
-            page_size: 0,
-            page_token: String::new(),
-        })
-        .await
-        .expect("Warm cached ReadTree through daemon should succeed")
-        .into_inner();
-    assert_eq!(warm_resp, cold_resp);
-
-    // 3. Warm cached paginated reads succeed locally from the daemon cache even though
-    // `jj-cc-server` rejects `page_size > 0` with `UNIMPLEMENTED`.
-    let page1 = daemon_client
-        .read_tree(ReadTreeRequest {
-            project_id: project_id.clone(),
-            tree_id: tree_id.clone(),
-            path: String::new(),
-            page_size: 2,
-            page_token: String::new(),
-        })
-        .await
-        .expect("Warm paginated ReadTree page 1 must be served from daemon cache")
-        .into_inner();
-    assert_eq!(
-        page1
-            .entries
-            .iter()
-            .map(|e| e.name.as_str())
-            .collect::<Vec<_>>(),
-        vec!["a.txt", "foo"]
+    // Force `cc-lib` onto the TCP path by clearing `socket_path` in `daemon.json`; `cc-lib` must
+    // attach `x-jj-cc-daemon-secret` automatically.
+    let raw_json = fs::read_to_string(daemon_dir.join("daemon.json")).unwrap();
+    let tcp_only_json = format!(
+        r#"{{"pid":{},"socket_path":null,"tcp_addr":"{tcp_url}","cache_dir":"{}","stats_path":"{}","default_upstream":null,"started_unix_secs":{},"secret":"{secret}"}}"#,
+        info.pid, info.cache_dir, info.stats_path, info.started_unix_secs
     );
-    assert_eq!(page1.next_page_token, "foo");
+    fs::write(daemon_dir.join("daemon.json"), tcp_only_json).unwrap();
 
-    let page2 = daemon_client
-        .read_tree(ReadTreeRequest {
-            project_id: project_id.clone(),
-            tree_id,
-            path: String::new(),
-            page_size: 2,
-            page_token: page1.next_page_token,
-        })
-        .await
-        .expect("Warm paginated ReadTree page 2 must be served from daemon cache")
-        .into_inner();
-    assert_eq!(
-        page2
-            .entries
-            .iter()
-            .map(|e| e.name.as_str())
-            .collect::<Vec<_>>(),
-        vec!["foo.rs"]
-    );
-    assert!(page2.next_page_token.is_empty());
+    let ws = dir.path().join("ws_tcp");
+    jj_daemon_cmd(dir.path(), &xdg, &daemon_dir, &cache_dir)
+        .args(["cc", "init", "--server", server.url(), ws.to_str().unwrap()])
+        .assert()
+        .success();
+    fs::write(ws.join("hello.txt"), "tcp secret ok\n").unwrap();
+    jj_daemon_cmd(&ws, &xdg, &daemon_dir, &cache_dir)
+        .args(["commit", "-m", "commit over authenticated daemon tcp"])
+        .assert()
+        .success();
 
-    // 4. Cold paginated ReadTree on an uncached tree succeeds against paginated `jj-cc-server`.
-    let cold_paginated = daemon_client
-        .read_tree(ReadTreeRequest {
-            project_id,
-            tree_id: second_tree_id.clone(),
-            path: String::new(),
-            page_size: 1,
-            page_token: String::new(),
-        })
-        .await
-        .expect("Cold paginated ReadTree must succeed against paginated jj-cc-server")
-        .into_inner();
-    assert_eq!(cold_paginated.tree_id, second_tree_id);
-    assert_eq!(
-        cold_paginated
-            .entries
-            .iter()
-            .map(|e| e.name.as_str())
-            .collect::<Vec<_>>(),
-        vec!["only.txt"]
+    fs::write(daemon_dir.join("daemon.json"), raw_json).unwrap();
+    jj_daemon_cmd(dir.path(), &xdg, &daemon_dir, &cache_dir)
+        .args(["cc", "daemon", "stop"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_daemon_rejects_legacy_flag_combined_with_subcommand() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let xdg = dir.path().join("xdg");
+    let daemon_dir = dir.path().join("daemon_state");
+    let cache_dir = dir.path().join("daemon_cache");
+    fs::create_dir_all(&xdg).unwrap();
+
+    let out = jj_daemon_cmd(dir.path(), &xdg, &daemon_dir, &cache_dir)
+        .args(["cc", "daemon", "--enable", "stop"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Cannot combine legacy flags"),
+        "expected user_error for legacy flag + subcommand, got: {stderr}"
     );
-    assert!(cold_paginated.next_page_token.is_empty());
 }

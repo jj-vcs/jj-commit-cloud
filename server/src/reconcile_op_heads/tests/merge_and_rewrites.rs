@@ -168,7 +168,8 @@ async fn test_reconcile_merges_divergent_bookmarks_and_prunes_ancestor_heads() {
             .await
             .unwrap()
             .unwrap(),
-    );
+    )
+    .unwrap();
     assert_eq!(merged_op.metadata.hostname, "jj-cc-server");
     assert_eq!(merged_op.metadata.username, "jj-cc-server");
     let parent_set: HashSet<_> = merged_op.parents.into_iter().collect();
@@ -186,7 +187,8 @@ async fn test_reconcile_merges_divergent_bookmarks_and_prunes_ancestor_heads() {
             .await
             .unwrap()
             .unwrap(),
-    );
+    )
+    .unwrap();
     // Because c1 is an ancestor of c2, merged `head_ids` contains only `{c2, c3}` (no dangling
     // c1), and `main` fast-forwarded to `c2` alongside `feature = c3`.
     assert_eq!(
