@@ -1,3 +1,24 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! In-memory [`Store`] backend for local development and unit tests.
+//!
+//! # Concurrency and Merge Invariants
+//! Workspace CAS updates normalize incoming `WorkspaceState` records and check
+//! `expected_operation_id` atomically under the `workspaces` mutex, returning
+//! `StoreError::CasConflict` on mismatch.
+
 use async_trait::async_trait;
 use cc_common::backend::*;
 use cc_common::op_store::*;
@@ -236,19 +257,29 @@ impl Store for MemoryStore {
         workspace_name: &str,
     ) -> StoreResult<Option<WorkspaceState>> {
         let workspaces = self.workspaces.lock().unwrap();
-        Ok(workspaces.get(repo_id).and_then(|ws| {
-            ws.get(&(user.to_string(), workspace_name.to_string()))
-                .cloned()
-        }))
+        Ok(workspaces
+            .get(repo_id)
+            .and_then(|ws| {
+                ws.get(&(user.to_string(), workspace_name.to_string()))
+                    .cloned()
+            })
+            .map(super::normalize_workspace_record))
     }
 
-    async fn put_workspace(&self, workspace: WorkspaceState) -> StoreResult<()> {
+    async fn put_workspace_cas(
+        &self,
+        workspace: WorkspaceState,
+        expected_operation_id: Option<&[u8]>,
+    ) -> StoreResult<()> {
         let mut workspaces = self.workspaces.lock().unwrap();
-        let repo_workspaces = workspaces.entry(workspace.repo_id.clone()).or_default();
-        repo_workspaces.insert(
-            (workspace.user.clone(), workspace.workspace_name.clone()),
-            workspace,
-        );
+        let key = (workspace.user.clone(), workspace.workspace_name.clone());
+        let existing = workspaces.get(&workspace.repo_id).and_then(|m| m.get(&key));
+        super::verify_workspace_cas(existing, &workspace, expected_operation_id)?;
+        let normalized = super::normalize_workspace_record(workspace);
+        workspaces
+            .entry(normalized.repo_id.clone())
+            .or_default()
+            .insert(key, normalized);
         Ok(())
     }
 
@@ -273,7 +304,156 @@ impl Store for MemoryStore {
         let workspaces = self.workspaces.lock().unwrap();
         Ok(workspaces
             .get(repo_id)
-            .map(|ws| ws.values().cloned().collect())
+            .map(|ws| {
+                ws.values()
+                    .cloned()
+                    .map(super::normalize_workspace_record)
+                    .collect()
+            })
             .unwrap_or_default())
+    }
+
+    async fn list_workspaces_page(
+        &self,
+        repo_id: &str,
+        after: Option<(&str, &str)>,
+        limit: usize,
+    ) -> StoreResult<Vec<WorkspaceState>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let workspaces = self.workspaces.lock().unwrap();
+        let Some(repo_ws) = workspaces.get(repo_id) else {
+            return Ok(Vec::new());
+        };
+        let mut matching: Vec<&WorkspaceState> = repo_ws
+            .values()
+            .filter(|ws| match after {
+                Some((after_user, after_ws)) => {
+                    (ws.user.as_str(), ws.workspace_name.as_str()) > (after_user, after_ws)
+                }
+                None => true,
+            })
+            .collect();
+        matching.sort_by(|a, b| (&a.user, &a.workspace_name).cmp(&(&b.user, &b.workspace_name)));
+        matching.truncate(limit);
+        Ok(matching
+            .into_iter()
+            .cloned()
+            .map(super::normalize_workspace_record)
+            .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[allow(deprecated)]
+    fn make_ws(repo_id: &str, user: &str, workspace_name: &str) -> WorkspaceState {
+        WorkspaceState {
+            repo_id: repo_id.to_string(),
+            user: user.to_string(),
+            workspace_name: workspace_name.to_string(),
+            commit_id: cc_common::ROOT_COMMIT_ID_BYTES.to_vec(),
+            operation_id: cc_common::ROOT_OPERATION_ID_BYTES.to_vec(),
+            tree_id: cc_common::EMPTY_TREE_ID_BYTES.to_vec(),
+            sparse_patterns: vec![String::new()],
+            tree_ids: vec![cc_common::EMPTY_TREE_ID_BYTES.to_vec()],
+            conflict_labels: Vec::new(),
+            sparse_patterns_set: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_memory_store_list_workspaces_page_keyset_pagination() {
+        let store = MemoryStore::new();
+        assert!(
+            store
+                .list_workspaces_page("repo-1", None, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Insert out of order across multiple users, multiple workspaces, and another repo.
+        let fixtures = [
+            ("repo-1", "bob", "ws-2"),
+            ("repo-1", "alice", "z-ws"),
+            ("repo-1", "alice", "a-ws"),
+            ("repo-1", "bob", "ws-1"),
+            ("repo-1", "", "default"),
+            ("repo-1", "carol", "main"),
+            ("repo-2", "alice", "isolated"),
+        ];
+        for (repo, user, ws) in fixtures {
+            store.put_workspace(make_ws(repo, user, ws)).await.unwrap();
+        }
+
+        // limit == 0 returns immediately.
+        assert!(
+            store
+                .list_workspaces_page("repo-1", None, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // First page ordered strictly by (user ASC, workspace_name ASC).
+        let p1 = store.list_workspaces_page("repo-1", None, 2).await.unwrap();
+        let keys1: Vec<(&str, &str)> = p1
+            .iter()
+            .map(|w| (w.user.as_str(), w.workspace_name.as_str()))
+            .collect();
+        assert_eq!(keys1, vec![("", "default"), ("alice", "a-ws")]);
+
+        // Cursor within the same user advances to that user's next workspace, then next user.
+        let p2 = store
+            .list_workspaces_page("repo-1", Some(("alice", "a-ws")), 2)
+            .await
+            .unwrap();
+        let keys2: Vec<(&str, &str)> = p2
+            .iter()
+            .map(|w| (w.user.as_str(), w.workspace_name.as_str()))
+            .collect();
+        assert_eq!(keys2, vec![("alice", "z-ws"), ("bob", "ws-1")]);
+
+        // Cursor on the last workspace of a user advances cleanly to the next user.
+        let p3 = store
+            .list_workspaces_page("repo-1", Some(("bob", "ws-1")), 5)
+            .await
+            .unwrap();
+        let keys3: Vec<(&str, &str)> = p3
+            .iter()
+            .map(|w| (w.user.as_str(), w.workspace_name.as_str()))
+            .collect();
+        assert_eq!(keys3, vec![("bob", "ws-2"), ("carol", "main")]);
+
+        // Cursor at or past the last key returns empty.
+        assert!(
+            store
+                .list_workspaces_page("repo-1", Some(("carol", "main")), 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_workspaces_page("repo-1", Some(("zzz", "zzz")), 5)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Cursor pointing to a missing/deleted key resumes at the next strictly greater row.
+        let after_gap = store
+            .list_workspaces_page("repo-1", Some(("alice", "m-deleted")), 2)
+            .await
+            .unwrap();
+        let gap_keys: Vec<(&str, &str)> = after_gap
+            .iter()
+            .map(|w| (w.user.as_str(), w.workspace_name.as_str()))
+            .collect();
+        assert_eq!(gap_keys, vec![("alice", "z-ws"), ("bob", "ws-1")]);
     }
 }

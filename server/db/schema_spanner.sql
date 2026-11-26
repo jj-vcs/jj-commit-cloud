@@ -88,6 +88,9 @@ CREATE TABLE IF NOT EXISTS workspaces (
     commit_id BYTES(MAX) NOT NULL,
     operation_id BYTES(MAX) NOT NULL,
     tree_id BYTES(MAX) NOT NULL,
+    proto_data BYTES(MAX),
     updated_at TIMESTAMP OPTIONS (allow_commit_timestamp = true),
     FOREIGN KEY (repo_id) REFERENCES repos (repo_id)
 ) PRIMARY KEY (repo_id, user, workspace_name);
+
+ALTER TABLE workspaces ADD COLUMN IF NOT EXISTS proto_data BYTES(MAX);

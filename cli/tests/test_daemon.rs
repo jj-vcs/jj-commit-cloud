@@ -97,12 +97,12 @@ async fn test_daemon_routes_rpc_calls_over_uds() {
     let test_commit = cc_common::backend::Commit {
         parent_commit_ids: vec![],
         predecessors: vec![],
-        root_tree_id: vec![vec![1, 2, 3]],
-        change_id: vec![4, 5, 6],
+        root_tree_id: vec![cc_common::EMPTY_TREE_ID_BYTES.to_vec()],
+        change_id: vec![4; cc_common::CHANGE_ID_LENGTH],
         description: "Commit through daemon".to_string(),
         author: None,
         committer: None,
-        commit_id: vec![10, 11, 12],
+        commit_id: vec![],
         conflict_labels: vec![],
         secure_sig: None,
     };
@@ -162,21 +162,33 @@ async fn test_daemon_routes_rpc_calls_over_uds() {
     assert_eq!(read_op_resp.operation.unwrap().view_id, vec![20, 21, 22]);
 
     // Test WorkspaceService over daemon UDS
+    #[allow(deprecated)]
     let ws_state = WorkspaceState {
         repo_id: repo_id.clone(),
         user: "daemon.user@example.com".to_string(),
         workspace_name: "default".to_string(),
         commit_id: written_commit_id.clone(),
-        operation_id: vec![30, 31, 32],
-        tree_id: vec![1, 2, 3],
+        operation_id: cc_common::ROOT_OPERATION_ID_BYTES.to_vec(),
+        tree_id: cc_common::EMPTY_TREE_ID_BYTES.to_vec(),
+        sparse_patterns: vec![String::new()],
+        tree_ids: vec![cc_common::EMPTY_TREE_ID_BYTES.to_vec()],
+        conflict_labels: Vec::new(),
+        sparse_patterns_set: true,
     };
 
-    workspace_client
+    let update_resp = workspace_client
         .update_workspace(UpdateWorkspaceRequest {
             workspace: Some(ws_state.clone()),
+            expected_operation_id: None,
         })
         .await
-        .expect("Failed to update workspace via daemon");
+        .expect("Failed to update workspace via daemon")
+        .into_inner();
+    assert!(update_resp.success);
+    assert_eq!(
+        update_resp.workspace.as_ref().map(|w| &w.commit_id),
+        Some(&written_commit_id)
+    );
 
     let get_ws_resp = workspace_client
         .get_workspace(GetWorkspaceRequest {
@@ -199,7 +211,7 @@ async fn test_daemon_routes_rpc_calls_over_uds() {
         .await
         .expect("Failed to delete workspace via daemon")
         .into_inner();
-    assert!(del_ws_resp.success);
+    assert!(del_ws_resp.existed);
 }
 
 #[tokio::test]
