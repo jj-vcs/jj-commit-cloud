@@ -1,0 +1,132 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Production GKE template manifest for jj-cc-server (Cloud Spanner + Cloud Storage).
+# Rendered and applied via `cargo xtask up gke --project <PROJECT_ID>`, or applied standalone:
+#   1. Create the Bearer auth Secret containing newline-separated token(s):
+#        kubectl create secret generic jj-cc-server-auth --from-file=tokens=./tokens.txt
+#   2. Substitute __GCP_SERVICE_ACCOUNT__, __IMAGE_URI__, __SPANNER_DATABASE__,
+#      __GCS_BUCKET__, and __GCS_PEER_BUCKETS__ (for example with sed) and apply:
+#        sed \
+#          -e "s|__GCP_SERVICE_ACCOUNT__|${GCP_SERVICE_ACCOUNT}|g" \
+#          -e "s|__IMAGE_URI__|${IMAGE_URI}|g" \
+#          -e "s|__SPANNER_DATABASE__|${SPANNER_DATABASE}|g" \
+#          -e "s|__GCS_BUCKET__|${GCS_BUCKET}|g" \
+#          -e "s|__GCS_PEER_BUCKETS__|${GCS_PEER_BUCKETS:-}|g" \
+#          deploy/k8s/gcp/gke.yaml | kubectl apply -f -
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: jj-cc-server-ksa
+  annotations:
+    iam.gke.io/gcp-service-account: "__GCP_SERVICE_ACCOUNT__"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jj-cc-server
+  labels:
+    app: jj-cc-server
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: jj-cc-server
+  template:
+    metadata:
+      labels:
+        app: jj-cc-server
+    spec:
+      serviceAccountName: jj-cc-server-ksa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+        - name: jj-cc-server
+          image: "__IMAGE_URI__"
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            seccompProfile:
+              type: RuntimeDefault
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: HOST
+              value: "0.0.0.0"
+            - name: PORT
+              value: "8080"
+            - name: JJ_CC_SERVER_AUTH_TOKEN_FILE
+              value: "/etc/jj-cc/auth/tokens"
+            - name: STORE_TYPE
+              value: "spanner"
+            - name: SPANNER_DATABASE
+              value: "__SPANNER_DATABASE__"
+            - name: BLOB_STORE
+              value: "gcs"
+            - name: GCS_BUCKET
+              value: "__GCS_BUCKET__"
+            - name: GCS_PEER_BUCKETS
+              value: "__GCS_PEER_BUCKETS__"
+          volumeMounts:
+            - name: auth-tokens
+              mountPath: /etc/jj-cc/auth
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          ports:
+            - name: grpc
+              containerPort: 8080
+          readinessProbe:
+            grpc:
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            grpc:
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+      volumes:
+        - name: auth-tokens
+          secret:
+            secretName: jj-cc-server-auth
+            defaultMode: 0440
+            optional: false
+        - name: tmp
+          emptyDir:
+            sizeLimit: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jj-cc-server
+spec:
+  type: ClusterIP
+  selector:
+    app: jj-cc-server
+  ports:
+    - name: grpc
+      port: 8080
+      targetPort: 8080

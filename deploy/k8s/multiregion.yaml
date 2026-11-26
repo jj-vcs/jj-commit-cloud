@@ -1,0 +1,167 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Local two-region Spanner + Cloud Storage emulator manifest for Podman
+# (`podman kube play deploy/k8s/multiregion.yaml`, which binds 127.0.0.1:8081 and 127.0.0.1:8082
+# via hostIP/hostPort) or Kubernetes (`kubectl apply -f deploy/k8s/multiregion.yaml`, then
+# `kubectl port-forward svc/jj-cc-multiregion 8081:8081 8082:8082`).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: jj-cc-multiregion
+  labels:
+    app: jj-cc-multiregion
+    mode: multiregion
+spec:
+  restartPolicy: Always
+  containers:
+    - name: spanner-emulator
+      image: gcr.io/cloud-spanner-emulator/emulator:latest
+      ports:
+        - containerPort: 9010
+        - containerPort: 9020
+    - name: gcs-emulator
+      image: docker.io/fsouza/fake-gcs-server:latest
+      args:
+        - "-scheme"
+        - "http"
+        - "-port"
+        - "4443"
+        - "-external-url"
+        - "http://127.0.0.1:4443"
+        - "-backend"
+        - "memory"
+      ports:
+        - containerPort: 4443
+    - name: server-us
+      image: localhost/jj-cc-server:local
+      imagePullPolicy: IfNotPresent
+      securityContext:
+        runAsNonRoot: true
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
+        seccompProfile:
+          type: RuntimeDefault
+        capabilities:
+          drop: ["ALL"]
+      env:
+        - name: HOST
+          value: "0.0.0.0"
+        - name: JJ_CC_ALLOW_UNAUTHENTICATED
+          value: "true"
+        - name: PORT
+          value: "8081"
+        - name: STORE_TYPE
+          value: "spanner"
+        - name: SPANNER_EMULATOR_HOST
+          value: "127.0.0.1:9010"
+        - name: SPANNER_EMULATOR_REST_HOST
+          value: "http://127.0.0.1:9020"
+        - name: SPANNER_DATABASE
+          value: "projects/local-project/instances/local-instance/databases/commit-cloud"
+        - name: SPANNER_AUTO_MIGRATE
+          value: "true"
+        - name: BLOB_STORE
+          value: "gcs"
+        - name: STORAGE_EMULATOR_HOST
+          value: "http://127.0.0.1:4443"
+        - name: GCS_BUCKET
+          value: "gs://blobs-uc1"
+        - name: GCS_PEER_BUCKETS
+          value: "gs://blobs-ew1"
+      volumeMounts:
+        - name: tmp-us
+          mountPath: /tmp
+      ports:
+        - containerPort: 8081
+          hostIP: 127.0.0.1
+          hostPort: 8081
+          protocol: TCP
+      readinessProbe:
+        grpc:
+          port: 8081
+        initialDelaySeconds: 2
+        periodSeconds: 3
+    - name: server-eu
+      image: localhost/jj-cc-server:local
+      imagePullPolicy: IfNotPresent
+      securityContext:
+        runAsNonRoot: true
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
+        seccompProfile:
+          type: RuntimeDefault
+        capabilities:
+          drop: ["ALL"]
+      env:
+        - name: HOST
+          value: "0.0.0.0"
+        - name: JJ_CC_ALLOW_UNAUTHENTICATED
+          value: "true"
+        - name: PORT
+          value: "8082"
+        - name: STORE_TYPE
+          value: "spanner"
+        - name: SPANNER_EMULATOR_HOST
+          value: "127.0.0.1:9010"
+        - name: SPANNER_EMULATOR_REST_HOST
+          value: "http://127.0.0.1:9020"
+        - name: SPANNER_DATABASE
+          value: "projects/local-project/instances/local-instance/databases/commit-cloud"
+        - name: SPANNER_AUTO_MIGRATE
+          value: "true"
+        - name: BLOB_STORE
+          value: "gcs"
+        - name: STORAGE_EMULATOR_HOST
+          value: "http://127.0.0.1:4443"
+        - name: GCS_BUCKET
+          value: "gs://blobs-ew1"
+        - name: GCS_PEER_BUCKETS
+          value: "gs://blobs-uc1"
+      volumeMounts:
+        - name: tmp-eu
+          mountPath: /tmp
+      ports:
+        - containerPort: 8082
+          hostIP: 127.0.0.1
+          hostPort: 8082
+          protocol: TCP
+      readinessProbe:
+        grpc:
+          port: 8082
+        initialDelaySeconds: 2
+        periodSeconds: 3
+  volumes:
+    - name: tmp-us
+      emptyDir:
+        sizeLimit: 1Gi
+    - name: tmp-eu
+      emptyDir:
+        sizeLimit: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jj-cc-multiregion
+spec:
+  type: ClusterIP
+  selector:
+    app: jj-cc-multiregion
+  ports:
+    - name: grpc-us
+      port: 8081
+      targetPort: 8081
+    - name: grpc-eu
+      port: 8082
+      targetPort: 8082
