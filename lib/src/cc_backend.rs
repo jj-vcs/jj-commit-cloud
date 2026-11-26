@@ -1,8 +1,8 @@
 #![allow(elided_lifetimes_in_paths)]
 
 use async_trait::async_trait;
-use futures::stream::{self, BoxStream};
 use futures::StreamExt as _;
+use futures::stream::{self, BoxStream};
 use jj_lib::backend::*;
 use jj_lib::index::Index;
 use jj_lib::object_id::ObjectId;
@@ -14,7 +14,7 @@ use std::pin::Pin;
 use std::time::SystemTime;
 
 use crate::client::connect_backend_client;
-use crate::util::{run_async, CommitCloudConfig};
+use crate::util::{CommitCloudConfig, run_async};
 
 #[derive(Debug)]
 pub struct CommitCloudBackend {
@@ -64,7 +64,10 @@ impl CommitCloudBackend {
                 ))
                 .await?
                 .into_inner();
-            Ok((register_repo_response.project_id, register_repo_response.repo_id))
+            Ok((
+                register_repo_response.project_id,
+                register_repo_response.repo_id,
+            ))
         })?;
 
         // Write local config toml
@@ -158,10 +161,11 @@ impl Backend for CommitCloudBackend {
                         object_type: "file".into(),
                         hash: file_id_hex,
                         source: status.into(),
-                    }) as Box<dyn std::error::Error + Send + Sync>);
+                    })
+                        as Box<dyn std::error::Error + Send + Sync>);
                 }
                 Err(status) => {
-                    return Err(Box::new(status) as Box<dyn std::error::Error + Send + Sync>)
+                    return Err(Box::new(status) as Box<dyn std::error::Error + Send + Sync>);
                 }
             };
 
@@ -269,7 +273,8 @@ impl Backend for CommitCloudBackend {
                         object_type: "tree".into(),
                         hash: tree_id_hex,
                         source: status.into(),
-                    }) as Box<dyn std::error::Error + Send + Sync>)
+                    })
+                        as Box<dyn std::error::Error + Send + Sync>)
                 }
                 Err(status) => Err(Box::new(status) as Box<dyn std::error::Error + Send + Sync>),
             }
@@ -352,7 +357,8 @@ impl Backend for CommitCloudBackend {
                         object_type: "commit".into(),
                         hash: commit_id_hex,
                         source: status.into(),
-                    }) as Box<dyn std::error::Error + Send + Sync>)
+                    })
+                        as Box<dyn std::error::Error + Send + Sync>)
                 }
                 Err(status) => Err(Box::new(status) as Box<dyn std::error::Error + Send + Sync>),
             }

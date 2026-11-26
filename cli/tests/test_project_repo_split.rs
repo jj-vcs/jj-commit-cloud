@@ -107,7 +107,12 @@ async fn test_multiple_repos_share_project_cas_with_isolated_oplog_and_undo() {
     Command::cargo_bin("jj")
         .unwrap()
         .current_dir(client_2_dir.path())
-        .args(["new", &client_1_commit_id, "-m", "client 2 building on client 1"])
+        .args([
+            "new",
+            &client_1_commit_id,
+            "-m",
+            "client 2 building on client 1",
+        ])
         .assert()
         .success();
 

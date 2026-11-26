@@ -65,7 +65,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if args.socket.exists() {
-        info!("Removing existing stale socket file at '{}'", args.socket.display());
+        info!(
+            "Removing existing stale socket file at '{}'",
+            args.socket.display()
+        );
         let _ = fs::remove_file(&args.socket);
     }
 

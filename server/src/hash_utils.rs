@@ -255,15 +255,13 @@ pub fn hash_view(view: &cc_common::op_store::View) -> Vec<u8> {
         }
     };
 
-    let sorted_bookmarks: std::collections::BTreeMap<_, _> =
-        view.local_bookmarks.iter().collect();
+    let sorted_bookmarks: std::collections::BTreeMap<_, _> = view.local_bookmarks.iter().collect();
     for (name, target) in sorted_bookmarks {
         append_length_prefixed_str(&mut buf, name);
         append_ref_target(&mut buf, target);
     }
 
-    let sorted_remotes: std::collections::BTreeMap<_, _> =
-        view.remote_bookmarks.iter().collect();
+    let sorted_remotes: std::collections::BTreeMap<_, _> = view.remote_bookmarks.iter().collect();
     for (name, remote_ref) in sorted_remotes {
         append_length_prefixed_str(&mut buf, name);
         buf.extend_from_slice(&(remote_ref.is_tracked as u8).to_le_bytes());

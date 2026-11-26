@@ -217,7 +217,9 @@ impl OpStoreService for CommitCloudOpStoreService {
         ensure_repo_registered_error(self.store.as_ref(), &req.repo_id, "reconciling op heads")
             .await?;
 
-        let head = crate::reconcile_op_heads::reconcile_repo_op_heads(self.store.clone(), &req.repo_id).await?;
+        let head =
+            crate::reconcile_op_heads::reconcile_repo_op_heads(self.store.clone(), &req.repo_id)
+                .await?;
 
         Ok(tonic::Response::new(ReconcileOpHeadsResponse {
             op_head: head,

@@ -1,6 +1,6 @@
 use cc_lib::git_importer::GitImporter;
 use clap::Parser;
-use jj_cli::command_error::{user_error, CommandError};
+use jj_cli::command_error::{CommandError, user_error};
 use std::path::PathBuf;
 
 #[derive(Parser, Clone, Debug)]
@@ -24,10 +24,7 @@ pub struct ImportGitArgs {
 
 pub async fn cmd_import_git(args: &ImportGitArgs) -> Result<(), CommandError> {
     let work_dir = if args.git_dir.file_name() == Some(std::ffi::OsStr::new(".git")) {
-        args.git_dir
-            .parent()
-            .unwrap_or(&args.git_dir)
-            .to_path_buf()
+        args.git_dir.parent().unwrap_or(&args.git_dir).to_path_buf()
     } else {
         args.git_dir.clone()
     };

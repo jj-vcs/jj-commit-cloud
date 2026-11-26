@@ -5,7 +5,7 @@ use cc_lib::cc_op_store::CommitCloudOpStore;
 use cc_lib::cc_working_copy::CommitCloudWorkingCopyFactory;
 use clap::Parser;
 use jj_cli::cli_util::CommandHelper;
-use jj_cli::command_error::{user_error, CommandError};
+use jj_cli::command_error::{CommandError, user_error};
 use jj_lib::backend::BackendInitError;
 use jj_lib::op_store::RootOperationData;
 use jj_lib::ref_name::WorkspaceNameBuf;
@@ -97,7 +97,7 @@ pub async fn cmd_cc_init(
             other => {
                 return Err(user_error(format!(
                     "Unsupported working copy type: '{other}' (expected 'commit_cloud' or 'local')"
-                )))
+                )));
             }
         };
     let workspace_name = WorkspaceNameBuf::from(args.workspace_name.clone());

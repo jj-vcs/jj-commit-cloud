@@ -3,10 +3,12 @@ use cc_common::backend::{ReadCommitRequest, RegisterRepositoryRequest, WriteComm
 use cc_common::op_store::op_store_service_client::OpStoreServiceClient;
 use cc_common::op_store::{ReadOperationRequest, WriteOperationRequest};
 use cc_common::workspace::workspace_service_client::WorkspaceServiceClient;
-use cc_common::workspace::{DeleteWorkspaceRequest, GetWorkspaceRequest, UpdateWorkspaceRequest, WorkspaceState};
+use cc_common::workspace::{
+    DeleteWorkspaceRequest, GetWorkspaceRequest, UpdateWorkspaceRequest, WorkspaceState,
+};
 use hyper_util::rt::TokioIo;
 use std::fs;
-use testutils::{spawn_daemon, spawn_server, TestWorkspace};
+use testutils::{TestWorkspace, spawn_daemon, spawn_server};
 use tokio::net::UnixStream;
 use tonic::transport::{Endpoint, Uri};
 use tower::service_fn;
@@ -186,10 +188,7 @@ async fn test_daemon_routes_rpc_calls_over_uds() {
         .expect("Failed to get workspace via daemon")
         .into_inner();
     assert!(get_ws_resp.workspace.is_some());
-    assert_eq!(
-        get_ws_resp.workspace.unwrap().commit_id,
-        written_commit_id
-    );
+    assert_eq!(get_ws_resp.workspace.unwrap().commit_id, written_commit_id);
 
     let del_ws_resp = workspace_client
         .delete_workspace(DeleteWorkspaceRequest {
@@ -256,7 +255,10 @@ async fn test_daemon_auto_spawn_on_cli_command() {
         .success();
 
     // Verify socket was created and is active
-    assert!(socket_path.exists(), "Daemon socket should have been auto-spawned");
+    assert!(
+        socket_path.exists(),
+        "Daemon socket should have been auto-spawned"
+    );
 
     // Run log command to verify it communicates through the auto-spawned daemon
     let mut log_cmd = assert_cmd::Command::cargo_bin("jj").unwrap();

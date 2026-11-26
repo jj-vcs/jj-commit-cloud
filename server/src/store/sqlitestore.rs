@@ -3,7 +3,7 @@ use cc_common::backend::*;
 use cc_common::op_store::*;
 use cc_common::workspace::WorkspaceState;
 use prost::Message;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -26,8 +26,8 @@ pub struct SqliteStore {
 }
 
 // SqliteStore startup and constructor methods return Result<Self, Error>
-// while the methods on the Store trait return StoreResult<T>. This will 
-// match the startup method return type for the rest of the storage methods. 
+// while the methods on the Store trait return StoreResult<T>. This will
+// match the startup method return type for the rest of the storage methods.
 impl SqliteStore {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, rusqlite::Error> {
         let path_buf = path.as_ref().to_path_buf();
@@ -70,7 +70,8 @@ impl SqliteStore {
     #[cfg(test)]
     pub fn open_readonly<P: AsRef<Path>>(path: P) -> Result<Self, rusqlite::Error> {
         let path_buf = path.as_ref().to_path_buf();
-        let conn = Connection::open_with_flags(&path_buf, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let conn =
+            Connection::open_with_flags(&path_buf, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         Ok(Self {
             path: Some(path_buf),
             conn: Arc::new(Mutex::new(conn)),
@@ -248,7 +249,11 @@ impl Store for SqliteStore {
         .map_err(|e| StoreError::Task(e.to_string()))?
     }
 
-    async fn get_tree(&self, project_id: &str, tree_id: &[u8]) -> StoreResult<Option<Vec<TreeEntry>>> {
+    async fn get_tree(
+        &self,
+        project_id: &str,
+        tree_id: &[u8],
+    ) -> StoreResult<Option<Vec<TreeEntry>>> {
         let conn = self.conn.clone();
         let project_id = project_id.to_string();
         let tree_id = tree_id.to_vec();
@@ -831,22 +836,40 @@ mod tests {
         let repo_id = "test-repo".to_string();
 
         assert_eq!(store.is_repo_registered(&repo_id).await.unwrap(), false);
-        store.register_repo(repo_id.clone(), "default".to_string(), Some("my-repo".to_string())).await.unwrap();
+        store
+            .register_repo(
+                repo_id.clone(),
+                "default".to_string(),
+                Some("my-repo".to_string()),
+            )
+            .await
+            .unwrap();
         assert_eq!(store.is_repo_registered(&repo_id).await.unwrap(), true);
-        assert!(store.register_repo(repo_id.clone(), "default".to_string(), None).await.is_ok());
+        assert!(
+            store
+                .register_repo(repo_id.clone(), "default".to_string(), None)
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
     async fn test_sqlite_put_and_read_file_succeeds() {
         let store = SqliteStore::in_memory().unwrap();
         let repo_id = "test-repo".to_string();
-        store.register_repo(repo_id.clone(), "default".to_string(), None).await.unwrap();
+        store
+            .register_repo(repo_id.clone(), "default".to_string(), None)
+            .await
+            .unwrap();
 
         let file_id = vec![1, 2, 3, 4];
         let content = b"hello file content".to_vec();
 
         assert_eq!(store.get_file(&repo_id, &file_id).await.unwrap(), None);
-        store.put_file(repo_id.clone(), file_id.clone(), content.clone()).await.unwrap();
+        store
+            .put_file(repo_id.clone(), file_id.clone(), content.clone())
+            .await
+            .unwrap();
         let read = store.get_file(&repo_id, &file_id).await.unwrap();
         assert_eq!(read, Some(content));
     }
@@ -855,13 +878,19 @@ mod tests {
     async fn test_sqlite_put_and_read_commit_succeeds() {
         let store = SqliteStore::in_memory().unwrap();
         let repo_id = "test-repo".to_string();
-        store.register_repo(repo_id.clone(), "default".to_string(), None).await.unwrap();
+        store
+            .register_repo(repo_id.clone(), "default".to_string(), None)
+            .await
+            .unwrap();
 
         let commit = sample_commit();
         let commit_id = commit.commit_id.clone();
 
         assert_eq!(store.get_commit(&repo_id, &commit_id).await.unwrap(), None);
-        store.put_commit(repo_id.clone(), commit_id.clone(), commit.clone()).await.unwrap();
+        store
+            .put_commit(repo_id.clone(), commit_id.clone(), commit.clone())
+            .await
+            .unwrap();
         let read = store.get_commit(&repo_id, &commit_id).await.unwrap();
         assert_eq!(read, Some(commit));
     }
@@ -870,13 +899,19 @@ mod tests {
     async fn test_sqlite_put_and_read_tree_succeeds() {
         let store = SqliteStore::in_memory().unwrap();
         let repo_id = "test-repo".to_string();
-        store.register_repo(repo_id.clone(), "default".to_string(), None).await.unwrap();
+        store
+            .register_repo(repo_id.clone(), "default".to_string(), None)
+            .await
+            .unwrap();
 
         let tree_entries = sample_tree_entries();
         let tree_id = vec![10, 20, 30];
 
         assert_eq!(store.get_tree(&repo_id, &tree_id).await.unwrap(), None);
-        store.put_tree(repo_id.clone(), tree_id.clone(), tree_entries.clone()).await.unwrap();
+        store
+            .put_tree(repo_id.clone(), tree_id.clone(), tree_entries.clone())
+            .await
+            .unwrap();
         let read = store.get_tree(&repo_id, &tree_id).await.unwrap();
         assert_eq!(read, Some(tree_entries));
     }
@@ -885,13 +920,19 @@ mod tests {
     async fn test_sqlite_put_and_read_operation_succeeds() {
         let store = SqliteStore::in_memory().unwrap();
         let repo_id = "test-repo".to_string();
-        store.register_repo(repo_id.clone(), "default".to_string(), None).await.unwrap();
+        store
+            .register_repo(repo_id.clone(), "default".to_string(), None)
+            .await
+            .unwrap();
 
         let op = sample_operation();
         let op_id = vec![40, 50, 60];
 
         assert_eq!(store.get_operation(&repo_id, &op_id).await.unwrap(), None);
-        store.put_operation(repo_id.clone(), op_id.clone(), op.clone()).await.unwrap();
+        store
+            .put_operation(repo_id.clone(), op_id.clone(), op.clone())
+            .await
+            .unwrap();
         let read = store.get_operation(&repo_id, &op_id).await.unwrap();
         assert_eq!(read, Some(op));
     }
@@ -900,13 +941,19 @@ mod tests {
     async fn test_sqlite_put_and_read_view_succeeds() {
         let store = SqliteStore::in_memory().unwrap();
         let repo_id = "test-repo".to_string();
-        store.register_repo(repo_id.clone(), "default".to_string(), None).await.unwrap();
+        store
+            .register_repo(repo_id.clone(), "default".to_string(), None)
+            .await
+            .unwrap();
 
         let view = sample_view();
         let view_id = vec![70, 80, 90];
 
         assert_eq!(store.get_view(&repo_id, &view_id).await.unwrap(), None);
-        store.put_view(repo_id.clone(), view_id.clone(), view.clone()).await.unwrap();
+        store
+            .put_view(repo_id.clone(), view_id.clone(), view.clone())
+            .await
+            .unwrap();
         let read = store.get_view(&repo_id, &view_id).await.unwrap();
         assert_eq!(read, Some(view));
     }
@@ -915,56 +962,103 @@ mod tests {
     async fn test_sqlite_put_and_read_op_heads_succeeds() {
         let store = SqliteStore::in_memory().unwrap();
         let repo_id = "test-repo".to_string();
-        store.register_repo(repo_id.clone(), "default".to_string(), None).await.unwrap();
+        store
+            .register_repo(repo_id.clone(), "default".to_string(), None)
+            .await
+            .unwrap();
 
         assert_eq!(store.get_op_heads(&repo_id).await.unwrap(), None);
         let head1 = vec![101];
-        let heads = store.update_op_heads_append_new_remove_old(repo_id.clone(), &[], head1.clone()).await.unwrap();
+        let heads = store
+            .update_op_heads_append_new_remove_old(repo_id.clone(), &[], head1.clone())
+            .await
+            .unwrap();
         assert_eq!(heads, vec![head1.clone()]);
-        assert_eq!(store.get_op_heads(&repo_id).await.unwrap(), Some(vec![head1.clone()]));
+        assert_eq!(
+            store.get_op_heads(&repo_id).await.unwrap(),
+            Some(vec![head1.clone()])
+        );
 
         let head2 = vec![102];
-        let heads = store.update_op_heads_append_new_remove_old(repo_id.clone(), &[head1], head2.clone()).await.unwrap();
+        let heads = store
+            .update_op_heads_append_new_remove_old(repo_id.clone(), &[head1], head2.clone())
+            .await
+            .unwrap();
         assert_eq!(heads, vec![head2.clone()]);
-        assert_eq!(store.get_op_heads(&repo_id).await.unwrap(), Some(vec![head2]));
+        assert_eq!(
+            store.get_op_heads(&repo_id).await.unwrap(),
+            Some(vec![head2])
+        );
     }
 
     #[tokio::test]
     async fn test_sqlite_compare_and_swap_op_heads_succeeds() {
         let store = SqliteStore::in_memory().unwrap();
         let repo_id = "test-repo-exact".to_string();
-        store.register_repo(repo_id.clone(), "default".to_string(), None).await.unwrap();
+        store
+            .register_repo(repo_id.clone(), "default".to_string(), None)
+            .await
+            .unwrap();
 
         let head1 = vec![201];
         let head2 = vec![202];
-        store.update_op_heads_append_new_remove_old(repo_id.clone(), &[], head1.clone()).await.unwrap();
-        store.update_op_heads_append_new_remove_old(repo_id.clone(), &[], head2.clone()).await.unwrap();
+        store
+            .update_op_heads_append_new_remove_old(repo_id.clone(), &[], head1.clone())
+            .await
+            .unwrap();
+        store
+            .update_op_heads_append_new_remove_old(repo_id.clone(), &[], head2.clone())
+            .await
+            .unwrap();
 
         let merged_head = vec![203];
         let res = store
-            .update_op_heads_compare_and_swap(repo_id.clone(), &[head1.clone(), head2.clone()], merged_head.clone())
+            .update_op_heads_compare_and_swap(
+                repo_id.clone(),
+                &[head1.clone(), head2.clone()],
+                merged_head.clone(),
+            )
             .await
             .unwrap();
         assert_eq!(res, vec![merged_head.clone()]);
-        assert_eq!(store.get_op_heads(&repo_id).await.unwrap(), Some(vec![merged_head]));
+        assert_eq!(
+            store.get_op_heads(&repo_id).await.unwrap(),
+            Some(vec![merged_head])
+        );
     }
 
     #[tokio::test]
     async fn test_sqlite_compare_and_swap_op_heads_fails_on_mismatch() {
         let store = SqliteStore::in_memory().unwrap();
         let repo_id = "test-repo-exact-mismatch".to_string();
-        store.register_repo(repo_id.clone(), "default".to_string(), None).await.unwrap();
+        store
+            .register_repo(repo_id.clone(), "default".to_string(), None)
+            .await
+            .unwrap();
 
         let head1 = vec![201];
         let head2 = vec![202];
         let head3 = vec![203];
-        store.update_op_heads_append_new_remove_old(repo_id.clone(), &[], head1.clone()).await.unwrap();
-        store.update_op_heads_append_new_remove_old(repo_id.clone(), &[], head2.clone()).await.unwrap();
-        store.update_op_heads_append_new_remove_old(repo_id.clone(), &[], head3.clone()).await.unwrap();
+        store
+            .update_op_heads_append_new_remove_old(repo_id.clone(), &[], head1.clone())
+            .await
+            .unwrap();
+        store
+            .update_op_heads_append_new_remove_old(repo_id.clone(), &[], head2.clone())
+            .await
+            .unwrap();
+        store
+            .update_op_heads_append_new_remove_old(repo_id.clone(), &[], head3.clone())
+            .await
+            .unwrap();
 
         // Attempt exact update expecting only [head1, head2] when head3 is also in DB
         let err = store
-            .update_op_heads_compare_and_swap(repo_id.clone(), &[head1.clone(), head2.clone()], vec![204])
+            .update_op_heads_compare_and_swap(
+                repo_id.clone(),
+                &[head1.clone(), head2.clone()],
+                vec![204],
+            )
             .await
             .unwrap_err();
         match &err {
@@ -991,11 +1085,17 @@ mod tests {
         let store = SqliteStore::open(&file_path).unwrap();
 
         let repo_id = "test-reconnect-repo".to_string();
-        store.register_repo(repo_id.clone(), "default".to_string(), None).await.unwrap();
+        store
+            .register_repo(repo_id.clone(), "default".to_string(), None)
+            .await
+            .unwrap();
 
         let file_id = vec![10, 20, 30];
         let content = b"persisted content".to_vec();
-        store.put_file(repo_id.clone(), file_id.clone(), content.clone()).await.unwrap();
+        store
+            .put_file(repo_id.clone(), file_id.clone(), content.clone())
+            .await
+            .unwrap();
 
         // Reconnect to the database using the stored path
         assert!(store.reconnect().is_ok());
@@ -1009,113 +1109,166 @@ mod tests {
     #[tokio::test]
     async fn test_sqlite_register_repo_fails_on_readonly_store() {
         let (_dir, store) = create_readonly_store();
-        let err = store.register_repo("repo1".to_string(), "default".to_string(), None).await.unwrap_err();
+        let err = store
+            .register_repo("repo1".to_string(), "default".to_string(), None)
+            .await
+            .unwrap_err();
         match &err {
             StoreError::Write(msg) => {
                 assert_eq!(msg, "attempt to write a readonly database");
             }
             _ => panic!("expected StoreError::Write, got {err:?}"),
         }
-        assert_eq!(err.to_string(), "storage write error: attempt to write a readonly database");
+        assert_eq!(
+            err.to_string(),
+            "storage write error: attempt to write a readonly database"
+        );
     }
 
     #[tokio::test]
     async fn test_sqlite_put_commit_fails_on_readonly_store() {
         let (_dir, store) = create_readonly_store();
-        let err = store.put_commit("repo1".to_string(), vec![1u8], sample_commit()).await.unwrap_err();
+        let err = store
+            .put_commit("repo1".to_string(), vec![1u8], sample_commit())
+            .await
+            .unwrap_err();
         match &err {
             StoreError::Write(msg) => {
                 assert_eq!(msg, "attempt to write a readonly database");
             }
             _ => panic!("expected StoreError::Write, got {err:?}"),
         }
-        assert_eq!(err.to_string(), "storage write error: attempt to write a readonly database");
+        assert_eq!(
+            err.to_string(),
+            "storage write error: attempt to write a readonly database"
+        );
     }
 
     #[tokio::test]
     async fn test_sqlite_put_tree_fails_on_readonly_store() {
         let (_dir, store) = create_readonly_store();
-        let err = store.put_tree("repo1".to_string(), vec![1u8], sample_tree_entries()).await.unwrap_err();
+        let err = store
+            .put_tree("repo1".to_string(), vec![1u8], sample_tree_entries())
+            .await
+            .unwrap_err();
         match &err {
             StoreError::Write(msg) => {
                 assert_eq!(msg, "attempt to write a readonly database");
             }
             _ => panic!("expected StoreError::Write, got {err:?}"),
         }
-        assert_eq!(err.to_string(), "storage write error: attempt to write a readonly database");
+        assert_eq!(
+            err.to_string(),
+            "storage write error: attempt to write a readonly database"
+        );
     }
 
     #[tokio::test]
     async fn test_sqlite_put_file_fails_on_readonly_store() {
         let (_dir, store) = create_readonly_store();
-        let err = store.put_file("repo1".to_string(), vec![1u8], b"data".to_vec()).await.unwrap_err();
+        let err = store
+            .put_file("repo1".to_string(), vec![1u8], b"data".to_vec())
+            .await
+            .unwrap_err();
         match &err {
             StoreError::Write(msg) => {
                 assert_eq!(msg, "attempt to write a readonly database");
             }
             _ => panic!("expected StoreError::Write, got {err:?}"),
         }
-        assert_eq!(err.to_string(), "storage write error: attempt to write a readonly database");
+        assert_eq!(
+            err.to_string(),
+            "storage write error: attempt to write a readonly database"
+        );
     }
 
     #[tokio::test]
     async fn test_sqlite_put_operation_fails_on_readonly_store() {
         let (_dir, store) = create_readonly_store();
-        let err = store.put_operation("repo1".to_string(), vec![1u8], sample_operation()).await.unwrap_err();
+        let err = store
+            .put_operation("repo1".to_string(), vec![1u8], sample_operation())
+            .await
+            .unwrap_err();
         match &err {
             StoreError::Write(msg) => {
                 assert_eq!(msg, "attempt to write a readonly database");
             }
             _ => panic!("expected StoreError::Write, got {err:?}"),
         }
-        assert_eq!(err.to_string(), "storage write error: attempt to write a readonly database");
+        assert_eq!(
+            err.to_string(),
+            "storage write error: attempt to write a readonly database"
+        );
     }
 
     #[tokio::test]
     async fn test_sqlite_put_view_fails_on_readonly_store() {
         let (_dir, store) = create_readonly_store();
-        let err = store.put_view("repo1".to_string(), vec![1u8], sample_view()).await.unwrap_err();
+        let err = store
+            .put_view("repo1".to_string(), vec![1u8], sample_view())
+            .await
+            .unwrap_err();
         match &err {
             StoreError::Write(msg) => {
                 assert_eq!(msg, "attempt to write a readonly database");
             }
             _ => panic!("expected StoreError::Write, got {err:?}"),
         }
-        assert_eq!(err.to_string(), "storage write error: attempt to write a readonly database");
+        assert_eq!(
+            err.to_string(),
+            "storage write error: attempt to write a readonly database"
+        );
     }
 
     #[tokio::test]
     async fn test_sqlite_update_op_heads_fails_on_readonly_store() {
         let (_dir, store) = create_readonly_store();
-        let err = store.update_op_heads_append_new_remove_old("repo1".to_string(), &[], vec![1u8]).await.unwrap_err();
+        let err = store
+            .update_op_heads_append_new_remove_old("repo1".to_string(), &[], vec![1u8])
+            .await
+            .unwrap_err();
         match &err {
             StoreError::Write(msg) => {
                 assert_eq!(msg, "attempt to write a readonly database");
             }
             _ => panic!("expected StoreError::Write, got {err:?}"),
         }
-        assert_eq!(err.to_string(), "storage write error: attempt to write a readonly database");
+        assert_eq!(
+            err.to_string(),
+            "storage write error: attempt to write a readonly database"
+        );
     }
 
     #[tokio::test]
     async fn test_sqlite_compare_and_swap_op_heads_fails_on_readonly_store() {
         let (_dir, store) = create_readonly_store();
         let root_head = cc_common::ROOT_OPERATION_ID_BYTES.to_vec();
-        let err = store.update_op_heads_compare_and_swap("repo1".to_string(), &[root_head], vec![1u8]).await.unwrap_err();
+        let err = store
+            .update_op_heads_compare_and_swap("repo1".to_string(), &[root_head], vec![1u8])
+            .await
+            .unwrap_err();
         match &err {
             StoreError::Write(msg) => {
                 assert_eq!(msg, "attempt to write a readonly database");
             }
             _ => panic!("expected StoreError::Write, got {err:?}"),
         }
-        assert_eq!(err.to_string(), "storage write error: attempt to write a readonly database");
+        assert_eq!(
+            err.to_string(),
+            "storage write error: attempt to write a readonly database"
+        );
     }
 
     // Read error tests (missing tables)
     #[tokio::test]
     async fn test_sqlite_is_repo_registered_fails_on_missing_table() {
         let store = SqliteStore::in_memory().unwrap();
-        store.conn.lock().unwrap().execute("DROP TABLE repos", []).unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("DROP TABLE repos", [])
+            .unwrap();
         let err = store.is_repo_registered("r1").await.unwrap_err();
         match &err {
             StoreError::Read(msg) => {
@@ -1129,7 +1282,12 @@ mod tests {
     #[tokio::test]
     async fn test_sqlite_get_commit_fails_on_missing_table() {
         let store = SqliteStore::in_memory().unwrap();
-        store.conn.lock().unwrap().execute("DROP TABLE commits", []).unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("DROP TABLE commits", [])
+            .unwrap();
         let err = store.get_commit("r1", &[1]).await.unwrap_err();
         match &err {
             StoreError::Read(msg) => {
@@ -1137,13 +1295,21 @@ mod tests {
             }
             _ => panic!("expected StoreError::Read, got {err:?}"),
         }
-        assert_eq!(err.to_string(), "storage read error: no such table: commits");
+        assert_eq!(
+            err.to_string(),
+            "storage read error: no such table: commits"
+        );
     }
 
     #[tokio::test]
     async fn test_sqlite_get_tree_fails_on_missing_table() {
         let store = SqliteStore::in_memory().unwrap();
-        store.conn.lock().unwrap().execute("DROP TABLE trees", []).unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("DROP TABLE trees", [])
+            .unwrap();
         let err = store.get_tree("r1", &[1]).await.unwrap_err();
         match &err {
             StoreError::Read(msg) => {
@@ -1157,7 +1323,12 @@ mod tests {
     #[tokio::test]
     async fn test_sqlite_get_file_fails_on_missing_table() {
         let store = SqliteStore::in_memory().unwrap();
-        store.conn.lock().unwrap().execute("DROP TABLE files", []).unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("DROP TABLE files", [])
+            .unwrap();
         let err = store.get_file("r1", &[1]).await.unwrap_err();
         match &err {
             StoreError::Read(msg) => {
@@ -1171,7 +1342,12 @@ mod tests {
     #[tokio::test]
     async fn test_sqlite_get_operation_fails_on_missing_table() {
         let store = SqliteStore::in_memory().unwrap();
-        store.conn.lock().unwrap().execute("DROP TABLE operations", []).unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("DROP TABLE operations", [])
+            .unwrap();
         let err = store.get_operation("r1", &[1]).await.unwrap_err();
         match &err {
             StoreError::Read(msg) => {
@@ -1179,13 +1355,21 @@ mod tests {
             }
             _ => panic!("expected StoreError::Read, got {err:?}"),
         }
-        assert_eq!(err.to_string(), "storage read error: no such table: operations");
+        assert_eq!(
+            err.to_string(),
+            "storage read error: no such table: operations"
+        );
     }
 
     #[tokio::test]
     async fn test_sqlite_get_view_fails_on_missing_table() {
         let store = SqliteStore::in_memory().unwrap();
-        store.conn.lock().unwrap().execute("DROP TABLE views", []).unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("DROP TABLE views", [])
+            .unwrap();
         let err = store.get_view("r1", &[1]).await.unwrap_err();
         match &err {
             StoreError::Read(msg) => {
@@ -1199,7 +1383,12 @@ mod tests {
     #[tokio::test]
     async fn test_sqlite_get_op_heads_fails_on_missing_table() {
         let store = SqliteStore::in_memory().unwrap();
-        store.conn.lock().unwrap().execute("DROP TABLE op_heads", []).unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("DROP TABLE op_heads", [])
+            .unwrap();
         let err = store.get_op_heads("r1").await.unwrap_err();
         match &err {
             StoreError::Read(msg) => {
@@ -1207,17 +1396,25 @@ mod tests {
             }
             _ => panic!("expected StoreError::Read, got {err:?}"),
         }
-        assert_eq!(err.to_string(), "storage read error: no such table: op_heads");
+        assert_eq!(
+            err.to_string(),
+            "storage read error: no such table: op_heads"
+        );
     }
 
     // Decode error tests (corrupted data)
     #[tokio::test]
     async fn test_sqlite_get_commit_fails_on_corrupted_data() {
         let store = SqliteStore::in_memory().unwrap();
-        store.conn.lock().unwrap().execute(
-            "INSERT INTO commits (project_id, commit_id, data) VALUES (?1, ?2, ?3)",
-            params!["r1", vec![1u8], vec![0xFFu8, 0xFFu8, 0xFFu8, 0xFFu8]],
-        ).unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO commits (project_id, commit_id, data) VALUES (?1, ?2, ?3)",
+                params!["r1", vec![1u8], vec![0xFFu8, 0xFFu8, 0xFFu8, 0xFFu8]],
+            )
+            .unwrap();
         let err = store.get_commit("r1", &[1]).await.unwrap_err();
         match &err {
             StoreError::Decode(msg) => {
@@ -1225,16 +1422,24 @@ mod tests {
             }
             _ => panic!("expected StoreError::Decode, got {err:?}"),
         }
-        assert_eq!(err.to_string(), "stored data is corrupt: failed to decode Protobuf message: invalid varint");
+        assert_eq!(
+            err.to_string(),
+            "stored data is corrupt: failed to decode Protobuf message: invalid varint"
+        );
     }
 
     #[tokio::test]
     async fn test_sqlite_get_tree_fails_on_corrupted_data() {
         let store = SqliteStore::in_memory().unwrap();
-        store.conn.lock().unwrap().execute(
-            "INSERT INTO trees (project_id, tree_id, data) VALUES (?1, ?2, ?3)",
-            params!["r1", vec![1u8], vec![0xFFu8, 0xFFu8, 0xFFu8, 0xFFu8]],
-        ).unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO trees (project_id, tree_id, data) VALUES (?1, ?2, ?3)",
+                params!["r1", vec![1u8], vec![0xFFu8, 0xFFu8, 0xFFu8, 0xFFu8]],
+            )
+            .unwrap();
         let err = store.get_tree("r1", &[1]).await.unwrap_err();
         match &err {
             StoreError::Decode(msg) => {
@@ -1242,16 +1447,24 @@ mod tests {
             }
             _ => panic!("expected StoreError::Decode, got {err:?}"),
         }
-        assert_eq!(err.to_string(), "stored data is corrupt: failed to decode Protobuf message: invalid varint");
+        assert_eq!(
+            err.to_string(),
+            "stored data is corrupt: failed to decode Protobuf message: invalid varint"
+        );
     }
 
     #[tokio::test]
     async fn test_sqlite_get_operation_fails_on_corrupted_data() {
         let store = SqliteStore::in_memory().unwrap();
-        store.conn.lock().unwrap().execute(
-            "INSERT INTO operations (repo_id, op_id, data) VALUES (?1, ?2, ?3)",
-            params!["r1", vec![1u8], vec![0xFFu8, 0xFFu8, 0xFFu8, 0xFFu8]],
-        ).unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO operations (repo_id, op_id, data) VALUES (?1, ?2, ?3)",
+                params!["r1", vec![1u8], vec![0xFFu8, 0xFFu8, 0xFFu8, 0xFFu8]],
+            )
+            .unwrap();
         let err = store.get_operation("r1", &[1]).await.unwrap_err();
         match &err {
             StoreError::Decode(msg) => {
@@ -1259,16 +1472,24 @@ mod tests {
             }
             _ => panic!("expected StoreError::Decode, got {err:?}"),
         }
-        assert_eq!(err.to_string(), "stored data is corrupt: failed to decode Protobuf message: invalid varint");
+        assert_eq!(
+            err.to_string(),
+            "stored data is corrupt: failed to decode Protobuf message: invalid varint"
+        );
     }
 
     #[tokio::test]
     async fn test_sqlite_get_view_fails_on_corrupted_data() {
         let store = SqliteStore::in_memory().unwrap();
-        store.conn.lock().unwrap().execute(
-            "INSERT INTO views (repo_id, view_id, data) VALUES (?1, ?2, ?3)",
-            params!["r1", vec![1u8], vec![0xFFu8, 0xFFu8, 0xFFu8, 0xFFu8]],
-        ).unwrap();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO views (repo_id, view_id, data) VALUES (?1, ?2, ?3)",
+                params!["r1", vec![1u8], vec![0xFFu8, 0xFFu8, 0xFFu8, 0xFFu8]],
+            )
+            .unwrap();
         let err = store.get_view("r1", &[1]).await.unwrap_err();
         match &err {
             StoreError::Decode(msg) => {
@@ -1276,7 +1497,10 @@ mod tests {
             }
             _ => panic!("expected StoreError::Decode, got {err:?}"),
         }
-        assert_eq!(err.to_string(), "stored data is corrupt: failed to decode Protobuf message: invalid varint");
+        assert_eq!(
+            err.to_string(),
+            "stored data is corrupt: failed to decode Protobuf message: invalid varint"
+        );
     }
 
     // Encode error test
@@ -1289,14 +1513,20 @@ mod tests {
             }
             _ => panic!("expected StoreError::Encode, got {err:?}"),
         }
-        assert_eq!(err.to_string(), "storage encode error: test protobuf encode error");
+        assert_eq!(
+            err.to_string(),
+            "storage encode error: test protobuf encode error"
+        );
     }
 
     #[tokio::test]
     async fn test_sqlite_put_and_read_workspace_succeeds() {
         let store = SqliteStore::in_memory().unwrap();
         store
-            .register_project("shared-proj".to_string(), Some("Shared Project".to_string()))
+            .register_project(
+                "shared-proj".to_string(),
+                Some("Shared Project".to_string()),
+            )
             .await
             .unwrap();
         store

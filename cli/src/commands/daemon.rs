@@ -1,6 +1,6 @@
 use cc_lib::util::CommitCloudConfig;
 use clap::Parser;
-use jj_cli::command_error::{user_error, CommandError};
+use jj_cli::command_error::{CommandError, user_error};
 
 #[derive(Parser, Clone, Debug)]
 pub struct DaemonArgs {

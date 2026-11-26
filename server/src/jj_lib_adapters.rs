@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
-use futures::stream::{self, BoxStream, LocalBoxStream};
 use futures::StreamExt as _;
+use futures::stream::{self, BoxStream, LocalBoxStream};
 use jj_lib::backend::*;
 use jj_lib::commit::Commit as JjCommit;
 use jj_lib::graph::GraphNode;
@@ -137,23 +137,33 @@ impl Backend for ServerBackend {
     }
 
     async fn read_symlink(&self, _path: &RepoPath, _id: &SymlinkId) -> BackendResult<String> {
-        Err(BackendError::Unsupported("read_symlink not supported".to_string()))
+        Err(BackendError::Unsupported(
+            "read_symlink not supported".to_string(),
+        ))
     }
 
     async fn write_symlink(&self, _path: &RepoPath, _target: &str) -> BackendResult<SymlinkId> {
-        Err(BackendError::Unsupported("write_symlink not supported".to_string()))
+        Err(BackendError::Unsupported(
+            "write_symlink not supported".to_string(),
+        ))
     }
 
     async fn read_copy(&self, _id: &CopyId) -> BackendResult<CopyHistory> {
-        Err(BackendError::Unsupported("copies not supported".to_string()))
+        Err(BackendError::Unsupported(
+            "copies not supported".to_string(),
+        ))
     }
 
     async fn write_copy(&self, _contents: &CopyHistory) -> BackendResult<CopyId> {
-        Err(BackendError::Unsupported("copies not supported".to_string()))
+        Err(BackendError::Unsupported(
+            "copies not supported".to_string(),
+        ))
     }
 
     async fn get_related_copies(&self, _copy_id: &CopyId) -> BackendResult<Vec<RelatedCopy>> {
-        Err(BackendError::Unsupported("copies not supported".to_string()))
+        Err(BackendError::Unsupported(
+            "copies not supported".to_string(),
+        ))
     }
 
     async fn read_tree(&self, _path: &RepoPath, id: &TreeId) -> BackendResult<Tree> {
@@ -193,7 +203,11 @@ impl Backend for ServerBackend {
         let tree_id_bytes = compute_git_tree_hash(&proto_entries);
 
         self.store
-            .put_tree(self.project_id.clone(), tree_id_bytes.clone(), proto_entries)
+            .put_tree(
+                self.project_id.clone(),
+                tree_id_bytes.clone(),
+                proto_entries,
+            )
             .await
             .map_err(|e| BackendError::Other(e.into()))?;
 
@@ -386,7 +400,11 @@ impl OpStore for ServerOpStore {
         }
     }
 
-    async fn gc(&self, _target_op_ids: &[OperationId], _keep_newer: SystemTime) -> OpStoreResult<()> {
+    async fn gc(
+        &self,
+        _target_op_ids: &[OperationId],
+        _keep_newer: SystemTime,
+    ) -> OpStoreResult<()> {
         Ok(())
     }
 }
@@ -429,11 +447,7 @@ impl OpHeadsStore for ServerOpHeadsStore {
         let target_id = new_id.clone();
 
         self.store
-            .update_op_heads_compare_and_swap(
-                self.repo_id.clone(),
-                &old_vec,
-                new_vec,
-            )
+            .update_op_heads_compare_and_swap(self.repo_id.clone(), &old_vec, new_vec)
             .await
             .map_err(|e| OpHeadsStoreError::Write {
                 new_op_id: target_id,
@@ -515,10 +529,7 @@ impl Revset for EmptyRevset {
 pub struct ServerIndex;
 
 impl Index for ServerIndex {
-    fn shortest_unique_commit_id_prefix_len(
-        &self,
-        _commit_id: &CommitId,
-    ) -> IndexResult<usize> {
+    fn shortest_unique_commit_id_prefix_len(&self, _commit_id: &CommitId) -> IndexResult<usize> {
         Ok(12)
     }
 
@@ -533,11 +544,7 @@ impl Index for ServerIndex {
         Ok(false)
     }
 
-    fn is_ancestor(
-        &self,
-        ancestor_id: &CommitId,
-        descendant_id: &CommitId,
-    ) -> IndexResult<bool> {
+    fn is_ancestor(&self, ancestor_id: &CommitId, descendant_id: &CommitId) -> IndexResult<bool> {
         Ok(ancestor_id == descendant_id)
     }
 
@@ -553,10 +560,7 @@ impl Index for ServerIndex {
         Err(IndexError::AllHeadsForGcUnsupported)
     }
 
-    fn heads(
-        &self,
-        candidates: &mut dyn Iterator<Item = &CommitId>,
-    ) -> IndexResult<Vec<CommitId>> {
+    fn heads(&self, candidates: &mut dyn Iterator<Item = &CommitId>) -> IndexResult<Vec<CommitId>> {
         Ok(candidates.cloned().collect())
     }
 

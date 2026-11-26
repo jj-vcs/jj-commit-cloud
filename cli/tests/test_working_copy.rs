@@ -1,5 +1,5 @@
-use cc_common::workspace::workspace_service_client::WorkspaceServiceClient;
 use cc_common::workspace::GetWorkspaceRequest;
+use cc_common::workspace::workspace_service_client::WorkspaceServiceClient;
 use std::fs;
 use testutils::TestWorkspace;
 
@@ -94,7 +94,9 @@ async fn test_working_copy_syncs_state_to_server() {
         .expect("Failed to get workspace")
         .into_inner();
 
-    let ws_state = response.workspace.expect("Workspace should be registered on server");
+    let ws_state = response
+        .workspace
+        .expect("Workspace should be registered on server");
     assert_eq!(ws_state.repo_id, repo_id);
     assert_eq!(ws_state.user, user);
     assert_eq!(ws_state.workspace_name, "default");
@@ -110,7 +112,9 @@ async fn test_working_copy_snapshot_and_change_detection() {
     fs::write(&test_file, "hello from commit cloud working copy").unwrap();
 
     let mut cmd = ws.jj_cmd();
-    cmd.args(["describe", "-m", "add hello.txt"]).assert().success();
+    cmd.args(["describe", "-m", "add hello.txt"])
+        .assert()
+        .success();
 
     let config_path = ws.repo_path().join(".jj/repo/store/config.toml");
     let config_str = fs::read_to_string(&config_path).unwrap();
@@ -132,9 +136,17 @@ async fn test_working_copy_snapshot_and_change_detection() {
         .expect("Failed to get workspace")
         .into_inner();
 
-    let ws_state = response.workspace.expect("Workspace should exist on server");
-    assert!(!ws_state.tree_id.is_empty(), "Working tree ID should not be empty");
-    assert!(!ws_state.commit_id.is_empty(), "commit_id should not be empty");
+    let ws_state = response
+        .workspace
+        .expect("Workspace should exist on server");
+    assert!(
+        !ws_state.tree_id.is_empty(),
+        "Working tree ID should not be empty"
+    );
+    assert!(
+        !ws_state.commit_id.is_empty(),
+        "commit_id should not be empty"
+    );
 }
 
 #[tokio::test]
@@ -355,7 +367,10 @@ async fn test_delete_workspace_nonexistent_returns_false() {
         .await
         .expect("Failed to call delete_workspace")
         .into_inner();
-    assert!(!del_resp.success, "Deleting a nonexistent workspace should return success = false");
+    assert!(
+        !del_resp.success,
+        "Deleting a nonexistent workspace should return success = false"
+    );
 
     // Attempt to delete from a nonexistent repository
     let del_resp2 = client
@@ -367,7 +382,10 @@ async fn test_delete_workspace_nonexistent_returns_false() {
         .await
         .expect("Failed to call delete_workspace")
         .into_inner();
-    assert!(!del_resp2.success, "Deleting from a nonexistent repository should return success = false");
+    assert!(
+        !del_resp2.success,
+        "Deleting from a nonexistent repository should return success = false"
+    );
 }
 
 #[tokio::test]
@@ -380,7 +398,9 @@ async fn test_check_working_copy_changes_succeeds() {
     let test_file = ws.repo_path().join("file.txt");
     fs::write(&test_file, "content").unwrap();
     let mut cmd = ws.jj_cmd();
-    cmd.args(["describe", "-m", "test commit"]).assert().success();
+    cmd.args(["describe", "-m", "test commit"])
+        .assert()
+        .success();
 
     let config_path = ws.repo_path().join(".jj/repo/store/config.toml");
     let config_str = fs::read_to_string(&config_path).unwrap();
@@ -402,7 +422,10 @@ async fn test_check_working_copy_changes_succeeds() {
         .expect("Failed to check working copy changes")
         .into_inner();
 
-    assert!(!response.has_changes, "Workspace should have no un-snapshotted changes after describe");
+    assert!(
+        !response.has_changes,
+        "Workspace should have no un-snapshotted changes after describe"
+    );
     assert_eq!(response.current_tree_id, response.commit_tree_id);
 }
 
@@ -430,7 +453,10 @@ async fn test_check_working_copy_changes_nonexistent_workspace_fails() {
         })
         .await;
 
-    assert!(result.is_err(), "Expected error when checking changes for nonexistent workspace");
+    assert!(
+        result.is_err(),
+        "Expected error when checking changes for nonexistent workspace"
+    );
     let status = result.unwrap_err();
     assert_eq!(status.code(), tonic::Code::NotFound);
 }
@@ -441,12 +467,12 @@ async fn test_workspace_forget_cli() {
 
     // Verify workspace list shows default workspace
     let mut list_cmd = ws.jj_cmd();
-    let output = list_cmd
-        .args(["workspace", "list"])
-        .assert()
-        .success();
+    let output = list_cmd.args(["workspace", "list"]).assert().success();
     let stdout = String::from_utf8_lossy(&output.get_output().stdout);
-    assert!(stdout.contains("default"), "Workspace list should include default");
+    assert!(
+        stdout.contains("default"),
+        "Workspace list should include default"
+    );
 
     // Forget the default workspace
     let mut forget_cmd = ws.jj_cmd();
@@ -457,12 +483,12 @@ async fn test_workspace_forget_cli() {
 
     // Verify workspace list is now empty or default is removed
     let mut list_cmd2 = ws.jj_cmd();
-    let output2 = list_cmd2
-        .args(["workspace", "list"])
-        .assert()
-        .success();
+    let output2 = list_cmd2.args(["workspace", "list"]).assert().success();
     let stdout2 = String::from_utf8_lossy(&output2.get_output().stdout);
-    assert!(!stdout2.contains("default:"), "Workspace list should not show active default workspace");
+    assert!(
+        !stdout2.contains("default:"),
+        "Workspace list should not show active default workspace"
+    );
 }
 
 #[tokio::test]
@@ -565,7 +591,12 @@ async fn test_working_copy_shared_project_sqlite_integration() {
         .current_dir(dir_client_2.path())
         .env("JJ_USER", "Client 2")
         .env("JJ_EMAIL", "client_2@example.com")
-        .args(["new", &client_1_commit_id, "-m", "working copy on top of client_1"])
+        .args([
+            "new",
+            &client_1_commit_id,
+            "-m",
+            "working copy on top of client_1",
+        ])
         .assert()
         .success();
 
@@ -626,4 +657,3 @@ async fn test_working_copy_shared_project_sqlite_integration() {
         .unwrap();
     assert_eq!(ws_count, 2);
 }
-
