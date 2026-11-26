@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Two writers that expect the same op head race to replace it.
-//! Every round must give exactly one success and one CAS rejection.
+//! Two writers racing from the same op head both succeed under lock-free
+//! additive `UpdateOpHeads`, preserving both sibling heads with zero lost
+//! updates until `ReconcileOpHeads` merges them back to a single head.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use tempfile::NamedTempFile;
 use tokio::sync::Barrier;
@@ -23,7 +25,8 @@ use cc_common::backend::backend_service_client::BackendServiceClient;
 use cc_common::backend::{HashAlgorithm, RegisterRepositoryRequest};
 use cc_common::op_store::op_store_service_client::OpStoreServiceClient;
 use cc_common::op_store::{
-    GetOpHeadsRequest, Operation, OperationMetadata, UpdateOpHeadsRequest, WriteOperationRequest,
+    GetOpHeadsRequest, Operation, OperationMetadata, ReconcileOpHeadsRequest, UpdateOpHeadsRequest,
+    WriteOperationRequest,
 };
 use testutils::spawn_sqlite_server;
 
@@ -44,7 +47,7 @@ fn make_op(parent: Vec<u8>, desc: String, ts: i64) -> Operation {
             attributes: Default::default(),
         }),
         commit_predecessors: vec![],
-        commit_predecessors_set: false,
+        commit_predecessors_set: true,
     }
 }
 
@@ -127,35 +130,52 @@ async fn run_two_writer_race(server_url: String) {
             }));
         }
 
-        let mut winners = Vec::new();
-        let mut rejections = 0;
+        let mut written = HashSet::new();
         for handle in handles {
             let (new_id, result) = handle.await.unwrap();
-            match result {
-                Ok(_) => winners.push(new_id),
-                Err(status) if status.code() == tonic::Code::Aborted => rejections += 1,
-                Err(status) => panic!("round {round}: unexpected error {status:?}"),
-            }
+            result.unwrap_or_else(|status| {
+                panic!("round {round}: additive UpdateOpHeads must succeed, got {status:?}")
+            });
+            written.insert(new_id);
         }
         assert_eq!(
-            (winners.len(), rejections),
-            (1, 1),
-            "round {round}: expected one success and one rejection"
+            written.len(),
+            2,
+            "round {round}: expected two distinct op IDs"
         );
 
-        let heads = setup
+        let heads: HashSet<Vec<u8>> = setup
             .get_op_heads(GetOpHeadsRequest {
                 repo_id: repo_id.clone(),
             })
             .await
             .unwrap()
             .into_inner()
-            .op_head_ids;
+            .op_head_ids
+            .into_iter()
+            .collect();
         assert_eq!(
-            heads, winners,
-            "round {round}: head must be the winner only"
+            heads, written,
+            "round {round}: both concurrent sibling heads must be preserved"
         );
-        base = winners.pop().unwrap();
+
+        let reconciled = setup
+            .reconcile_op_heads(ReconcileOpHeadsRequest {
+                repo_id: repo_id.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            !reconciled.client_resolution_required,
+            "round {round}: server reconciliation must merge divergent heads"
+        );
+        assert_eq!(
+            reconciled.current_op_head_ids,
+            vec![reconciled.op_head.clone()],
+            "round {round}: reconciled repo must have a single head"
+        );
+        base = reconciled.op_head;
     }
 }
 

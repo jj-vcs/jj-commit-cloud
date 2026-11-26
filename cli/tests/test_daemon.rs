@@ -532,16 +532,26 @@ async fn test_daemon_cold_and_warm_read_tree_against_server() {
     );
     assert!(page2.next_page_token.is_empty());
 
-    // 4. Cold paginated ReadTree on an uncached tree still propagates `UNIMPLEMENTED` from server.
-    let cold_paginated_err = daemon_client
+    // 4. Cold paginated ReadTree on an uncached tree succeeds against paginated `jj-cc-server`.
+    let cold_paginated = daemon_client
         .read_tree(ReadTreeRequest {
             project_id,
-            tree_id: second_tree_id,
+            tree_id: second_tree_id.clone(),
             path: String::new(),
             page_size: 1,
             page_token: String::new(),
         })
         .await
-        .unwrap_err();
-    assert_eq!(cold_paginated_err.code(), tonic::Code::Unimplemented);
+        .expect("Cold paginated ReadTree must succeed against paginated jj-cc-server")
+        .into_inner();
+    assert_eq!(cold_paginated.tree_id, second_tree_id);
+    assert_eq!(
+        cold_paginated
+            .entries
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["only.txt"]
+    );
+    assert!(cold_paginated.next_page_token.is_empty());
 }

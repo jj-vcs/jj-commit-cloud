@@ -73,7 +73,7 @@ fn test_server_fails_when_database_parent_path_is_not_a_directory() {
     let invalid_db_path = blocker_file.join("store.db");
     let expected_io_err = fs::create_dir_all(&blocker_file).unwrap_err();
     let expected_stderr = format!(
-        "Error: Failed to create parent directory '{}' for SQLite database: {}\n",
+        "Error: storage backend error: failed to create SQLite parent directory {}: {}\n",
         blocker_file.display(),
         expected_io_err
     );
@@ -101,7 +101,7 @@ fn test_server_fails_when_sqlite_database_file_permission_denied() {
 
     let expected_rusqlite_err = rusqlite::Connection::open(&readonly_db).unwrap_err();
     let expected_stderr = format!(
-        "Error: Failed to open SQLite database at '{}': {}\n",
+        "Error: storage backend error: failed to open SQLite database {}: {}\n",
         readonly_db.display(),
         expected_rusqlite_err
     );
@@ -127,7 +127,7 @@ fn test_server_fails_when_home_directory_is_unwritable_for_default_sqlite_path()
     let expected_default_dir = blocker_file.join(".jj-cc-server");
     let expected_io_err = fs::create_dir_all(&expected_default_dir).unwrap_err();
     let expected_stderr = format!(
-        "Error: Failed to create default SQLite directory '{}': {}\n",
+        "Error: storage backend error: failed to create SQLite parent directory {}: {}\n",
         expected_default_dir.display(),
         expected_io_err
     );

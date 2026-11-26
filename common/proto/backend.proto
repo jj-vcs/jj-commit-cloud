@@ -49,8 +49,8 @@ package commit_cloud.backend;
 // - `RESOURCE_EXHAUSTED`: `WriteFileStream` upload exceeds the server's maximum
 //   blob size (512 MiB).
 // - `DATA_LOSS`: Stored symlink bytes are not valid UTF-8 or contain NUL bytes.
-// - `UNIMPLEMENTED`: Requested RPC, option, field (`Commit.external_ids`), or
-//   repository `HashAlgorithm` is not yet enabled on this server.
+// - `UNIMPLEMENTED`: Requested option or repository `HashAlgorithm` is not yet
+//   enabled on this server.
 service BackendService {
   // Registers or ensures a shared `project_id` namespace that owns immutable
   // commits, directory trees, symlinks, and blob reachability across sibling
@@ -62,8 +62,8 @@ service BackendService {
   rpc RegisterRepository(RegisterRepositoryRequest)
       returns (RegisterRepositoryResponse);
 
-  // Reads a commit header by `commit_id` (the virtual all-zero `ROOT_COMMIT_ID`
-  // is synthesized client-side unless server root synthesis is enabled).
+  // Reads a commit header by `commit_id`, synthesizing the virtual all-zero
+  // `ROOT_COMMIT_ID` when no physical root commit row is stored.
   rpc ReadCommit(ReadCommitRequest) returns (ReadCommitResponse);
 
   // Persists a commit and returns its canonical `commit_id` (verifying digest
@@ -226,9 +226,8 @@ message Commit {
   // Optional external VCS commit identifiers (for example `git-sha1`,
   // `git-sha256`, or `perforce-cl`) attached at import time or derived after
   // the fact when canonical Commit Cloud IDs diverge from flat Git Merkle
-  // hashes. Excluded from `commit_id` hashing. Currently returns
-  // `UNIMPLEMENTED` when non-empty; once wired, servers validate key and digest
-  // formats, while secondary-index cross-commit uniqueness enforcement across
+  // hashes. Excluded from `commit_id` hashing. Servers enforce key and digest
+  // format validation, while secondary-index cross-commit uniqueness across
   // `(project_id, key, external_id)` is planned for post-M1.
   map<string, bytes> external_ids = 12;
 }

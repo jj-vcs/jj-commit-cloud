@@ -194,6 +194,20 @@ async fn test_server_bearer_auth_enforces_tokens_while_keeping_health_open() {
         .chunk;
     assert_eq!(chunk, b"hello bearer auth");
 
+    let mut sha256_req = Request::new(RegisterRepositoryRequest {
+        project_id: String::new(),
+        repo_id: None,
+        name: None,
+        hash_algorithm: cc_common::backend::HashAlgorithm::Sha256 as i32,
+    });
+    sha256_req
+        .metadata_mut()
+        .insert("authorization", "Bearer active-token-1".parse().unwrap());
+    let sha256_err = backend
+        .register_repository(sha256_req)
+        .await
+        .expect_err("SHA-256 repository registration must return UNIMPLEMENTED in M1");
+    assert_eq!(sha256_err.code(), Code::Unimplemented);
     let mut req2 = Request::new(GetOpHeadsRequest {
         repo_id: repo_id.clone(),
     });
@@ -270,6 +284,102 @@ fn run_server_cli(env_vars: &[(&str, &str)], args: &[&str]) -> std::process::Out
         stdout: out_handle.join().unwrap_or_default(),
         stderr: err_handle.join().unwrap_or_default(),
     }
+}
+
+#[test]
+fn test_server_spanner_refuses_to_start_without_explicit_blob_store() {
+    let db_arg = "--spanner-database=projects/p/instances/i/databases/d";
+
+    let out = run_server_cli(&[], &["--port=0", "--store-type=spanner", db_arg]);
+    assert!(
+        !out.status.success(),
+        "spanner without blob store must fail at startup"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("requires an explicit blob store"),
+        "unexpected stderr: {stderr}"
+    );
+
+    // Empty env var placeholders must not bypass the durable blob store requirement.
+    let out_empty_env = run_server_cli(
+        &[("BLOB_PATH", "")],
+        &["--port=0", "--store-type=spanner", db_arg],
+    );
+    assert!(!out_empty_env.status.success());
+
+    // `--spanner-emulator` / `SPANNER_EMULATOR` flag is advertised and accepted by the CLI.
+    let help = run_server_cli(&[], &["--help"]);
+    assert!(help.status.success());
+    let help_stdout = String::from_utf8_lossy(&help.stdout);
+    assert!(
+        help_stdout.contains("--spanner-emulator") && help_stdout.contains("SPANNER_EMULATOR"),
+        "--help missing --spanner-emulator / SPANNER_EMULATOR: {help_stdout}"
+    );
+    let out_emu = run_server_cli(
+        &[],
+        &[
+            "--port=0",
+            "--store-type=spanner",
+            "--spanner-emulator",
+            "--spanner-endpoint=127.0.0.1:9010",
+            db_arg,
+        ],
+    );
+    assert!(!out_emu.status.success());
+    let emu_stderr = String::from_utf8_lossy(&out_emu.stderr);
+    assert!(
+        emu_stderr.contains("requires an explicit blob store"),
+        "expected startup to parse --spanner-emulator and reach blob-store validation, got: {emu_stderr}"
+    );
+}
+
+#[tokio::test]
+async fn test_server_rejects_oversized_inline_blob_threshold_bytes() {
+    let over_cli = run_server_cli(&[], &["--port=0", "--inline-blob-threshold-bytes=4194305"]);
+    assert!(
+        !over_cli.status.success(),
+        "--inline-blob-threshold-bytes above 4 MiB must fail at startup"
+    );
+    let cli_stderr = String::from_utf8_lossy(&over_cli.stderr);
+    assert!(
+        cli_stderr.contains("exceeds maximum allowed value"),
+        "unexpected stderr: {cli_stderr}"
+    );
+
+    let over_env = run_server_cli(
+        &[("INLINE_BLOB_THRESHOLD_BYTES", "10485760")],
+        &["--port=0"],
+    );
+    assert!(
+        !over_env.status.success(),
+        "INLINE_BLOB_THRESHOLD_BYTES above 4 MiB must fail at startup"
+    );
+    let env_stderr = String::from_utf8_lossy(&over_env.stderr);
+    assert!(
+        env_stderr.contains("exceeds maximum allowed value"),
+        "unexpected stderr: {env_stderr}"
+    );
+
+    // Exact 4 MiB boundary is accepted and serves health checks.
+    let server =
+        testutils::spawn_server_with_args(&["--inline-blob-threshold-bytes=4194304"]).await;
+    let channel = tonic::transport::Endpoint::from_shared(server.url().to_string())
+        .expect("valid endpoint")
+        .connect()
+        .await
+        .expect("connect to 4 MiB threshold server succeeded");
+    let mut health = HealthClient::new(channel);
+    let res = health
+        .check(HealthCheckRequest {
+            service: String::new(),
+        })
+        .await
+        .expect("health check should succeed");
+    assert_eq!(
+        res.into_inner().status(),
+        tonic_health::pb::health_check_response::ServingStatus::Serving
+    );
 }
 
 #[test]

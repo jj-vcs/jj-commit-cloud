@@ -2,9 +2,9 @@
 
 ## Summary
 
-jj-cc-server keeps commits, trees, files, operations, views and operation heads in [Cloud Spanner](https://cloud.google.com/spanner) when started with `--store-type spanner`. Workspaces that pass the same `--repo-id` to `jj cc init` share one operation log: a commit made in one workspace shows up in `jj log` of the others. Two writers that expect the same operation head cannot both win; the second gets a CAS conflict (gRPC `ABORTED`).
+jj-cc-server stores repository metadata (projects, repositories, commits, trees, symlinks, operations, views, operation heads, workspaces, and blob records) in [Cloud Spanner](https://cloud.google.com/spanner) when started with `--store-type spanner`, paired with an explicit blob store (`--blob-path` for local disk storage or `--blob-store=memory` for throwaway tests). Workspaces that pass the same `--repo-id` to `jj cc init` share one operation log: a commit made in one workspace shows up in `jj log` of the others. Concurrent writers use lock-free additive `UpdateOpHeads` inside serializable Spanner transactions: two writers starting from the same operation head both succeed with zero lost updates, keeping both sibling heads until `ReconcileOpHeads` merges them back to a single head.
 
-The sections below build the server and the jj CLI, create a database (Cloud Spanner, or the Spanner emulator with no GCP account), start the server, connect two workspaces, check that they share history and that concurrent writers are serialized, and remove everything again. Every step lists the output to expect.
+Follow these steps to build the server and the jj CLI, create a database on Cloud Spanner or the Spanner emulator, start the server with an explicit blob store, connect two workspaces, verify shared history and concurrent-writer reconciliation, and clean up. Every step lists the output to expect.
 
 ## Prerequisites
 
@@ -40,7 +40,7 @@ The jj built here embeds the `jj cc` commands and starts jj-cc-daemon from the s
 
 ## Create the database
 
-Pick one of the two options. Each ends with a database path for `--spanner-db`, exported as `SPANNER_DB`.
+Pick one of the two options. Each ends with a database path for `--spanner-database` (alias `--spanner-db`), exported as `SPANNER_DB`.
 
 ### Cloud Spanner
 
@@ -54,7 +54,7 @@ gcloud services enable spanner.googleapis.com --project "$PROJECT"
 gcloud spanner instances create "$INSTANCE" --project "$PROJECT" \
     --config=regional-europe-west3 --processing-units=100 --description="jj-cc-server"
 gcloud spanner databases create jj-cc --instance="$INSTANCE" --project "$PROJECT"
-grep -v '^\s*--' "$CC_SRC/server/db/schema_spanner.sql" > /tmp/jj-cc-schema.sql
+grep -v '^\s*--' "$CC_SRC/server/sql/spanner_schema.sql" > /tmp/jj-cc-schema.sql
 gcloud spanner databases ddl update jj-cc --instance="$INSTANCE" --project "$PROJECT" \
     --ddl-file=/tmp/jj-cc-schema.sql
 gcloud auth application-default login    # credentials for a server on this machine
@@ -68,10 +68,10 @@ gcloud spanner databases ddl describe jj-cc --instance="$INSTANCE" --project "$P
 ```
 
 ```
-10
+11
 ```
 
-The schema in [server/db/schema_spanner.sql](../server/db/schema_spanner.sql) has `--` comment lines, which the `grep` removes before gcloud reads the statements. A server on a Compute Engine VM uses the VM's service account in place of `gcloud auth application-default login`; grant it `roles/spanner.databaseUser` on the database.
+The schema in [server/sql/spanner_schema.sql](../server/sql/spanner_schema.sql) has `--` comment lines, which `grep` removes before gcloud reads the statements. A server on a Compute Engine VM uses the VM's service account in place of `gcloud auth application-default login`; grant it `roles/spanner.databaseUser` on the database.
 
 ### Spanner emulator
 
@@ -88,25 +88,38 @@ export SPANNER_EMULATOR_HOST=localhost:9010
 export SPANNER_DB="projects/test-project/instances/test-instance/databases/jj-cc"
 ```
 
-Expected output: each `curl` prints a JSON operation whose `name` ends in `/operations/_auto0` or similar. With Podman, replace `docker` with `podman`. The server creates the tables itself on the emulator at start.
+Expected output: each `curl` prints a JSON operation whose `name` ends in `/operations/_auto0` or similar. With Podman, replace `docker` with `podman`. Passing `--spanner-auto-migrate` when starting jj-cc-server applies [server/sql/spanner_schema.sql](../server/sql/spanner_schema.sql) on startup (and creates the database if it is missing).
 
 ## Start the server
 
-In a terminal that has `CC_SRC`, `PATH`, `SPANNER_DB` and, for the emulator, `SPANNER_EMULATOR_HOST` set:
+In a terminal that has `CC_SRC`, `PATH`, `SPANNER_DB` and, for the emulator, `SPANNER_EMULATOR_HOST` set, start jj-cc-server with an explicit blob store (`--blob-path` for local disk storage or `--blob-store=memory` for throwaway tests).
+
+Against Cloud Spanner (using the schema already applied with `gcloud` above):
 
 ```sh
-jj-cc-server --port 8080 --store-type spanner --spanner-db "$SPANNER_DB"
+jj-cc-server --port 8080 --store-type spanner \
+    --spanner-database "$SPANNER_DB" \
+    --blob-path /tmp/jj-cc-blobs
+```
+
+Against the Spanner emulator, add `--spanner-auto-migrate` so the server creates the tables on startup. Replace `--blob-path /tmp/jj-cc-blobs` with `--blob-store=memory` for throwaway runs where blobs do not need to survive restarts:
+
+```sh
+jj-cc-server --port 8080 --store-type spanner \
+    --spanner-database "$SPANNER_DB" \
+    --spanner-auto-migrate \
+    --blob-path /tmp/jj-cc-blobs
 ```
 
 Expected output, after a few seconds:
 
 ```
-INFO jj_cc_server: Connecting to Cloud Spanner at 'projects/…/databases/jj-cc'
-INFO jj_cc_server::store::spannerstore: Ensuring Spanner database schema tables exist for '…'...
+INFO jj_cc_server: Connecting to Cloud Spanner database 'projects/…/databases/jj-cc'
+INFO jj_cc_server: Opening local filesystem blob store at /tmp/jj-cc-blobs
 INFO jj_cc_server: jj-cc-server listening on 127.0.0.1:8080
 ```
 
-On Cloud Spanner with only `roles/spanner.databaseUser`, the server also logs `Spanner auto-schema initialization notice`, because it may not change the schema; the schema applied with gcloud above is the one in use. Stop the server with Ctrl+C.
+Without `--spanner-auto-migrate`, the server performs no DDL on startup, so `roles/spanner.databaseUser` is sufficient on Cloud Spanner. Stop the server with Ctrl+C.
 
 ## Connect two workspaces
 
@@ -189,14 +202,14 @@ test test_two_writer_race_external_server ... ok
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in …
 ```
 
-The test ([cli/tests/test_two_writer_race.rs](../cli/tests/test_two_writer_race.rs)) runs 50 rounds in which two clients send `UpdateOpHeads` at the same moment, both expecting the same head, and fails unless every round gives one success and one `ABORTED`.
+The test ([cli/tests/test_two_writer_race.rs](../cli/tests/test_two_writer_race.rs)) runs 50 rounds in which two clients start from the same base operation head, synchronize at a barrier, and send `UpdateOpHeads` at the same time. Every round verifies that both lock-free additive `UpdateOpHeads` calls succeed with zero lost updates, that `GetOpHeads` retains both concurrent sibling heads, and that `ReconcileOpHeads` merges the divergent heads back to a single operation head.
 
 ## Stop and clean up
 
 ```sh
 # Ctrl+C in the server terminal, then:
 pkill -f "jj-cc-daemon --server http://127.0.0.1:8080 " || true
-rm -rf /tmp/jj-cc /tmp/jj-cc-schema.sql
+rm -rf /tmp/jj-cc /tmp/jj-cc-blobs /tmp/jj-cc-schema.sql
 # Cloud Spanner: delete the instance; this stops the billing and deletes the data
 gcloud spanner instances delete "$INSTANCE" --project "$PROJECT"
 # Emulator: remove the container
@@ -205,6 +218,6 @@ docker rm -f spanner-emulator && unset SPANNER_EMULATOR_HOST
 
 ## Common problems
 
+* **The server exits with `--store-type=spanner requires an explicit blob store`:** Spanner stores metadata and requires an explicit blob store so file contents do not land in memory by mistake. Pass `--blob-path /tmp/jj-cc-blobs` (or `BLOB_PATH`) for local disk storage, or `--blob-store=memory` for throwaway tests.
 * **The server logs `cannot create the authentication headers` and never prints `listening`:** the server has no Google credentials. Run `gcloud auth application-default login` on the machine that runs the server, or run it on a VM whose service account has `roles/spanner.databaseUser` on the database. Check that `SPANNER_EMULATOR_HOST` is unset when the target is Cloud Spanner, and set when it is the emulator.
-* **`jj cc init` fails with `Failed to connect to Commit Cloud server: transport error`:** nothing listens on `--server` yet. Wait for `jj-cc-server listening on 127.0.0.1:8080`, and check that the port in `--server` matches `--port`; on Cloud Spanner the first start can take several seconds while the server checks the schema.
-* **`jj cc init` for the second workspace fails with `CAS conflict: write race detected on stale old_op_head_ids: head 00000000000000000000000000000000`:** the server was built from a revision older than the change that lets a new workspace join an existing repository. Rebuild from the checkout that contains this file.
+* **`jj cc init` fails with `Failed to connect to Commit Cloud server: transport error`:** nothing listens on `--server` yet. Wait for `jj-cc-server listening on 127.0.0.1:8080`, and check that the port in `--server` matches `--port`; when `--spanner-auto-migrate` is set, the first start can take several seconds while the server applies the schema.
