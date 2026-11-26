@@ -39,6 +39,8 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 serde_json = "1"
 tempfile = "3"
 google-cloud-spanner = "0.35.0"
+google-cloud-storage = "1.22.0"
+google-cloud-auth = "1.19.0"
 google-cloud-gax = "1.15.0"
 
 [dev-dependencies]

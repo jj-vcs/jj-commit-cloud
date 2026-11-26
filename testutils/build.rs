@@ -42,19 +42,19 @@ fn main() {
         .join("Cargo.toml");
 
     let mut cmd = Command::new(cargo);
-    cmd.args([
-        "build",
-        "--manifest-path",
-        workspace_manifest.to_str().unwrap(),
-        "-p",
-        "jj-commit-cloud-server",
-        "--bin",
-        "jj-cc-server",
-        "-p",
-        "jj-commit-cloud-daemon",
-        "--bin",
-        "jj-cc-daemon",
-    ]);
+    cmd.arg("build")
+        .arg("--manifest-path")
+        .arg(&workspace_manifest)
+        .args([
+            "-p",
+            "jj-commit-cloud-server",
+            "--bin",
+            "jj-cc-server",
+            "-p",
+            "jj-commit-cloud-daemon",
+            "--bin",
+            "jj-cc-daemon",
+        ]);
     if profile == "release" {
         cmd.arg("--release");
     }

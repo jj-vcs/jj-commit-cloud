@@ -51,8 +51,10 @@ use tokio::sync::{Semaphore, mpsc};
 
 mod composite;
 pub mod error;
+pub mod gcsblob;
 pub mod localblob;
 pub mod memorystore;
+pub mod replicatedblob;
 pub mod spannerstore;
 pub mod sqlitestore;
 #[cfg(test)]
@@ -63,11 +65,13 @@ use composite::BoundedNamespaceCache;
 pub(crate) use composite::check_workspace_cas_precondition;
 pub use composite::*;
 pub use error::{StoreError, StoreResult};
+pub use gcsblob::{GcsBlobStore, GcsConnectConfig, IMMUTABLE_CACHE_CONTROL};
 pub use localblob::LocalFsBlobStore;
 pub use memorystore::{
     CommitId, FileId, MemoryBlobStore, MemoryMetadataStore, OpId, ProjectId, RepoId, SymlinkId,
     TreeId, ViewId,
 };
+pub use replicatedblob::{ReplicatedBlobStore, ReplicatedBlobStoreConfig, ReplicationStats};
 pub use spannerstore::{SpannerConnectConfig, SpannerMetadataStore};
 pub use sqlitestore::SqliteMetadataStore;
 
