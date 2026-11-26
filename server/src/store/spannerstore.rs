@@ -173,27 +173,83 @@ impl Store for SpannerStore {
         project_id: String,
         name: Option<String>,
     ) -> StoreResult<()> {
-        let proj_mutation = Mutation::new_insert_or_update_builder("projects")
-            .set("project_id")
-            .to(&project_id)
-            .build();
-
-        let mut repo_builder = Mutation::new_insert_or_update_builder("repos")
-            .set("repo_id")
-            .to(&repo_id)
-            .set("project_id")
-            .to(&project_id);
-        if let Some(n) = name {
-            repo_builder = repo_builder.set("name").to(&n);
-        }
-        let repo_mutation = repo_builder.build();
-
-        self.db_client
-            .write_only_transaction()
+        let runner = self
+            .db_client
+            .read_write_transaction()
+            .with_transaction_timeout(std::time::Duration::from_secs(30))
             .build()
-            .write(vec![proj_mutation, repo_mutation])
             .await
-            .map_err(|e| StoreError::Write(e.to_string()))?;
+            .map_err(|e| {
+                if e.status().is_some_and(|s| s.code.name() == "ABORTED") {
+                    StoreError::CasConflict(e.to_string())
+                } else {
+                    StoreError::Write(e.to_string())
+                }
+            })?;
+        let app_err: Arc<std::sync::Mutex<Option<StoreError>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let app_err_tx = Arc::clone(&app_err);
+        let tx_res = runner
+            .run(async move |tx| {
+                let repo_stmt =
+                    Statement::builder("SELECT project_id FROM repos WHERE repo_id = @repo_id")
+                        .add_param("repo_id", &repo_id)
+                        .build();
+                let mut rs = tx.execute_query(repo_stmt).await?;
+                if let Some(row_res) = rs.next().await {
+                    let row = row_res?;
+                    let existing_project_id: String = row.try_get("project_id")?;
+                    if existing_project_id != project_id {
+                        *app_err_tx.lock().unwrap() = Some(StoreError::AlreadyExists(format!(
+                            "repository '{repo_id}' is already registered under project '{existing_project_id}', not '{project_id}'"
+                        )));
+                        return Err(google_cloud_spanner::Error::deser(std::io::Error::other(
+                            "repository project conflict",
+                        )));
+                    }
+                    return Ok(());
+                }
+
+                let proj_stmt = Statement::builder(
+                    "SELECT 1 FROM projects WHERE project_id = @project_id",
+                )
+                .add_param("project_id", &project_id)
+                .build();
+                let mut proj_rs = tx.execute_query(proj_stmt).await?;
+                let mut mutations = Vec::new();
+                if proj_rs.next().await.transpose()?.is_none() {
+                    mutations.push(
+                        Mutation::new_insert_builder("projects")
+                            .set("project_id")
+                            .to(&project_id)
+                            .build(),
+                    );
+                }
+
+                let mut repo_builder = Mutation::new_insert_builder("repos")
+                    .set("repo_id")
+                    .to(&repo_id)
+                    .set("project_id")
+                    .to(&project_id);
+                if let Some(n) = &name {
+                    repo_builder = repo_builder.set("name").to(n);
+                }
+                mutations.push(repo_builder.build());
+                tx.buffer(mutations)?;
+                Ok(())
+            })
+            .await;
+
+        if let Some(err) = app_err.lock().unwrap().take() {
+            return Err(err);
+        }
+        tx_res.map_err(|e| {
+            if e.status().is_some_and(|s| s.code.name() == "ABORTED") {
+                StoreError::CasConflict(e.to_string())
+            } else {
+                StoreError::Write(e.to_string())
+            }
+        })?;
         Ok(())
     }
 
@@ -616,7 +672,10 @@ impl Store for SpannerStore {
         }
 
         let mut mutations = Vec::new();
-        for old in expected_exact_heads {
+        for old in &expected_set {
+            if old == &new_id {
+                continue;
+            }
             let key = Key::new(vec![repo_id.clone().into(), old.clone().into()]);
             let key_set = KeySet::builder().add_key(key).build();
             mutations.push(Mutation::delete("op_heads", key_set));

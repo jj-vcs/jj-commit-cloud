@@ -420,6 +420,8 @@ async fn test_rejects_merge_commit_with_root_commit_as_parent() {
         predecessors: vec![],
         conflict_labels: vec![],
         secure_sig: None,
+        raw_git_commit: vec![],
+        external_ids: Default::default(),
     };
 
     let result = client
@@ -441,4 +443,163 @@ async fn test_rejects_merge_commit_with_root_commit_as_parent() {
         "Unexpected error message: {}",
         status.message()
     );
+}
+
+#[tokio::test]
+async fn test_import_git_diamond_merge_change_id_header_and_symlink() {
+    let ws = testutils::TestWorkspace::init().await;
+    let config_path = ws.repo_path().join(".jj/repo/store/config.toml");
+    let config_str = fs::read_to_string(&config_path).unwrap();
+    let config: toml::Value = toml::from_str(&config_str).unwrap();
+    let project_id = config
+        .get("project_id")
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_string();
+    let repo_id = config.get("repo_id").unwrap().as_str().unwrap().to_string();
+
+    let git_dir = tempfile::tempdir().unwrap();
+    let git_path = git_dir.path();
+    let run_git = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(git_path)
+            .env("GIT_AUTHOR_NAME", "Tester")
+            .env("GIT_AUTHOR_EMAIL", "tester@example.com")
+            .env("GIT_COMMITTER_NAME", "Tester")
+            .env("GIT_COMMITTER_EMAIL", "tester@example.com")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    };
+
+    run_git(&["init", "-b", "main"]);
+    fs::write(git_path.join("base.txt"), "base\n").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("base.txt", git_path.join("base.link")).unwrap();
+    run_git(&["add", "."]);
+    run_git(&["commit", "-m", "base commit with symlink"]);
+
+    // Branch A
+    run_git(&["checkout", "-b", "branch-a"]);
+    fs::write(git_path.join("a.txt"), "a\n").unwrap();
+    run_git(&["add", "a.txt"]);
+    run_git(&["commit", "-m", "branch A"]);
+
+    // Branch B with a jj-style `change-id` header created via git commit-tree
+    run_git(&["checkout", "main"]);
+    run_git(&["checkout", "-b", "branch-b"]);
+    fs::write(git_path.join("b.txt"), "b\n").unwrap();
+    run_git(&["add", "b.txt"]);
+    let tree_hex = String::from_utf8(
+        Command::new("git")
+            .args(["write-tree"])
+            .current_dir(git_path)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    let main_hex = String::from_utf8(
+        Command::new("git")
+            .args(["rev-parse", "main"])
+            .current_dir(git_path)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    let raw_commit = format!(
+        "tree {tree_hex}\nparent {main_hex}\nauthor Tester <tester@example.com> 1700000000 +0000\ncommitter Tester <tester@example.com> 1700000000 +0000\nchange-id zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzyy\n\nbranch B with change-id\n"
+    );
+    let mut hash_child = Command::new("git")
+        .args(["hash-object", "-t", "commit", "-w", "--stdin"])
+        .current_dir(git_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write as _;
+    hash_child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(raw_commit.as_bytes())
+        .unwrap();
+    let out = hash_child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let branch_b_hex = String::from_utf8(out.stdout).unwrap().trim().to_string();
+    run_git(&["reset", "--hard", &branch_b_hex]);
+
+    // Diamond merge: merge branch-a into branch-b
+    run_git(&["merge", "--no-ff", "branch-a", "-m", "diamond merge"]);
+
+    let mut cmd = assert_cmd::Command::cargo_bin("jj").unwrap();
+    cmd.args([
+        "cc",
+        "import-git",
+        "--git-dir",
+        git_path.to_str().unwrap(),
+        "--project-id",
+        &project_id,
+        "--repo-id",
+        &repo_id,
+        "--server",
+        ws.server_url(),
+    ]);
+    cmd.assert().success();
+
+    let log_out = ws
+        .jj_cmd()
+        .args(["log", "--no-graph", "-T", "description"])
+        .output()
+        .unwrap();
+    assert!(log_out.status.success());
+    let log_str = String::from_utf8_lossy(&log_out.stdout);
+    assert!(
+        log_str.contains("diamond merge"),
+        "log missing merge: {log_str}"
+    );
+    assert!(
+        log_str.contains("branch B with change-id"),
+        "log missing branch B: {log_str}"
+    );
+
+    let change_id_out = ws
+        .jj_cmd()
+        .args([
+            "log",
+            "--no-graph",
+            "-r",
+            "description(substring:\"branch B with change-id\")",
+            "-T",
+            "change_id",
+        ])
+        .output()
+        .unwrap();
+    assert!(change_id_out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&change_id_out.stdout).trim(),
+        "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzyy",
+        "branch B should preserve its Git change-id header"
+    );
+
+    #[cfg(unix)]
+    {
+        ws.jj_cmd()
+            .args(["new", "description(substring:\"diamond merge\")"])
+            .assert()
+            .success();
+        let target = fs::read_link(ws.repo_path().join("base.link")).unwrap();
+        assert_eq!(
+            target,
+            std::path::Path::new("base.txt"),
+            "imported symlink target should round-trip cleanly"
+        );
+    }
 }

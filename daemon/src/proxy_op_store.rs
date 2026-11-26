@@ -1,3 +1,17 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use crate::connection::RemoteConnectionManager;
 use cc_common::op_store::op_store_service_server::OpStoreService;
 use cc_common::op_store::*;
@@ -31,6 +45,15 @@ impl OpStoreService for DaemonOpStoreProxy {
     ) -> Result<Response<WriteOperationResponse>, Status> {
         self.conn_manager
             .with_op_store(|mut c| async move { c.write_operation(request).await })
+            .await
+    }
+
+    async fn resolve_operation_prefix(
+        &self,
+        request: Request<ResolveOperationPrefixRequest>,
+    ) -> Result<Response<ResolveOperationPrefixResponse>, Status> {
+        self.conn_manager
+            .with_op_store(|mut c| async move { c.resolve_operation_prefix(request).await })
             .await
     }
 
@@ -76,6 +99,15 @@ impl OpStoreService for DaemonOpStoreProxy {
     ) -> Result<Response<ReconcileOpHeadsResponse>, Status> {
         self.conn_manager
             .with_op_store(|mut c| async move { c.reconcile_op_heads(request).await })
+            .await
+    }
+
+    async fn publish_operation(
+        &self,
+        request: Request<PublishOperationRequest>,
+    ) -> Result<Response<PublishOperationResponse>, Status> {
+        self.conn_manager
+            .with_op_store(|mut c| async move { c.publish_operation(request).await })
             .await
     }
 }

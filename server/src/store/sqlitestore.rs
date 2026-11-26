@@ -197,17 +197,37 @@ impl Store for SqliteStore {
     ) -> StoreResult<()> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || {
-            let conn = conn.lock().unwrap();
-            conn.execute(
+            let mut conn = conn.lock().unwrap();
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|e| StoreError::Write(e.to_string()))?;
+            let existing: Option<String> = tx
+                .query_row(
+                    "SELECT project_id FROM repos WHERE repo_id = ?1",
+                    params![repo_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| StoreError::Read(e.to_string()))?;
+            if let Some(existing_project_id) = existing {
+                if existing_project_id != project_id {
+                    return Err(StoreError::AlreadyExists(format!(
+                        "repository '{repo_id}' is already registered under project '{existing_project_id}', not '{project_id}'"
+                    )));
+                }
+                return Ok(());
+            }
+            tx.execute(
                 "INSERT OR IGNORE INTO projects (project_id) VALUES (?1)",
                 params![project_id],
             )
             .map_err(|e| StoreError::Write(e.to_string()))?;
-            conn.execute(
-                "INSERT OR IGNORE INTO repos (repo_id, project_id, name) VALUES (?1, ?2, ?3)",
+            tx.execute(
+                "INSERT INTO repos (repo_id, project_id, name) VALUES (?1, ?2, ?3)",
                 params![repo_id, project_id, name],
             )
             .map_err(|e| StoreError::Write(e.to_string()))?;
+            tx.commit().map_err(|e| StoreError::Write(e.to_string()))?;
             Ok(())
         })
         .await
@@ -924,6 +944,8 @@ mod tests {
             predecessors: vec![vec![13, 14, 15]],
             conflict_labels: vec!["label1".to_string()],
             secure_sig: None,
+            raw_git_commit: vec![],
+            external_ids: Default::default(),
         }
     }
 
@@ -936,6 +958,7 @@ mod tests {
                         id: vec![1, 2, 3],
                         executable: false,
                         copy_id: vec![],
+                        size_bytes: None,
                     })),
                 }),
             },

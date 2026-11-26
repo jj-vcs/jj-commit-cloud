@@ -22,6 +22,7 @@ async fn register_test_repo(server_url: &str) -> String {
             project_id: "test-project".to_string(),
             repo_id: None,
             name: None,
+            hash_algorithm: cc_common::backend::HashAlgorithm::Sha1 as i32,
         }))
         .await
         .expect("Failed to register repository");
@@ -43,8 +44,33 @@ async fn test_sqlite_concurrent_write_race_fails_on_stale_old_heads() {
 
     let root_head = cc_common::ROOT_OPERATION_ID_BYTES.to_vec();
 
-    // Client 1 advances root -> op_1
-    let op_1 = vec![0x11; 20];
+    let make_op = |desc: &str| cc_common::op_store::Operation {
+        parents: vec![root_head.clone()],
+        view_id: cc_common::ROOT_VIEW_ID_BYTES.to_vec(),
+        metadata: Some(cc_common::op_store::OperationMetadata {
+            start_time_millis: 1000,
+            end_time_millis: 1000,
+            description: desc.to_string(),
+            hostname: "test".to_string(),
+            username: "test".to_string(),
+            is_snapshot: false,
+            workspace_name: None,
+            attributes: Default::default(),
+        }),
+        commit_predecessors: vec![],
+        commit_predecessors_set: false,
+    };
+
+    // Client 1 persists op_1 and advances root -> op_1
+    let op_1 = op_client_1
+        .write_operation(cc_common::op_store::WriteOperationRequest {
+            repo_id: repo_id.clone(),
+            operation: Some(make_op("op 1")),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .operation_id;
     op_client_1
         .update_op_heads(UpdateOpHeadsRequest {
             repo_id: repo_id.clone(),
@@ -54,8 +80,16 @@ async fn test_sqlite_concurrent_write_race_fails_on_stale_old_heads() {
         .await
         .unwrap();
 
-    // Client 2 tries to update using stale root_head
-    let op_2 = vec![0x22; 20];
+    // Client 2 persists op_2 and tries to update using stale root_head
+    let op_2 = op_client_2
+        .write_operation(cc_common::op_store::WriteOperationRequest {
+            repo_id: repo_id.clone(),
+            operation: Some(make_op("op 2")),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .operation_id;
     let result = op_client_2
         .update_op_heads(UpdateOpHeadsRequest {
             repo_id: repo_id.clone(),
@@ -94,10 +128,35 @@ async fn test_stress_concurrent_op_heads_writes_sqlite() {
                 .await
                 .expect("Failed to connect client in worker");
 
+            // Write the worker's operation before publishing its op head.
+            let worker_op = op_client
+                .write_operation(cc_common::op_store::WriteOperationRequest {
+                    repo_id: repo_id.clone(),
+                    operation: Some(cc_common::op_store::Operation {
+                        parents: vec![cc_common::ROOT_OPERATION_ID_BYTES.to_vec()],
+                        view_id: cc_common::ROOT_VIEW_ID_BYTES.to_vec(),
+                        metadata: Some(cc_common::op_store::OperationMetadata {
+                            start_time_millis: (worker_idx as i64) + 1,
+                            end_time_millis: (worker_idx as i64) + 1,
+                            description: format!("worker {worker_idx}"),
+                            hostname: "test".to_string(),
+                            username: "test".to_string(),
+                            is_snapshot: false,
+                            workspace_name: None,
+                            attributes: Default::default(),
+                        }),
+                        commit_predecessors: vec![],
+                        commit_predecessors_set: false,
+                    }),
+                })
+                .await
+                .expect("write_operation should succeed")
+                .into_inner()
+                .operation_id;
+
             // Synchronize all tasks to hit the SQLite database simultaneously
             barrier.wait().await;
 
-            let worker_op = vec![(worker_idx + 1) as u8; 20];
             let response = op_client
                 .update_op_heads(UpdateOpHeadsRequest {
                     repo_id,
