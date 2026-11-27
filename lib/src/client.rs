@@ -6,6 +6,11 @@ use tokio::net::UnixStream;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 
+/// Directory for auto-started daemon sockets, overriding `/tmp`. Tests set it
+/// to a fresh temporary directory, so a test never reaches a daemon left by
+/// another test or an earlier run.
+pub const DAEMON_SOCKET_DIR_ENV: &str = "JJ_CC_DAEMON_SOCKET_DIR";
+
 pub fn get_default_daemon_socket(server_url: &str) -> PathBuf {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -14,6 +19,11 @@ pub fn get_default_daemon_socket(server_url: &str) -> PathBuf {
     server_url.hash(&mut hasher);
     let hash = hasher.finish();
 
+    // A short name: Unix socket paths are limited to about 100 bytes, and a
+    // temporary directory already uses most of that on macOS.
+    if let Some(dir) = std::env::var_os(DAEMON_SOCKET_DIR_ENV) {
+        return PathBuf::from(dir).join(format!("{hash:016x}.sock"));
+    }
     if let Ok(user) = std::env::var("USER") {
         PathBuf::from(format!("/tmp/jj-cc-daemon-{user}-{hash:016x}.sock"))
     } else {

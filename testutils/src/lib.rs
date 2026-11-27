@@ -20,11 +20,88 @@ use tokio::process::Command;
 pub struct ServerGuard {
     child: tokio::process::Child,
     url: String,
+    daemons: DaemonSandbox,
 }
 
 impl ServerGuard {
     pub fn url(&self) -> &str {
         &self.url
+    }
+
+    /// A `jj` command whose auto-started daemons live in this server's
+    /// sandbox and stop with the server.
+    pub fn jj_cmd(&self) -> assert_cmd::Command {
+        self.daemons.jj_cmd()
+    }
+
+    /// Where this server's auto-started daemons put their sockets.
+    pub fn daemon_socket_dir(&self) -> &std::path::Path {
+        self.daemons.path()
+    }
+}
+
+/// Must match `cc_lib::client::DAEMON_SOCKET_DIR_ENV`.
+const DAEMON_SOCKET_DIR_ENV: &str = "JJ_CC_DAEMON_SOCKET_DIR";
+
+/// Confines the daemons that `jj` starts on its own to one test.
+///
+/// `cc-lib` starts a `jj-cc-daemon` when nothing listens on the daemon
+/// socket, detaches it, and never stops it. By default the socket is in
+/// `/tmp`, named after the server URL, so the daemon outlives the test and a
+/// later test whose server reuses the port can reach it. Commands from
+/// [`DaemonSandbox::jj_cmd`] put the socket in a fresh temporary directory
+/// instead, and dropping the sandbox stops every daemon whose socket is in
+/// it.
+pub struct DaemonSandbox {
+    dir: tempfile::TempDir,
+}
+
+impl DaemonSandbox {
+    pub fn new() -> Self {
+        DaemonSandbox {
+            dir: tempfile::tempdir().expect("daemon socket directory should have been created"),
+        }
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        self.dir.path()
+    }
+
+    /// The `jj` binary, with auto-started daemons kept in this sandbox.
+    pub fn jj_cmd(&self) -> assert_cmd::Command {
+        let mut cmd = find_jj_cmd();
+        cmd.env(DAEMON_SOCKET_DIR_ENV, self.dir.path());
+        cmd
+    }
+}
+
+impl Default for DaemonSandbox {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for DaemonSandbox {
+    fn drop(&mut self) {
+        // The daemons were started by `jj`, not by this process, so there is
+        // no child handle to kill. Each one has its socket path, and so this
+        // unique directory, on its command line.
+        let pattern = self.dir.path().to_string_lossy().into_owned();
+        let _ = std::process::Command::new("pkill")
+            .args(["-f", &pattern])
+            .status();
+        // Wait until they are gone, so the next test starts clean.
+        for _ in 0..100 {
+            let alive = std::process::Command::new("pgrep")
+                .args(["-f", &pattern])
+                .stdout(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+            if !alive {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }
 
@@ -151,7 +228,11 @@ pub async fn spawn_server_with_env(env_vars: &[(&str, &str)], extra_args: &[&str
 
     let url = format!("http://{}", server_addr);
 
-    ServerGuard { child, url }
+    ServerGuard {
+        child,
+        url,
+        daemons: DaemonSandbox::new(),
+    }
 }
 
 pub async fn spawn_sqlite_server(db_path: &std::path::Path) -> ServerGuard {
@@ -176,7 +257,7 @@ impl TestWorkspace {
             tempfile::tempdir().expect("temporary directory should have been created for testing");
         let repo_path = temp_dir.path();
 
-        let mut init_cmd = find_jj_cmd();
+        let mut init_cmd = server.jj_cmd();
 
         init_cmd
             .current_dir(repo_path)
@@ -212,7 +293,7 @@ impl TestWorkspace {
             tempfile::tempdir().expect("temporary directory should have been created for testing");
         let repo_path = temp_dir.path();
 
-        let mut init_cmd = find_jj_cmd();
+        let mut init_cmd = server.jj_cmd();
 
         init_cmd
             .current_dir(repo_path)
@@ -253,8 +334,14 @@ impl TestWorkspace {
         self.server.url()
     }
 
+    /// The workspace's server; its `jj_cmd` runs `jj` outside the workspace
+    /// directory with the same daemon sandbox.
+    pub fn server(&self) -> &ServerGuard {
+        &self.server
+    }
+
     pub fn jj_cmd(&self) -> assert_cmd::Command {
-        let mut cmd = find_jj_cmd();
+        let mut cmd = self.server.jj_cmd();
         cmd.current_dir(self.repo_path());
         cmd.env("JJ_USER", "Test User");
         cmd.env("JJ_EMAIL", "test.user@example.com");

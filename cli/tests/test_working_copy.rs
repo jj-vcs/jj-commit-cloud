@@ -26,7 +26,7 @@ async fn test_cc_init_working_copy_type_local() {
     let server = testutils::spawn_server().await;
     let temp_dir = tempfile::tempdir().unwrap();
 
-    let mut cmd = assert_cmd::Command::cargo_bin("jj").unwrap();
+    let mut cmd = server.jj_cmd();
     cmd.env("JJ_USER", "Test User")
         .env("JJ_EMAIL", "test.user@example.com")
         .args([
@@ -49,7 +49,7 @@ async fn test_cc_init_working_copy_type_local() {
     assert_eq!(working_copy_type.trim(), "local");
 
     // Verify commands like describe and log work cleanly with local working copy
-    let mut describe_cmd = assert_cmd::Command::cargo_bin("jj").unwrap();
+    let mut describe_cmd = server.jj_cmd();
     describe_cmd
         .current_dir(temp_dir.path())
         .env("JJ_USER", "Test User")
@@ -58,7 +58,7 @@ async fn test_cc_init_working_copy_type_local() {
         .assert()
         .success();
 
-    let mut log_cmd = assert_cmd::Command::cargo_bin("jj").unwrap();
+    let mut log_cmd = server.jj_cmd();
     let output = log_cmd
         .current_dir(temp_dir.path())
         .env("JJ_USER", "Test User")
@@ -154,7 +154,7 @@ async fn test_working_copy_fails_without_user_identity() {
     let server = testutils::spawn_server().await;
     let temp_dir = tempfile::tempdir().unwrap();
 
-    let mut cmd = assert_cmd::Command::cargo_bin("jj").unwrap();
+    let mut cmd = server.jj_cmd();
     // Intentionally pass an empty config without user.email or user.name, and clear env vars
     cmd.env_remove("JJ_USER")
         .env_remove("JJ_EMAIL")
@@ -520,7 +520,7 @@ async fn test_working_copy_shared_project_sqlite_integration() {
     let dir_client_2 = tempfile::tempdir().unwrap();
 
     // Initialize client_1 and client_2 sharing the same project_id on SQLite
-    let mut init_cmd_1 = assert_cmd::Command::cargo_bin("jj").unwrap();
+    let mut init_cmd_1 = server.jj_cmd();
     init_cmd_1
         .current_dir(dir_client_1.path())
         .env("JJ_USER", "Client 1")
@@ -540,7 +540,7 @@ async fn test_working_copy_shared_project_sqlite_integration() {
         .assert()
         .success();
 
-    let mut init_cmd_2 = assert_cmd::Command::cargo_bin("jj").unwrap();
+    let mut init_cmd_2 = server.jj_cmd();
     init_cmd_2
         .current_dir(dir_client_2.path())
         .env("JJ_USER", "Client 2")
@@ -564,7 +564,7 @@ async fn test_working_copy_shared_project_sqlite_integration() {
     let file_1 = dir_client_1.path().join("shared.txt");
     fs::write(&file_1, "hello from client_1 in shared project").unwrap();
 
-    let mut describe_cmd_1 = assert_cmd::Command::cargo_bin("jj").unwrap();
+    let mut describe_cmd_1 = server.jj_cmd();
     describe_cmd_1
         .current_dir(dir_client_1.path())
         .env("JJ_USER", "Client 1")
@@ -573,7 +573,7 @@ async fn test_working_copy_shared_project_sqlite_integration() {
         .assert()
         .success();
 
-    let mut log_cmd_1 = assert_cmd::Command::cargo_bin("jj").unwrap();
+    let mut log_cmd_1 = server.jj_cmd();
     let log_output_1 = log_cmd_1
         .current_dir(dir_client_1.path())
         .env("JJ_USER", "Client 1")
@@ -586,7 +586,7 @@ async fn test_working_copy_shared_project_sqlite_integration() {
         .to_string();
 
     // client_2 checks out a new working copy commit on top of client_1's shared commit
-    let mut new_cmd_2 = assert_cmd::Command::cargo_bin("jj").unwrap();
+    let mut new_cmd_2 = server.jj_cmd();
     new_cmd_2
         .current_dir(dir_client_2.path())
         .env("JJ_USER", "Client 2")

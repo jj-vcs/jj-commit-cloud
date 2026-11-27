@@ -66,7 +66,7 @@ async fn test_import_git_repository_succeeds() {
     assert!(commit_status.success());
 
     // Run `jj cc import-git` with required --project-id and --repo-id
-    let mut cmd = assert_cmd::Command::cargo_bin("jj").expect("jj binary should build");
+    let mut cmd = ws.server().jj_cmd();
     cmd.args([
         "cc",
         "import-git",
@@ -149,7 +149,7 @@ async fn test_import_git_preserves_existing_unrelated_workspace_history() {
     assert!(commit_status.success());
 
     // Import the Git repository
-    let mut cmd = assert_cmd::Command::cargo_bin("jj").expect("jj binary should build");
+    let mut cmd = ws.server().jj_cmd();
     cmd.args([
         "cc",
         "import-git",
@@ -232,7 +232,7 @@ async fn test_import_git_preserves_non_utc_timezone_offsets() {
         .unwrap();
     assert!(commit_status.success());
 
-    let mut cmd = assert_cmd::Command::cargo_bin("jj").expect("jj binary should build");
+    let mut cmd = ws.server().jj_cmd();
     cmd.args([
         "cc",
         "import-git",
@@ -337,7 +337,7 @@ async fn test_import_git_rejects_commit_with_missing_timestamp() {
         .unwrap();
     assert!(ref_status.success());
 
-    let mut cmd = assert_cmd::Command::cargo_bin("jj").expect("jj binary should build");
+    let mut cmd = ws.server().jj_cmd();
     cmd.args([
         "cc",
         "import-git",
@@ -374,7 +374,7 @@ async fn test_import_git_fails_on_unregistered_repo() {
         .current_dir(git_path)
         .status();
 
-    let mut cmd = assert_cmd::Command::cargo_bin("jj").expect("jj binary should build");
+    let mut cmd = server.jj_cmd();
     cmd.args([
         "cc",
         "import-git",

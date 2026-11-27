@@ -207,11 +207,11 @@ async fn test_daemon_auto_spawn_on_cli_command() {
     let server = spawn_server().await;
     let temp_dir = tempfile::tempdir().unwrap();
 
-    let socket_dir = tempfile::tempdir().unwrap();
-    let socket_path = socket_dir.path().join("auto_spawn.sock");
+    // In the server's sandbox, so the auto-started daemon stops with it.
+    let socket_path = server.daemon_socket_dir().join("auto_spawn.sock");
     assert!(!socket_path.exists());
 
-    let mut init_cmd = assert_cmd::Command::cargo_bin("jj").unwrap();
+    let mut init_cmd = server.jj_cmd();
     init_cmd
         .current_dir(temp_dir.path())
         .env("JJ_USER", "Test User")
@@ -245,7 +245,7 @@ async fn test_daemon_auto_spawn_on_cli_command() {
     let test_file = temp_dir.path().join("test.txt");
     fs::write(&test_file, "auto spawned daemon test").unwrap();
 
-    let mut describe_cmd = assert_cmd::Command::cargo_bin("jj").unwrap();
+    let mut describe_cmd = server.jj_cmd();
     describe_cmd
         .current_dir(temp_dir.path())
         .env("JJ_USER", "Test User")
@@ -261,7 +261,7 @@ async fn test_daemon_auto_spawn_on_cli_command() {
     );
 
     // Run log command to verify it communicates through the auto-spawned daemon
-    let mut log_cmd = assert_cmd::Command::cargo_bin("jj").unwrap();
+    let mut log_cmd = server.jj_cmd();
     let output = log_cmd
         .current_dir(temp_dir.path())
         .env("JJ_USER", "Test User")

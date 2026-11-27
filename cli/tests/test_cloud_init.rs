@@ -87,8 +87,8 @@ async fn test_cc_init_registers_repository() {
 
 #[tokio::test]
 async fn test_cc_init_fails_on_invalid_server_addr() {
-    let mut cmd =
-        assert_cmd::Command::cargo_bin("jj").expect("The jj CLI binary should have compiled");
+    let daemons = testutils::DaemonSandbox::new();
+    let mut cmd = daemons.jj_cmd();
 
     cmd.args([
         "cc",
@@ -106,8 +106,8 @@ async fn test_cc_init_fails_on_invalid_server_addr() {
 
 #[tokio::test]
 async fn test_cc_init_fails_without_project_id() {
-    let mut cmd =
-        assert_cmd::Command::cargo_bin("jj").expect("The jj CLI binary should have compiled");
+    let daemons = testutils::DaemonSandbox::new();
+    let mut cmd = daemons.jj_cmd();
 
     cmd.args([
         "cc",
