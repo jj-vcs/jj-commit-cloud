@@ -940,3 +940,293 @@ async fn test_server_oidc_and_k8s_auth_flags_validation_and_non_loopback_bind() 
         .unwrap_err();
     assert_eq!(err.code(), Code::Unauthenticated);
 }
+
+#[test]
+fn test_server_postgres_and_s3_startup_guards_and_secret_hiding() {
+    // --store-type=postgres without URL fails fast.
+    let no_url = run_server_cli(&[], &["--port=0", "--store-type=postgres"]);
+    assert!(!no_url.status.success());
+    assert!(
+        String::from_utf8_lossy(&no_url.stderr).contains("--postgres-url"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&no_url.stderr)
+    );
+
+    // --store-type=postgres with DATABASE_URL but without explicit blob store fails fast.
+    let no_blob = run_server_cli(
+        &[("DATABASE_URL", "postgres://user:secret@127.0.0.1:5432/db")],
+        &["--port=0", "--store-type=postgres"],
+    );
+    assert!(!no_blob.status.success());
+    assert!(
+        String::from_utf8_lossy(&no_blob.stderr).contains("requires an explicit blob store"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&no_blob.stderr)
+    );
+
+    // --blob-store=s3 without --s3-bucket fails fast.
+    let no_s3_bucket = run_server_cli(&[], &["--port=0", "--blob-store=s3"]);
+    assert!(!no_s3_bucket.status.success());
+    assert!(
+        String::from_utf8_lossy(&no_s3_bucket.stderr).contains("--s3-bucket"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&no_s3_bucket.stderr)
+    );
+
+    // Setting both --gcs-bucket and --s3-bucket without --blob-store fails closed.
+    let ambiguous = run_server_cli(
+        &[],
+        &[
+            "--port=0",
+            "--gcs-bucket=valid-gcs-bucket",
+            "--s3-bucket=valid-s3-bucket",
+        ],
+    );
+    assert!(!ambiguous.status.success());
+    assert!(
+        String::from_utf8_lossy(&ambiguous.stderr).contains("specify")
+            || String::from_utf8_lossy(&ambiguous.stderr).contains("--blob-store"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&ambiguous.stderr)
+    );
+
+    // Secrets in POSTGRES_URL / S3_SECRET_ACCESS_KEY never leak into --help output.
+    let help = run_server_cli(
+        &[
+            ("POSTGRES_URL", "postgres://u:pg-super-secret@localhost/db"),
+            ("S3_ACCESS_KEY_ID", "ak-super-secret"),
+            ("S3_SECRET_ACCESS_KEY", "sk-super-secret"),
+            ("S3_SESSION_TOKEN", "st-super-secret"),
+        ],
+        &["--help"],
+    );
+    assert!(help.status.success());
+    let help_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&help.stdout),
+        String::from_utf8_lossy(&help.stderr)
+    );
+    for secret in [
+        "pg-super-secret",
+        "ak-super-secret",
+        "sk-super-secret",
+        "st-super-secret",
+    ] {
+        assert!(
+            !help_out.contains(secret),
+            "--help leaked secret {secret:?}"
+        );
+    }
+
+    // Blank --postgres-ca-cert / POSTGRES_CA_CERT fails closed.
+    let blank_pg_ca = run_server_cli(&[("POSTGRES_CA_CERT", "   ")], &["--port=0"]);
+    assert!(!blank_pg_ca.status.success());
+
+    // --postgres-ca-cert with contradictory sslmode=disable or sslmode=prefer fails closed
+    // before dialing and without leaking credentials.
+    for bad_mode in ["disable", "prefer"] {
+        let pg_url = format!("postgres://u:pg-super-secret@127.0.0.1:5432/db?sslmode={bad_mode}");
+        let out = run_server_cli(
+            &[("POSTGRES_URL", &pg_url)],
+            &[
+                "--port=0",
+                "--store-type=postgres",
+                "--blob-store=memory",
+                "--postgres-ca-cert=/nonexistent/ca.pem",
+            ],
+        );
+        assert!(
+            !out.status.success(),
+            "--postgres-ca-cert with sslmode={bad_mode} must fail closed"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("--postgres-ca-cert") && stderr.contains(bad_mode),
+            "unexpected stderr for sslmode={bad_mode}: {stderr}"
+        );
+        assert!(
+            !stderr.contains("pg-super-secret"),
+            "stderr leaked password for sslmode={bad_mode}: {stderr}"
+        );
+    }
+
+    // --postgres-ca-cert help text documents fail-closed TLS behavior.
+    let pg_ca_help_section = help_out
+        .split("--postgres-ca-cert")
+        .nth(1)
+        .expect("--help should document --postgres-ca-cert")
+        .split("--blob-path")
+        .next()
+        .unwrap_or("");
+    assert!(
+        pg_ca_help_section.contains("verify-full")
+            && pg_ca_help_section.contains("sslmode=disable"),
+        "--postgres-ca-cert help text should document verify-full default and rejected modes: {pg_ca_help_section}"
+    );
+
+    // Partial explicit S3_* credentials must NOT mix with ambient AWS_* credentials.
+    let mixed_creds = run_server_cli(
+        &[
+            ("S3_BUCKET", "valid-s3-bucket"),
+            ("S3_ACCESS_KEY_ID", "explicit-ak"),
+            ("AWS_SECRET_ACCESS_KEY", "ambient-sk"),
+            ("AWS_SESSION_TOKEN", "ambient-st"),
+        ],
+        &["--port=0", "--blob-store=s3"],
+    );
+    assert!(!mixed_creds.status.success());
+    let mixed_stderr = String::from_utf8_lossy(&mixed_creds.stderr);
+    assert!(
+        mixed_stderr.contains("both access_key and secret_key"),
+        "expected missing secret_key error without falling back to ambient AWS_SECRET_ACCESS_KEY, got: {mixed_stderr}"
+    );
+
+    // Control characters in S3_BUCKET / S3_REGION / credentials are preserved and rejected.
+    let bad_bucket_ctrl = run_server_cli(
+        &[("S3_BUCKET", "valid-s3-bucket\n")],
+        &["--port=0", "--blob-store=s3"],
+    );
+    assert!(!bad_bucket_ctrl.status.success());
+
+    let bad_region_ctrl = run_server_cli(
+        &[
+            ("S3_BUCKET", "valid-s3-bucket"),
+            ("AWS_REGION", "us-west-2\r\n"),
+        ],
+        &["--port=0", "--blob-store=s3"],
+    );
+    assert!(!bad_region_ctrl.status.success());
+    let bad_region_ctrl_stderr = String::from_utf8_lossy(&bad_region_ctrl.stderr);
+    assert!(
+        bad_region_ctrl_stderr.contains("control characters"),
+        "unexpected stderr for control-char region: {bad_region_ctrl_stderr}"
+    );
+    assert!(
+        !bad_region_ctrl_stderr.contains('\r'),
+        "startup stderr echoed raw carriage return for AWS_REGION: {bad_region_ctrl_stderr:?}"
+    );
+
+    // Invalid AWS_DEFAULT_REGION is picked up by the region fallback chain and rejected.
+    let bad_default_region = run_server_cli(
+        &[
+            ("S3_BUCKET", "valid-s3-bucket"),
+            ("AWS_DEFAULT_REGION", "INVALID_REGION"),
+        ],
+        &["--port=0", "--blob-store=s3"],
+    );
+    assert!(!bad_default_region.status.success());
+    assert!(
+        String::from_utf8_lossy(&bad_default_region.stderr).contains("invalid S3 region"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&bad_default_region.stderr)
+    );
+
+    // Invalid `--s3-peer-buckets` entries must never echo query strings, fragments, userinfo,
+    // or raw control characters to stderr.
+    for bad_peer in [
+        "peer-a=https://s3.example.com?X-Amz-Signature=TOPSECRET",
+        "peer-a:eu-west-1=https://s3.example.com?X-Amz-Signature=TOPSECRET",
+        "peer-a=https://s3.example.com#TOPSECRET",
+        "peer-a=http://ak:TOPSECRET@s3.example.com",
+        "peer-a:eu-west-1=http://ak:TOPSECRET@s3.example.com",
+        "peer-a=https://s3.example.com?email=a@b&X-Amz-Signature=TOPSECRET",
+        "http://ak:TOPSECRET=1@s3.example.com",
+        "alice:my-secret-pw=1@s3.example.com",
+        "peer-a=https://s3.example.com\r\n?X-Amz-Signature=TOPSECRET",
+    ] {
+        let arg = format!("--s3-peer-buckets={bad_peer}");
+        let out = run_server_cli(&[], &["--port=0", &arg]);
+        assert!(
+            !out.status.success(),
+            "invalid --s3-peer-buckets={bad_peer:?} must fail at startup"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("invalid --s3-peer-buckets entry"),
+            "unexpected stderr for {bad_peer:?}: {stderr}"
+        );
+        assert!(
+            !stderr.contains("TOPSECRET") && !stderr.contains("my-secret-pw"),
+            "startup stderr leaked secret for --s3-peer-buckets={bad_peer:?}: {stderr}"
+        );
+        assert!(
+            !stderr.contains('\r'),
+            "startup stderr echoed raw carriage return for {bad_peer:?}: {stderr:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_server_explicit_s3_credentials_do_not_inherit_ambient_aws_session_token() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let saw_session_token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let saw_region_ap = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let saw_session_c = saw_session_token.clone();
+    let saw_region_c = saw_region_ap.clone();
+    let mock_task = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let saw_tok = saw_session_c.clone();
+            let saw_reg = saw_region_c.clone();
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stream);
+                loop {
+                    let mut req_line = String::new();
+                    if reader.read_line(&mut req_line).await.unwrap_or(0) == 0 {
+                        break;
+                    }
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            break;
+                        }
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            break;
+                        }
+                        let lower = trimmed.to_ascii_lowercase();
+                        if lower.starts_with("x-amz-security-token:") {
+                            saw_tok.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        if lower.starts_with("authorization:")
+                            && trimmed.contains("/ap-northeast-1/s3/")
+                        {
+                            saw_reg.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    let resp = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+                    if reader.get_mut().write_all(resp.as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+
+    let endpoint = format!("http://{addr}");
+    let _server = testutils::spawn_server_with_env(
+        &[
+            ("S3_BUCKET", "explicit-cred-bucket"),
+            ("S3_ENDPOINT", &endpoint),
+            ("S3_ACCESS_KEY_ID", "explicit-ak"),
+            ("S3_SECRET_ACCESS_KEY", "explicit-sk"),
+            ("AWS_SESSION_TOKEN", "stale-ambient-session-token"),
+            ("AWS_REGION", "ap-northeast-1"),
+        ],
+        &["--blob-store=s3"],
+    )
+    .await;
+
+    assert!(
+        !saw_session_token.load(std::sync::atomic::Ordering::Relaxed),
+        "explicit S3_ACCESS_KEY_ID/S3_SECRET_ACCESS_KEY must not inherit ambient AWS_SESSION_TOKEN"
+    );
+    assert!(
+        saw_region_ap.load(std::sync::atomic::Ordering::Relaxed),
+        "S3 region should fall back to AWS_REGION=ap-northeast-1 when S3_REGION is unset"
+    );
+    mock_task.abort();
+}

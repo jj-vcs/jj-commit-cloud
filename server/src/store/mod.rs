@@ -54,7 +54,9 @@ pub mod error;
 pub mod gcsblob;
 pub mod localblob;
 pub mod memorystore;
+pub mod postgresstore;
 pub mod replicatedblob;
+pub mod s3blob;
 pub mod spannerstore;
 pub mod sqlitestore;
 #[cfg(test)]
@@ -73,7 +75,9 @@ pub use memorystore::{
     CommitId, FileId, MemoryBlobStore, MemoryMetadataStore, OpId, ProjectId, RepoId, SymlinkId,
     TreeId, ViewId,
 };
+pub use postgresstore::{PostgresConnectConfig, PostgresMetadataStore};
 pub use replicatedblob::{ReplicatedBlobStore, ReplicatedBlobStoreConfig, ReplicationStats};
+pub use s3blob::{S3BlobStore, S3ConnectConfig};
 pub use spannerstore::{SpannerConnectConfig, SpannerMetadataStore};
 pub use sqlitestore::SqliteMetadataStore;
 
