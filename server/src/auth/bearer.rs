@@ -12,38 +12,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Optional constant-time Bearer token authentication interceptor for `jj-cc-server`.
+//! Static Bearer token validation, token-file loading, memory scrubbing, and bind-address
+//! authentication policy for `jj-cc-server`.
 //!
 //! # Authority and Crash-Safety Ordering
-//! `BearerAuthInterceptor` runs at the `tonic` service boundary before any `Store` read or
-//! write executes, rejecting unauthenticated requests with `Code::Unauthenticated` prior to
-//! backend storage access.
+//! Configured static tokens are validated for graphic ASCII syntax, hashed with SHA-256, and
+//! scrubbed from plaintext buffers. Non-loopback bind hosts fail closed unless authentication
+//! or `--allow-unauthenticated` is explicitly configured.
 //!
 //! # Concurrency and Merge Invariants
-//! Supports multiple active tokens simultaneously (`--auth-token`, `--auth-token-file`, or
-//! environment equivalents) so operators can rotate credentials across fleets of agents
-//! without downtime. Tokens are hashed to fixed-length digests and every configured token
-//! is compared in constant time so candidate length is not leaked. Binding to a non-loopback
-//! `--host` fails closed unless authentication is enabled or `--allow-unauthenticated` is set.
-//!
-//! # Cross-Process and RPC Boundaries
-//! Applied to `BackendService`, `OpStoreService`, and `WorkspaceService` while leaving
-//! `tonic_health` open so Kubernetes, GKE, GCE, and Cloud Run readiness probes succeed
-//! without credentials.
+//! Incoming credentials are compared across all configured SHA-256 digests in constant time
+//! without short-circuiting so neither prefix mismatches nor token ordering leak timing data.
 
 use std::io::Read as _;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::path::Path;
 use std::sync::Arc;
 
 use sha2::{Digest as _, Sha256};
 use subtle::{Choice, ConstantTimeEq as _};
 use tonic::{Request, Status, service::Interceptor};
 
-/// Public upper bound on a single Bearer token's byte length so synchronous SHA-256 hashing
-/// inside `Interceptor::call` cannot be abused with multi-megabyte headers.
+use super::MAX_AUTH_TOKEN_BYTES;
+
+/// Public upper bound on a single static Bearer token's byte length so synchronous SHA-256
+/// hashing inside `Interceptor::call` cannot be abused with multi-megabyte headers.
 pub const MAX_BEARER_TOKEN_BYTES: usize = 4096;
 
-const MAX_TOKEN_FILE_BYTES: u64 = 64 * 1024;
+pub(super) const MAX_TOKEN_FILE_BYTES: u64 = 64 * 1024;
 
 /// Constant-time gRPC Bearer token validator.
 ///
@@ -140,9 +136,29 @@ impl BearerAuthInterceptor {
     pub fn is_enabled(&self) -> bool {
         self.tokens.is_some()
     }
+
+    /// Constant-time match of a raw bearer token string against configured static token digests.
+    pub(super) fn verify_token_str(&self, token: &str) -> bool {
+        let Some(expected_tokens) = &self.tokens else {
+            return false;
+        };
+        if token.is_empty()
+            || token.len() > MAX_BEARER_TOKEN_BYTES
+            || !token.bytes().all(|b| b.is_ascii_graphic() && b != b'#')
+        {
+            return false;
+        }
+        let provided_digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        let matched = expected_tokens
+            .iter()
+            .fold(Choice::from(0u8), |acc, expected| {
+                acc | provided_digest.ct_eq(expected)
+            });
+        bool::from(matched)
+    }
 }
 
-fn scrub_bytes(mut bytes: Vec<u8>) {
+pub(super) fn scrub_bytes(mut bytes: Vec<u8>) {
     bytes.fill(0);
     std::hint::black_box(bytes.as_slice());
 }
@@ -154,10 +170,36 @@ pub fn scrub_tokens(tokens: &mut Vec<String>) {
     }
 }
 
+/// Owned Bearer credential whose heap buffer is zeroized on drop, including on async task
+/// cancellation.
+pub(super) struct ScrubbedToken(String);
+
+impl ScrubbedToken {
+    pub(super) fn new(token: String) -> Self {
+        Self(token)
+    }
+
+    pub(super) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for ScrubbedToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ScrubbedToken(<redacted>)")
+    }
+}
+
+impl Drop for ScrubbedToken {
+    fn drop(&mut self) {
+        scrub_bytes(std::mem::take(&mut self.0).into_bytes());
+    }
+}
+
 /// Reads newline- or comma-separated graphic-ASCII Bearer tokens from `path` (up to 64 KiB),
 /// stripping whitespace-delimited `#` comments and blank entries while rejecting embedded `#`
 /// characters so secrets are never silently truncated.
-pub fn load_tokens_from_file(path: &std::path::Path) -> Result<Vec<String>, String> {
+pub fn load_tokens_from_file(path: &Path) -> Result<Vec<String>, String> {
     let file = std::fs::File::open(path)
         .map_err(|e| format!("failed to read --auth-token-file '{}': {e}", path.display()))?;
     let mut raw_bytes = Vec::new();
@@ -252,9 +294,10 @@ pub fn is_loopback_host(host: &str) -> bool {
     }
 }
 
-const BIND_AUTH_REMEDIATION: &str = "configure --auth-token-file (JJ_CC_SERVER_AUTH_TOKEN_FILE) \
-    or --auth-token (JJ_CC_SERVER_AUTH_TOKEN), or pass --allow-unauthenticated \
-    (JJ_CC_ALLOW_UNAUTHENTICATED=true)";
+const BIND_AUTH_REMEDIATION: &str = "configure --auth-token-file (JJ_CC_SERVER_AUTH_TOKEN_FILE), \
+    --auth-token (JJ_CC_SERVER_AUTH_TOKEN), --auth-oidc-issuer (JJ_CC_AUTH_OIDC_ISSUER), \
+    or --auth-k8s-tokenreview-url (JJ_CC_AUTH_K8S_TOKENREVIEW_URL), or pass \
+    --allow-unauthenticated (JJ_CC_ALLOW_UNAUTHENTICATED=true)";
 
 /// Refuses to expose an unauthenticated gRPC listener on a non-loopback `--host` unless the
 /// operator explicitly opts in via `--allow-unauthenticated` (`JJ_CC_ALLOW_UNAUTHENTICATED`).
@@ -372,188 +415,40 @@ fn extract_bearer_token(header_val: &str) -> Option<&str> {
     .then_some(token)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tonic::Code;
-
-    struct TempTokenFile(std::path::PathBuf);
-    impl TempTokenFile {
-        fn new(contents: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "jj-cc-auth-test-{}-{}.txt",
-                std::process::id(),
-                uuid::Uuid::new_v4()
+pub(super) fn extract_http_bearer_token(headers: &http::HeaderMap) -> Result<&str, Status> {
+    let mut auth_headers = headers.get_all(http::header::AUTHORIZATION).iter();
+    let raw_header = match (auth_headers.next(), auth_headers.next()) {
+        (Some(header), None) => header.to_str().map_err(|_| {
+            Status::unauthenticated("authorization metadata header must be valid ASCII")
+        })?,
+        (Some(_), Some(_)) => {
+            return Err(Status::unauthenticated(
+                "multiple authorization metadata headers are not allowed",
             ));
-            std::fs::write(&path, contents).unwrap();
-            Self(path)
         }
-    }
-    impl Drop for TempTokenFile {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
+        (None, _) => {
+            return Err(Status::unauthenticated(
+                "missing authorization metadata header",
+            ));
         }
+    };
+
+    let (scheme, rest) = raw_header.trim().split_once(' ').ok_or_else(|| {
+        Status::unauthenticated("authorization header must use valid Bearer <token> format")
+    })?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return Err(Status::unauthenticated(
+            "authorization header must use valid Bearer <token> format",
+        ));
     }
-
-    #[test]
-    fn disabled_interceptor_allows_unauthenticated_requests() {
-        let mut auth = BearerAuthInterceptor::from_tokens(Vec::<String>::new());
-        assert!(!auth.is_enabled());
-        assert!(auth.call(Request::new(())).is_ok());
+    let token = rest.trim();
+    if token.is_empty()
+        || token.len() > MAX_AUTH_TOKEN_BYTES
+        || !token.bytes().all(|b| b.is_ascii_graphic())
+    {
+        return Err(Status::unauthenticated(
+            "authorization header must use valid Bearer <token> format",
+        ));
     }
-
-    #[test]
-    fn enabled_interceptor_enforces_tokens_and_supports_rotation() {
-        let mut auth = BearerAuthInterceptor::from_tokens([" token-v1 ", "token-v2"]);
-        assert!(auth.is_enabled());
-
-        let err = auth.call(Request::new(())).unwrap_err();
-        assert_eq!(err.code(), Code::Unauthenticated);
-
-        let mut wrong = Request::new(());
-        wrong
-            .metadata_mut()
-            .insert("authorization", "Bearer wrong-secret".parse().unwrap());
-        assert_eq!(auth.call(wrong).unwrap_err().code(), Code::Unauthenticated);
-
-        for valid_token in ["token-v1", "token-v2"] {
-            let mut ok_req = Request::new(());
-            ok_req.metadata_mut().insert(
-                "authorization",
-                format!("Bearer {valid_token}").parse().unwrap(),
-            );
-            assert!(auth.call(ok_req).is_ok());
-        }
-    }
-
-    #[test]
-    fn bearer_scheme_is_case_insensitive_and_rejects_internal_spaces_and_hashes() {
-        let mut auth = BearerAuthInterceptor::from_tokens(["secret-token"]);
-        for header in [
-            "Bearer secret-token",
-            "bearer secret-token",
-            "BEARER  secret-token",
-        ] {
-            let mut req = Request::new(());
-            req.metadata_mut()
-                .insert("authorization", header.parse().unwrap());
-            assert!(auth.call(req).is_ok(), "{header}");
-        }
-        for header in [
-            "Basic secret-token",
-            "Bearersecret-token",
-            "Bearer ",
-            "Bearer secret token",
-            "Bearer secret#token",
-        ] {
-            let mut req = Request::new(());
-            req.metadata_mut()
-                .insert("authorization", header.parse().unwrap());
-            assert_eq!(
-                auth.call(req).unwrap_err().code(),
-                Code::Unauthenticated,
-                "{header}"
-            );
-        }
-    }
-
-    #[test]
-    fn try_from_tokens_rejects_whitespace_hashes_and_oversized_tokens_without_leaking() {
-        assert!(
-            !BearerAuthInterceptor::try_from_tokens(["", " ", "\u{feff} , "])
-                .unwrap()
-                .is_enabled()
-        );
-        assert!(
-            BearerAuthInterceptor::try_from_tokens(["\u{feff}clean-token"])
-                .unwrap()
-                .is_enabled()
-        );
-
-        let oversized = "x".repeat(MAX_BEARER_TOKEN_BYTES + 1);
-        for bad in [
-            "Bearer leak-me-123",
-            "leak-me-123 extra",
-            "leak-me-123\t1",
-            "K#leak-me-123",
-            oversized.as_str(),
-        ] {
-            let err = BearerAuthInterceptor::try_from_tokens([bad]).unwrap_err();
-            assert!(!err.contains("leak-me-123"), "error leaked secret: {err}");
-        }
-
-        let auth = BearerAuthInterceptor::from_tokens(["super-secret-value"]);
-        let debug = format!("{auth:?}");
-        assert!(!debug.contains("super-secret-value"), "{debug}");
-        assert!(debug.contains("token_count: 1"), "{debug}");
-    }
-
-    #[test]
-    fn duplicate_authorization_headers_are_rejected() {
-        let mut auth = BearerAuthInterceptor::from_tokens(["secret-token"]);
-        let mut req = Request::new(());
-        req.metadata_mut()
-            .append("authorization", "Bearer secret-token".parse().unwrap());
-        req.metadata_mut()
-            .append("authorization", "Bearer wrong-token".parse().unwrap());
-        assert_eq!(auth.call(req).unwrap_err().code(), Code::Unauthenticated);
-    }
-
-    #[test]
-    fn bind_auth_policy_validates_brackets_and_requires_auth_on_non_loopback() {
-        for loopback in ["127.0.0.1", "127.0.1.1", "::1", "[::1]", "localhost"] {
-            assert!(is_loopback_host(loopback), "{loopback}");
-            assert!(enforce_bind_auth_policy(loopback, false, false).is_ok());
-        }
-        for invalid_bracket in ["[127.0.0.1]", "[localhost]", "[::1", "::1]", ""] {
-            assert!(!is_loopback_host(invalid_bracket), "{invalid_bracket}");
-            assert!(enforce_bind_auth_policy(invalid_bracket, true, true).is_err());
-        }
-        for remote in ["0.0.0.0", "::", "[::]", "10.0.0.5", "my-server.internal"] {
-            assert!(!is_loopback_host(remote), "{remote}");
-            let err = enforce_bind_auth_policy(remote, false, false).unwrap_err();
-            for expected in [
-                "--auth-token-file",
-                "JJ_CC_SERVER_AUTH_TOKEN_FILE",
-                "--auth-token",
-                "JJ_CC_SERVER_AUTH_TOKEN",
-                "--allow-unauthenticated",
-                "JJ_CC_ALLOW_UNAUTHENTICATED=true",
-            ] {
-                assert!(err.contains(expected), "missing {expected:?} in: {err}");
-            }
-            assert!(enforce_bind_auth_policy(remote, true, false).is_ok());
-            assert!(enforce_bind_auth_policy(remote, false, true).is_ok());
-        }
-    }
-
-    #[test]
-    fn load_tokens_from_file_strips_spaced_comments_and_rejects_embedded_hash_secrets() {
-        let valid = TempTokenFile::new(
-            "\u{feff}# rotation file\n  tok-a , # inline comment after comma\n tok-b , tok-c # trailing\n",
-        );
-        let parsed = load_tokens_from_file(&valid.0).unwrap();
-        assert_eq!(parsed, vec!["tok-a", "tok-b", "tok-c"]);
-
-        // Embedded `#` inside a secret must fail closed rather than silently truncating to `"K"`.
-        let embedded_hash = TempTokenFile::new("K#secret-remainder-xyz\n");
-        let hash_err = load_tokens_from_file(&embedded_hash.0).unwrap_err();
-        assert!(!hash_err.contains("secret-remainder-xyz"), "{hash_err}");
-
-        let empty = TempTokenFile::new("  # comment only \n  , # inline only \n");
-        assert!(load_tokens_from_file(&empty.0).is_err());
-
-        let spaced = TempTokenFile::new("tok-first-ok\ntok-with space\n");
-        let err = load_tokens_from_file(&spaced.0).unwrap_err();
-        assert!(!err.contains("tok-first-ok") && !err.contains("tok-with"));
-
-        let oversized_content = "a".repeat((MAX_TOKEN_FILE_BYTES as usize) + 1);
-        let oversized = TempTokenFile::new(&oversized_content);
-        let size_err = load_tokens_from_file(&oversized.0).unwrap_err();
-        assert!(size_err.contains("exceeds maximum size"), "{size_err}");
-
-        let mut tokens = vec!["secret-1".to_string(), "secret-2".to_string()];
-        scrub_tokens(&mut tokens);
-        assert!(tokens.is_empty());
-    }
+    Ok(token)
 }

@@ -43,8 +43,13 @@ package commit_cloud.workspace;
 //   absent.
 //
 // Status Codes:
-// - `UNAUTHENTICATED`: Server requires Bearer authentication and request
-//   metadata lacks a valid `authorization: Bearer <token>` header.
+// - `UNAUTHENTICATED`: Server requires authentication (static Bearer token,
+//   OIDC JWT, or Kubernetes `TokenReview`) and request metadata lacks a valid
+//   `authorization: Bearer <token>` credential.
+// - `PERMISSION_DENIED`: Authenticated caller is not permitted to invoke the
+//   method (for example a `worker-for-actor` credential calling a mutating
+//   RPC, or an OIDC actor targeting a disallowed `repo_id` when actor suffix
+//   enforcement is enabled).
 // - `NOT_FOUND`: `repo_id` is unregistered on `GetWorkspace`, `UpdateWorkspace`,
 //   `ListWorkspaces`, or `CheckWorkingCopyChanges`, or `CheckWorkingCopyChanges`
 //   targets an unknown workspace or commit. `GetWorkspace` returns `OK` with

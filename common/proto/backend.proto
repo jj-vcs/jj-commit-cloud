@@ -32,8 +32,13 @@ package commit_cloud.backend;
 //   before `WriteCommit`.
 //
 // Status Codes:
-// - `UNAUTHENTICATED`: Server requires Bearer authentication and request
-//   metadata lacks a valid `authorization: Bearer <token>` header.
+// - `UNAUTHENTICATED`: Server requires authentication (static Bearer token,
+//   OIDC JWT, or Kubernetes `TokenReview`) and request metadata lacks a valid
+//   `authorization: Bearer <token>` credential.
+// - `PERMISSION_DENIED`: Authenticated caller is not permitted to invoke the
+//   method (for example a `worker-for-actor` credential calling a mutating
+//   RPC, or an OIDC actor targeting a disallowed `repo_id` when actor suffix
+//   enforcement is enabled).
 // - `ALREADY_EXISTS`: `RegisterRepository` specifies a `repo_id` that is
 //   already registered under a different `project_id`.
 // - `NOT_FOUND`: `project_id` is unregistered, or the requested object digest
@@ -201,8 +206,10 @@ message RegisterRepositoryRequest {
   // `repo_id` when empty so standalone repositories remain isolated.
   string project_id = 1;
   // Optional explicit repository ID; if omitted (`None`), the server allocates
-  // a new UUIDv4. Setting `Some("")` or whitespace-only returns
-  // `INVALID_ARGUMENT`.
+  // a new UUIDv4 (except when actor repository suffix enforcement is enabled
+  // for an OIDC actor caller, which requires an explicit `repo_id` and returns
+  // `INVALID_ARGUMENT` when omitted). Setting `Some("")` or whitespace-only
+  // returns `INVALID_ARGUMENT`.
   optional string repo_id = 2;
   // Optional human-readable repository alias.
   optional string name = 3;
@@ -275,7 +282,11 @@ message Commit {
   // the fact when canonical Commit Cloud IDs diverge from flat Git Merkle
   // hashes. Excluded from `commit_id` hashing. Servers enforce key and digest
   // format validation, while secondary-index cross-commit uniqueness across
-  // `(project_id, key, external_id)` is planned for post-M1.
+  // `(project_id, key, external_id)` is planned for post-M1. The keys
+  // `actor-sub` and `actor-uid` are server-managed provenance fields (UTF-8,
+  // 1..=256 bytes, no ASCII control characters) stamped from verified OIDC or
+  // Kubernetes `TokenReview` identities on `WriteCommit` and stripped or
+  // overwritten regardless of client input.
   map<string, bytes> external_ids = 12;
 }
 

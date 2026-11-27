@@ -177,6 +177,7 @@ impl BackendService for FileOnlyUpstream {
 #[derive(Default)]
 struct MockUpstreamState {
     required_auth: Option<String>,
+    stamp_actor_sub: Option<String>,
     read_commit_calls: usize,
     write_commit_calls: usize,
     read_tree_calls: usize,
@@ -354,6 +355,7 @@ impl BackendService for MockUpstream {
         request: Request<WriteCommitRequest>,
     ) -> Result<Response<WriteCommitResponse>, Status> {
         self.check_auth(request.metadata())?;
+        let has_auth = request.metadata().get("authorization").is_some();
         let req = request.into_inner();
         let mut commit = req
             .commit
@@ -368,6 +370,8 @@ impl BackendService for MockUpstream {
                 sig.data = b"server-derived-signed-payload".to_vec();
             }
         }
+        commit.external_ids.remove("actor-sub");
+        commit.external_ids.remove("actor-uid");
         let id = if commit.commit_id.is_empty() {
             Sha1::digest(commit.encode_to_vec()).to_vec()
         } else {
@@ -375,6 +379,14 @@ impl BackendService for MockUpstream {
         };
         commit.commit_id = id.clone();
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if has_auth && let Some(sub) = st.stamp_actor_sub.clone() {
+            commit
+                .external_ids
+                .insert("actor-sub".to_string(), sub.into_bytes());
+            commit
+                .external_ids
+                .insert("actor-uid".to_string(), b"uid-server-verified".to_vec());
+        }
         st.write_commit_calls += 1;
         st.commits
             .entry((req.project_id, id.clone()))

@@ -533,9 +533,9 @@ async fn test_server_cli_metrics_listen_unauthenticated_and_fail_fast() {
         .unwrap_err();
     assert_eq!(err.code(), Code::Unauthenticated);
 
-    // Unauthenticated requests to unknown gRPC paths and trailing-slash service roots bypass
-    // per-service auth and return UNIMPLEMENTED; MetricsLayer must ignore them so they cannot
-    // pollute latency samples.
+    // ServerAuthLayer rejects unauthenticated requests to unknown gRPC paths and trailing-slash
+    // service roots before routing; authenticated requests to those unrouted paths return
+    // UNIMPLEMENTED. MetricsLayer must ignore both so they cannot pollute latency samples.
     let mut raw_grpc = tonic::client::Grpc::new(channel);
     for unrouted_path in [
         "/unknown.Service/Probe",
@@ -546,7 +546,7 @@ async fn test_server_cli_metrics_listen_unauthenticated_and_fail_fast() {
             HealthCheckRequest,
             tonic_health::pb::HealthCheckResponse,
         >::default();
-        let unknown_err = raw_grpc
+        let unauth_err = raw_grpc
             .unary(
                 Request::new(HealthCheckRequest {
                     service: String::new(),
@@ -557,9 +557,34 @@ async fn test_server_cli_metrics_listen_unauthenticated_and_fail_fast() {
             .await
             .unwrap_err();
         assert_eq!(
+            unauth_err.code(),
+            Code::Unauthenticated,
+            "unauthenticated path={unrouted_path}"
+        );
+
+        raw_grpc.ready().await.unwrap();
+        let mut authed_probe = Request::new(HealthCheckRequest {
+            service: String::new(),
+        });
+        authed_probe
+            .metadata_mut()
+            .insert("authorization", "Bearer obs-secret-token".parse().unwrap());
+        let codec = tonic::codec::ProstCodec::<
+            HealthCheckRequest,
+            tonic_health::pb::HealthCheckResponse,
+        >::default();
+        let unknown_err = raw_grpc
+            .unary(
+                authed_probe,
+                http::uri::PathAndQuery::from_static(unrouted_path),
+                codec,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
             unknown_err.code(),
             Code::Unimplemented,
-            "path={unrouted_path}"
+            "authenticated path={unrouted_path}"
         );
     }
 

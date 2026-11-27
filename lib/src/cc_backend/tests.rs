@@ -813,7 +813,8 @@ fn verified_commit_from_proto_binds_synthetic_change_id_and_validates_external_i
     wrong_change_id.change_id = vec![0x99; cc_common::CHANGE_ID_LENGTH];
     assert!(verified_commit_from_proto(&expected_id, wrong_change_id).is_err());
 
-    // External IDs validation: valid entries pass, malformed entries fail.
+    // External IDs validation: valid entries (including 65..=256 byte server-stamped
+    // actor attribution alongside 16 custom keys) pass, malformed entries fail.
     let mut valid_ext = proto.clone();
     valid_ext
         .external_ids
@@ -824,6 +825,19 @@ fn verified_commit_from_proto_binds_synthetic_change_id_and_validates_external_i
     valid_ext
         .external_ids
         .insert("perforce-cl".to_string(), b"123456".to_vec());
+    for idx in 0..13 {
+        valid_ext
+            .external_ids
+            .insert(format!("custom-key-{idx}"), vec![idx as u8]);
+    }
+    valid_ext.external_ids.insert(
+        "actor-sub".to_string(),
+        format!("system:actor:oss-demo:{}", "a".repeat(120)).into_bytes(),
+    );
+    valid_ext.external_ids.insert(
+        "actor-uid".to_string(),
+        format!("uid-{}", "b".repeat(80)).into_bytes(),
+    );
     assert!(verified_commit_from_proto(&expected_id, valid_ext).is_ok());
 
     for (bad_key, bad_val) in [
@@ -833,6 +847,14 @@ fn verified_commit_from_proto_binds_synthetic_change_id_and_validates_external_i
         ("git-sha256", vec![1; 20]),
         ("perforce-cl", vec![]),
         ("perforce-cl", vec![1; 65]),
+        ("actor-sub", vec![]),
+        ("actor-sub", b"   ".to_vec()),
+        ("actor-sub", vec![0xff, 0xfe]),
+        ("actor-sub", b"sub\nwith-newline".to_vec()),
+        ("actor-sub", vec![b'x'; 257]),
+        ("actor-uid", vec![]),
+        ("actor-uid", b"uid\x00nul".to_vec()),
+        ("actor-uid", vec![b'y'; 257]),
     ] {
         let mut bad_ext = proto.clone();
         bad_ext.external_ids.insert(bad_key.to_string(), bad_val);
