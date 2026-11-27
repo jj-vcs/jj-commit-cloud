@@ -12,13 +12,13 @@ use crate::op_store as pb;
 
 pub fn ref_target_to_proto(target: &RefTarget) -> pb::RefTarget {
     let removes = target
-        .removed_ids()
+        .present_removes()
         .map(|id| pb::RefTargetTerm {
             commit_id: id.as_bytes().to_vec(),
         })
         .collect();
     let adds = target
-        .added_ids()
+        .present_adds()
         .map(|id| pb::RefTargetTerm {
             commit_id: id.as_bytes().to_vec(),
         })
@@ -214,6 +214,6 @@ pub fn view_from_proto(view: pb::View) -> View {
         local_tags: BTreeMap::new(),
         remote_views,
         git_refs: BTreeMap::new(),
-        git_head: RefTarget::absent(),
+        git_heads: BTreeMap::new(),
     }
 }

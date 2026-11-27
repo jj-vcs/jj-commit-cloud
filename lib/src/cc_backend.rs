@@ -4,7 +4,6 @@ use async_trait::async_trait;
 use futures::StreamExt as _;
 use futures::stream::{self, BoxStream};
 use jj_lib::backend::*;
-use jj_lib::index::Index;
 use jj_lib::object_id::ObjectId;
 use jj_lib::repo_path::{RepoPath, RepoPathBuf};
 use std::fmt::Debug;
@@ -160,7 +159,7 @@ impl Backend for CommitCloudBackend {
                     return Err(Box::new(BackendError::ObjectNotFound {
                         object_type: "file".into(),
                         hash: file_id_hex,
-                        source: status.into(),
+                        source: Some(status.into()),
                     })
                         as Box<dyn std::error::Error + Send + Sync>);
                 }
@@ -272,7 +271,7 @@ impl Backend for CommitCloudBackend {
                     Err(Box::new(BackendError::ObjectNotFound {
                         object_type: "tree".into(),
                         hash: tree_id_hex,
-                        source: status.into(),
+                        source: Some(status.into()),
                     })
                         as Box<dyn std::error::Error + Send + Sync>)
                 }
@@ -356,7 +355,7 @@ impl Backend for CommitCloudBackend {
                     Err(Box::new(BackendError::ObjectNotFound {
                         object_type: "commit".into(),
                         hash: commit_id_hex,
-                        source: status.into(),
+                        source: Some(status.into()),
                     })
                         as Box<dyn std::error::Error + Send + Sync>)
                 }
@@ -415,7 +414,7 @@ impl Backend for CommitCloudBackend {
         Ok(stream::empty().boxed())
     }
 
-    fn gc(&self, _index: &dyn Index, _keep_newer: SystemTime) -> BackendResult<()> {
+    async fn gc(&self, _heads: &[CommitId], _keep_newer: SystemTime) -> BackendResult<()> {
         Ok(())
     }
 }

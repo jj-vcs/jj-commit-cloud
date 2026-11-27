@@ -3,7 +3,7 @@ use crate::cc_index_store::CommitCloudIndexStore;
 use crate::cc_op_heads_store::CommitCloudOpHeadsStore;
 use crate::cc_op_store::CommitCloudOpStore;
 use jj_lib::backend::{Backend, BackendLoadError};
-use jj_lib::index::IndexStore;
+use jj_lib::index_store::IndexStore;
 use jj_lib::op_heads_store::OpHeadsStore;
 use jj_lib::op_store::OpStore;
 use jj_lib::repo::StoreFactories;
