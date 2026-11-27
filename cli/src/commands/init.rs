@@ -21,11 +21,13 @@ use clap::Parser;
 use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};
 use jj_lib::backend::BackendInitError;
+use jj_lib::default_backend_factories::{
+    default_submodule_store_initializer, default_workspace_store_initializer,
+};
 use jj_lib::op_store::RootOperationData;
 use jj_lib::ref_name::WorkspaceNameBuf;
-use jj_lib::repo::ReadonlyRepo;
 use jj_lib::settings::UserSettings;
-use jj_lib::signing::Signer;
+use jj_lib::signing_factory::signer_from_settings;
 use jj_lib::workspace::Workspace;
 use std::path::Path;
 
@@ -69,7 +71,7 @@ pub async fn cmd_cc_init(
     let dest_path = Path::new(&args.destination);
 
     let user_settings = command_helper.settings();
-    let signer = Signer::from_settings(user_settings)
+    let signer = signer_from_settings(user_settings)
         .map_err(|e| user_error(format!("Failed to initialize signature signer: {:?}", e)))?;
 
     // Define the backend initializer closure for Workspace
@@ -101,7 +103,7 @@ pub async fn cmd_cc_init(
 
     let index_store_initializer = |_settings: &UserSettings, store_path: &Path| {
         let index_store = CommitCloudIndexStore::init(store_path).map_err(BackendInitError)?;
-        Ok(Box::new(index_store) as Box<dyn jj_lib::index::IndexStore>)
+        Ok(Box::new(index_store) as Box<dyn jj_lib::index_store::IndexStore>)
     };
 
     let working_copy_factory: Box<dyn jj_lib::working_copy::WorkingCopyFactory> =
@@ -118,16 +120,17 @@ pub async fn cmd_cc_init(
 
     // Delegate workspace creation to Jujutsu workspace engine
     Workspace::init_with_factories(
-        &user_settings,
+        user_settings,
         dest_path,
+        &workspace_name,
         &backend_initializer,
         signer,
+        default_workspace_store_initializer(),
         &op_store_initializer,
         &op_heads_store_initializer,
         &index_store_initializer,
-        ReadonlyRepo::default_submodule_store_initializer(),
+        default_submodule_store_initializer(),
         working_copy_factory.as_ref(),
-        workspace_name,
     )
     .await
     .map_err(|e| user_error(format!("Failed to initialize workspace: {:?}", e)))?;

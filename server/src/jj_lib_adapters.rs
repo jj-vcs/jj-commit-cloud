@@ -15,6 +15,7 @@
 #![allow(elided_lifetimes_in_paths)]
 
 use std::fmt::{self, Debug};
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -26,19 +27,22 @@ use jj_lib::backend::*;
 use jj_lib::commit::Commit as JjCommit;
 use jj_lib::graph::GraphNode;
 use jj_lib::index::{
-    ChangeIdIndex, Index, IndexError, IndexResult, IndexStore, IndexStoreResult, MutableIndex,
-    ReadonlyIndex, ResolvedChangeTargets,
+    ChangeIdIndex, Index, IndexError, IndexResult, MutableIndex, ReadonlyIndex,
+    ResolvedChangeTargets,
 };
+use jj_lib::index_store::{IndexStore, IndexStoreResult};
 use jj_lib::object_id::{HexPrefix, ObjectId, PrefixResolution};
 use jj_lib::op_heads_store::{OpHeadsStore, OpHeadsStoreError, OpHeadsStoreLock};
 use jj_lib::op_store::{
     OpStore, OpStoreError, OpStoreResult, Operation, OperationId, View, ViewId,
 };
 use jj_lib::operation::Operation as JjOperation;
+use jj_lib::ref_name::WorkspaceName;
 use jj_lib::repo_path::{RepoPath, RepoPathBuf};
 use jj_lib::revset::{ResolvedExpression, Revset, RevsetContainingFn, RevsetEvaluationError};
 use jj_lib::store::Store as JjStore;
 use jj_lib::submodule_store::SubmoduleStore;
+use jj_lib::workspace_store::{WorkspaceStore, WorkspaceStoreError};
 
 use crate::hash_utils::{
     compute_git_blob_hash, compute_git_commit_hash, compute_git_tree_hash, hash_operation,
@@ -128,7 +132,7 @@ impl Backend for ServerBackend {
             .ok_or_else(|| BackendError::ObjectNotFound {
                 object_type: "file".into(),
                 hash: id.hex(),
-                source: "file not found in server store".into(),
+                source: Some("file not found in server store".into()),
             })?;
         Ok(Box::pin(futures::io::Cursor::new(content)))
     }
@@ -193,7 +197,7 @@ impl Backend for ServerBackend {
             .ok_or_else(|| BackendError::ObjectNotFound {
                 object_type: "tree".into(),
                 hash: id.hex(),
-                source: "tree not found in server store".into(),
+                source: Some("tree not found in server store".into()),
             })?;
 
         let mut jj_entries = Vec::new();
@@ -244,7 +248,7 @@ impl Backend for ServerBackend {
             .ok_or_else(|| BackendError::ObjectNotFound {
                 object_type: "commit".into(),
                 hash: id.hex(),
-                source: "commit not found in server store".into(),
+                source: Some("commit not found in server store".into()),
             })?;
 
         Ok(commit_from_proto(proto_commit))
@@ -277,7 +281,7 @@ impl Backend for ServerBackend {
         Ok(stream::empty().boxed())
     }
 
-    fn gc(&self, _index: &dyn Index, _keep_newer: SystemTime) -> BackendResult<()> {
+    async fn gc(&self, _heads: &[CommitId], _keep_newer: SystemTime) -> BackendResult<()> {
         Ok(())
     }
 }
@@ -345,7 +349,7 @@ impl OpStore for ServerOpStore {
             .ok_or_else(|| OpStoreError::ObjectNotFound {
                 object_type: "operation".into(),
                 hash: id.hex(),
-                source: "operation not found in server store".into(),
+                source: Some("operation not found in server store".into()),
             })?;
 
         Ok(operation_from_proto(op))
@@ -382,7 +386,7 @@ impl OpStore for ServerOpStore {
             .ok_or_else(|| OpStoreError::ObjectNotFound {
                 object_type: "view".into(),
                 hash: id.hex(),
-                source: "view not found in server store".into(),
+                source: Some("view not found in server store".into()),
             })?;
 
         Ok(view_from_proto(view))
@@ -495,6 +499,7 @@ impl OpHeadsStore for ServerOpHeadsStore {
 #[derive(Debug)]
 pub struct EmptyRevset;
 
+#[async_trait(?Send)]
 impl Revset for EmptyRevset {
     fn stream<'a>(&self) -> LocalBoxStream<'a, Result<CommitId, RevsetEvaluationError>>
     where
@@ -521,11 +526,11 @@ impl Revset for EmptyRevset {
         Box::pin(futures::stream::empty())
     }
 
-    fn is_empty(&self) -> bool {
-        true
+    async fn is_empty(&self) -> Result<bool, RevsetEvaluationError> {
+        Ok(true)
     }
 
-    fn count_estimate(&self) -> Result<(usize, Option<usize>), RevsetEvaluationError> {
+    async fn count_estimate(&self) -> Result<(usize, Option<usize>), RevsetEvaluationError> {
         Ok((0, Some(0)))
     }
 
@@ -533,7 +538,7 @@ impl Revset for EmptyRevset {
     where
         Self: 'a,
     {
-        Box::new(|_id| Ok(false))
+        Box::new(|_id| Box::pin(async { Ok(false) }))
     }
 }
 
@@ -542,27 +547,35 @@ impl Revset for EmptyRevset {
 #[derive(Clone, Debug, Default)]
 pub struct ServerIndex;
 
+#[async_trait]
 impl Index for ServerIndex {
-    fn shortest_unique_commit_id_prefix_len(&self, _commit_id: &CommitId) -> IndexResult<usize> {
+    async fn shortest_unique_commit_id_prefix_len(
+        &self,
+        _commit_id: &CommitId,
+    ) -> IndexResult<usize> {
         Ok(12)
     }
 
-    fn resolve_commit_id_prefix(
+    async fn resolve_commit_id_prefix(
         &self,
         _prefix: &HexPrefix,
     ) -> IndexResult<PrefixResolution<CommitId>> {
         Ok(PrefixResolution::NoMatch)
     }
 
-    fn has_id(&self, _commit_id: &CommitId) -> IndexResult<bool> {
+    async fn has_id(&self, _commit_id: &CommitId) -> IndexResult<bool> {
         Ok(false)
     }
 
-    fn is_ancestor(&self, ancestor_id: &CommitId, descendant_id: &CommitId) -> IndexResult<bool> {
+    async fn is_ancestor(
+        &self,
+        ancestor_id: &CommitId,
+        descendant_id: &CommitId,
+    ) -> IndexResult<bool> {
         Ok(ancestor_id == descendant_id)
     }
 
-    fn common_ancestors(
+    async fn common_ancestors(
         &self,
         _set1: &[CommitId],
         _set2: &[CommitId],
@@ -574,11 +587,14 @@ impl Index for ServerIndex {
         Err(IndexError::AllHeadsForGcUnsupported)
     }
 
-    fn heads(&self, candidates: &mut dyn Iterator<Item = &CommitId>) -> IndexResult<Vec<CommitId>> {
+    async fn heads(
+        &self,
+        candidates: &mut (dyn Iterator<Item = &CommitId> + Send),
+    ) -> IndexResult<Vec<CommitId>> {
         Ok(candidates.cloned().collect())
     }
 
-    fn changed_paths_in_commit(
+    async fn changed_paths_in_commit(
         &self,
         _commit_id: &CommitId,
     ) -> IndexResult<Option<Box<dyn Iterator<Item = RepoPathBuf> + '_>>> {
@@ -589,22 +605,23 @@ impl Index for ServerIndex {
         &self,
         _expression: &ResolvedExpression,
         _store: &Arc<JjStore>,
-    ) -> Result<Box<dyn Revset + '_>, RevsetEvaluationError> {
+    ) -> Result<Box<dyn Revset>, RevsetEvaluationError> {
         Ok(Box::new(EmptyRevset))
     }
 }
 
 pub struct ServerChangeIdIndex;
 
+#[async_trait]
 impl ChangeIdIndex for ServerChangeIdIndex {
-    fn resolve_prefix(
+    async fn resolve_prefix(
         &self,
         _prefix: &HexPrefix,
     ) -> IndexResult<PrefixResolution<ResolvedChangeTargets>> {
         Ok(PrefixResolution::NoMatch)
     }
 
-    fn shortest_unique_prefix_len(&self, _change_id: &ChangeId) -> IndexResult<usize> {
+    async fn shortest_unique_prefix_len(&self, _change_id: &ChangeId) -> IndexResult<usize> {
         Ok(12)
     }
 }
@@ -617,8 +634,8 @@ impl ReadonlyIndex for ServerIndex {
     fn change_id_index(
         &self,
         _heads: &mut dyn Iterator<Item = &CommitId>,
-    ) -> Box<dyn ChangeIdIndex> {
-        Box::new(ServerChangeIdIndex)
+    ) -> IndexResult<Box<dyn ChangeIdIndex>> {
+        Ok(Box::new(ServerChangeIdIndex))
     }
 
     fn start_modification(&self) -> Box<dyn MutableIndex> {
@@ -635,8 +652,8 @@ impl MutableIndex for ServerIndex {
     fn change_id_index(
         &self,
         _heads: &mut dyn Iterator<Item = &CommitId>,
-    ) -> Box<dyn ChangeIdIndex + '_> {
-        Box::new(ServerChangeIdIndex)
+    ) -> IndexResult<Box<dyn ChangeIdIndex + '_>> {
+        Ok(Box::new(ServerChangeIdIndex))
     }
 
     async fn add_commit(&mut self, _commit: &JjCommit) -> IndexResult<()> {
@@ -682,5 +699,43 @@ pub struct ServerSubmoduleStore;
 impl SubmoduleStore for ServerSubmoduleStore {
     fn name(&self) -> &str {
         "server"
+    }
+}
+
+/// No-op [`WorkspaceStore`] for server-side operations. The server never checks
+/// out workspaces on disk, so there are no workspace paths to record.
+#[derive(Debug, Default)]
+pub struct ServerWorkspaceStore;
+
+impl WorkspaceStore for ServerWorkspaceStore {
+    fn name(&self) -> &str {
+        "server"
+    }
+
+    fn add(
+        &self,
+        _workspace_name: &WorkspaceName,
+        _path: &Path,
+    ) -> Result<(), WorkspaceStoreError> {
+        Ok(())
+    }
+
+    fn forget(&self, _workspace_names: &[&WorkspaceName]) -> Result<(), WorkspaceStoreError> {
+        Ok(())
+    }
+
+    fn rename(
+        &self,
+        _old_name: &WorkspaceName,
+        _new_name: &WorkspaceName,
+    ) -> Result<(), WorkspaceStoreError> {
+        Ok(())
+    }
+
+    fn get_workspace_path(
+        &self,
+        _workspace_name: &WorkspaceName,
+    ) -> Result<Option<PathBuf>, WorkspaceStoreError> {
+        Ok(None)
     }
 }

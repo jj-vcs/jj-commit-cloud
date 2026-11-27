@@ -18,7 +18,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use jj_lib::backend::CommitId;
 use jj_lib::default_index::DefaultIndexStore;
-use jj_lib::index::{IndexStore, IndexStoreError, IndexStoreResult, MutableIndex, ReadonlyIndex};
+use jj_lib::index::{MutableIndex, ReadonlyIndex};
+use jj_lib::index_store::{IndexStore, IndexStoreError, IndexStoreResult};
 use jj_lib::operation::Operation;
 use jj_lib::store::Store;
 
@@ -81,6 +82,7 @@ impl IndexStore for CommitCloudIndexStore {
             if !index
                 .as_index()
                 .has_id(cid)
+                .await
                 .map_err(|e| IndexStoreError::Read(e.into()))?
             {
                 missing_ids.push(cid.clone());
@@ -117,6 +119,7 @@ async fn add_commit_recursive(
     if mut_index
         .as_index()
         .has_id(commit_id)
+        .await
         .map_err(|e| IndexStoreError::Read(e.into()))?
     {
         return Ok(());

@@ -16,26 +16,30 @@
 
 use std::sync::Arc;
 
+use jj_lib::files::MergeOptions;
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::op_heads_store::OpHeadsStore;
 use jj_lib::op_store::OpStore;
 use jj_lib::repo::RepoLoader;
 use jj_lib::settings::UserSettings;
-use jj_lib::signing::Signer;
+use jj_lib::signing_factory::signer_from_settings;
 use jj_lib::store::Store as JjStore;
-use jj_lib::tree_merge::MergeOptions;
 
 use crate::jj_lib_adapters::{
     ServerBackend, ServerIndexStore, ServerOpHeadsStore, ServerOpStore, ServerSubmoduleStore,
+    ServerWorkspaceStore,
 };
 use crate::store::Store;
 
 static RECONCILER_ENV: std::sync::LazyLock<(UserSettings, MergeOptions)> =
     std::sync::LazyLock::new(|| {
-        let user_settings =
-            UserSettings::from_config(jj_lib::config::StackedConfig::with_defaults())
-                .expect("failed to load default user settings");
-        let merge_options = MergeOptions::from_settings(&user_settings)
+        let user_settings = UserSettings::from_config_and_home_dir(
+            jj_lib::config::StackedConfig::with_defaults(),
+            None,
+        )
+        .expect("failed to load default user settings");
+        let merge_options = user_settings
+            .merge_options()
             .expect("failed to create merge options from settings");
         (user_settings, merge_options)
     });
@@ -78,7 +82,7 @@ pub async fn reconcile_repo_op_heads(
         let handle = tokio::task::spawn_blocking(move || {
             pollster::block_on(async move {
                 let (ref user_settings, ref merge_options) = *RECONCILER_ENV;
-                let signer = Signer::from_settings(user_settings)
+                let signer = signer_from_settings(user_settings)
                     .map_err(|e| format!("failed to initialize signer: {e}"))?;
                 let index_store = Arc::new(ServerIndexStore);
                 let submodule_store = Arc::new(ServerSubmoduleStore);
@@ -97,6 +101,7 @@ pub async fn reconcile_repo_op_heads(
                 let repo_loader = RepoLoader::new(
                     user_settings.clone(),
                     jj_store,
+                    Arc::new(ServerWorkspaceStore),
                     op_store,
                     op_heads_store,
                     index_store,
@@ -109,7 +114,7 @@ pub async fn reconcile_repo_op_heads(
                 // the `Store` trait (`crate::store::Store::update_op_heads` via `ServerOpHeadsStore`)
                 // with strict exact CAS verification.
                 repo_loader
-                    .load_at_head()
+                    .load_at_head(None)
                     .await
                     .map(|repo| repo.op_id().as_bytes().to_vec())
                     .map_err(|e| e.to_string())
@@ -362,10 +367,13 @@ mod tests {
         // Direct jj-lib resolution on repo_id_jj
         let index_store = Arc::new(ServerIndexStore);
         let submodule_store = Arc::new(ServerSubmoduleStore);
-        let user_settings =
-            UserSettings::from_config(jj_lib::config::StackedConfig::with_defaults()).unwrap();
-        let signer = Signer::from_settings(&user_settings).unwrap();
-        let merge_options = MergeOptions::from_settings(&user_settings).unwrap();
+        let user_settings = UserSettings::from_config_and_home_dir(
+            jj_lib::config::StackedConfig::with_defaults(),
+            None,
+        )
+        .unwrap();
+        let signer = signer_from_settings(&user_settings).unwrap();
+        let merge_options = user_settings.merge_options().unwrap();
 
         let jj_backend = Box::new(ServerBackend::new(store.clone(), "default".to_string()));
         let jj_store = JjStore::new(jj_backend, signer, merge_options);
@@ -379,6 +387,7 @@ mod tests {
         let repo_loader = RepoLoader::new(
             user_settings,
             jj_store,
+            Arc::new(ServerWorkspaceStore),
             jj_op_store,
             jj_op_heads_store,
             index_store,
@@ -386,7 +395,7 @@ mod tests {
         );
 
         let jj_lib_repo = repo_loader
-            .load_at_head()
+            .load_at_head(None)
             .await
             .expect("jj-lib direct resolution failed");
         let jj_lib_op = jj_lib_repo.operation().clone();

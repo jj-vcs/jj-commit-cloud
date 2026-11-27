@@ -14,8 +14,8 @@ tokio = { version = "1.39", features = ["rt-multi-thread", "macros"] }
 uuid = { version = "1", features = ["v4"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
-jj-lib = "0.43.0"
-jj-cli = "0.43.0"
+jj-lib = "0.47.1"
+jj-cli = "0.47.1"
 cc-lib = { path = "../lib" }
 
 [dev-dependencies]
