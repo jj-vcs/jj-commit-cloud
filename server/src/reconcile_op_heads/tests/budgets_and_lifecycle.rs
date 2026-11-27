@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use cc_common::backend::Commit as ProtoCommit;
 use cc_common::op_store::{
@@ -78,6 +78,15 @@ impl MetadataStore for CountingMetadataStore {
     ) -> crate::store::StoreResult<String> {
         self.inner
             .register_repo_in_project(repo_id, project_id, name)
+            .await
+    }
+    async fn delete_repository(
+        &self,
+        repo_id: &str,
+        expected_project_id: Option<&str>,
+    ) -> crate::store::StoreResult<bool> {
+        self.inner
+            .delete_repository(repo_id, expected_project_id)
             .await
     }
     async fn get_commit(
@@ -264,6 +273,24 @@ impl MetadataStore for CountingMetadataStore {
     ) -> crate::store::StoreResult<()> {
         self.inner.put_operation(repo_id, op_id, op).await
     }
+    async fn put_operation_for_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+        op_id: &[u8],
+        op: &ProtoOperation,
+        require_dependencies_exist: bool,
+    ) -> crate::store::StoreResult<()> {
+        self.inner
+            .put_operation_for_project(
+                repo_id,
+                expected_project_id,
+                op_id,
+                op,
+                require_dependencies_exist,
+            )
+            .await
+    }
     async fn resolve_operation_id_prefix(
         &self,
         repo_id: &str,
@@ -289,6 +316,17 @@ impl MetadataStore for CountingMetadataStore {
     ) -> crate::store::StoreResult<()> {
         self.inner.put_view(repo_id, view_id, view).await
     }
+    async fn put_view_for_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+        view_id: &[u8],
+        view: &ProtoView,
+    ) -> crate::store::StoreResult<()> {
+        self.inner
+            .put_view_for_project(repo_id, expected_project_id, view_id, view)
+            .await
+    }
     async fn get_op_heads(
         &self,
         repo_id: &str,
@@ -303,6 +341,24 @@ impl MetadataStore for CountingMetadataStore {
     ) -> crate::store::StoreResult<Vec<crate::store::OpId>> {
         self.inner.update_op_heads(repo_id, old_ids, new_id).await
     }
+    async fn update_op_heads_for_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+        old_head_ids: &[Vec<u8>],
+        new_head_id: &[u8],
+        require_op_exists: bool,
+    ) -> crate::store::StoreResult<Vec<crate::store::OpId>> {
+        self.inner
+            .update_op_heads_for_project(
+                repo_id,
+                expected_project_id,
+                old_head_ids,
+                new_head_id,
+                require_op_exists,
+            )
+            .await
+    }
     async fn publish_operation_atomic(
         &self,
         repo_id: &str,
@@ -316,6 +372,31 @@ impl MetadataStore for CountingMetadataStore {
             .publish_operation_atomic(repo_id, view_id, view, op_id, op, old_ids)
             .await
     }
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_operation_for_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+        view_id: &[u8],
+        view: &ProtoView,
+        op_id: &[u8],
+        op: &ProtoOperation,
+        old_op_head_ids: &[Vec<u8>],
+        require_dependencies_exist: bool,
+    ) -> crate::store::StoreResult<Vec<crate::store::OpId>> {
+        self.inner
+            .publish_operation_for_project(
+                repo_id,
+                expected_project_id,
+                view_id,
+                view,
+                op_id,
+                op,
+                old_op_head_ids,
+                require_dependencies_exist,
+            )
+            .await
+    }
     async fn compare_and_swap_op_heads(
         &self,
         repo_id: &str,
@@ -324,6 +405,24 @@ impl MetadataStore for CountingMetadataStore {
     ) -> crate::store::StoreResult<()> {
         self.inner
             .compare_and_swap_op_heads(repo_id, expected_old_ids, new_id)
+            .await
+    }
+    async fn update_op_heads_cas_for_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+        expected_exact_heads: &[Vec<u8>],
+        new_head_id: &[u8],
+        require_op_exists: bool,
+    ) -> crate::store::StoreResult<()> {
+        self.inner
+            .update_op_heads_cas_for_project(
+                repo_id,
+                expected_project_id,
+                expected_exact_heads,
+                new_head_id,
+                require_op_exists,
+            )
             .await
     }
     async fn get_workspace(
@@ -343,6 +442,22 @@ impl MetadataStore for CountingMetadataStore {
     ) -> crate::store::StoreResult<()> {
         self.inner
             .put_workspace_cas(workspace, expected_operation_id)
+            .await
+    }
+    async fn put_workspace_cas_for_project(
+        &self,
+        expected_project_id: &str,
+        workspace: &cc_common::workspace::WorkspaceState,
+        expected_operation_id: Option<&[u8]>,
+        require_operation_exists: bool,
+    ) -> crate::store::StoreResult<()> {
+        self.inner
+            .put_workspace_cas_for_project(
+                expected_project_id,
+                workspace,
+                expected_operation_id,
+                require_operation_exists,
+            )
             .await
     }
     async fn list_workspaces(
@@ -476,6 +591,7 @@ async fn test_reconcile_prioritizes_newly_added_heads_over_many_unchanged_heads(
     let needs_client = requires_client_rewrite_resolution(
         &counting_store,
         repo_id,
+        project_id,
         &op_store,
         &index,
         &[op_a_id, op_b_id],
@@ -891,7 +1007,6 @@ async fn test_reconcile_commit_walk_budget_exceeded_defers_and_missing_commit_er
         );
     }
 }
-
 #[tokio::test]
 async fn test_reconcile_enforces_per_walk_and_aggregate_index_visit_budgets() {
     // Precheck passes with zero index walks, while `RepoLoader::load_at_head`
@@ -1186,6 +1301,573 @@ async fn test_reconcile_enforces_per_walk_and_aggregate_index_visit_budgets() {
         assert!(
             !ok.client_resolution_required && !ok.op_head.is_empty(),
             "expected reconciliation to succeed within ample aggregate budget, got {ok:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_reconcile_concurrent_delete_and_reregister_other_project_fails_safely() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use async_trait::async_trait;
+    use cc_common::backend::{Commit as ProtoCommit, TreeEntry};
+    use cc_common::op_store::{Operation as ProtoOperation, View as ProtoView};
+    use cc_common::workspace::WorkspaceState;
+
+    use crate::store::{BlobRecord, CommitId as StoreCommitId, OpId, StoreResult};
+
+    #[derive(Clone, Copy)]
+    enum SwapStage {
+        PutView,
+        PutOperation,
+        CasOpHeads,
+    }
+
+    /// Deterministic fault-injection store that deletes `repo_id` from `proj-a` and
+    /// re-registers it under `proj-b` right at `stage` during an active `ReconcileOpHeads`
+    /// attempt.
+    struct SwapProjectMidReconcileMeta {
+        inner: MemoryMetadataStore,
+        repo_id: String,
+        old_project: String,
+        new_project: String,
+        stage: SwapStage,
+        armed: AtomicBool,
+        last_put_view_id: Mutex<Option<Vec<u8>>>,
+    }
+
+    impl SwapProjectMidReconcileMeta {
+        async fn maybe_swap(&self, stage: SwapStage) -> StoreResult<()> {
+            if std::mem::discriminant(&self.stage) == std::mem::discriminant(&stage)
+                && self.armed.swap(false, Ordering::SeqCst)
+            {
+                self.inner
+                    .delete_repository(&self.repo_id, Some(&self.old_project))
+                    .await?;
+                self.inner
+                    .register_repo_in_project(&self.repo_id, &self.new_project, None)
+                    .await?;
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl MetadataStore for SwapProjectMidReconcileMeta {
+        fn backend_name(&self) -> &'static str {
+            "swap_mid_reconcile_memory"
+        }
+        async fn register_project(&self, project_id: &str, name: Option<&str>) -> StoreResult<()> {
+            self.inner.register_project(project_id, name).await
+        }
+        async fn is_project_registered(&self, project_id: &str) -> StoreResult<bool> {
+            self.inner.is_project_registered(project_id).await
+        }
+        async fn get_repo_project_id(&self, repo_id: &str) -> StoreResult<Option<String>> {
+            self.inner.get_repo_project_id(repo_id).await
+        }
+        async fn register_repo_in_project(
+            &self,
+            repo_id: &str,
+            project_id: &str,
+            name: Option<&str>,
+        ) -> StoreResult<String> {
+            self.inner
+                .register_repo_in_project(repo_id, project_id, name)
+                .await
+        }
+        async fn delete_repository(
+            &self,
+            repo_id: &str,
+            expected_project_id: Option<&str>,
+        ) -> StoreResult<bool> {
+            self.inner
+                .delete_repository(repo_id, expected_project_id)
+                .await
+        }
+        async fn get_commit(
+            &self,
+            project_id: &str,
+            commit_id: &[u8],
+        ) -> StoreResult<Option<ProtoCommit>> {
+            self.inner.get_commit(project_id, commit_id).await
+        }
+        async fn get_commit_generation(
+            &self,
+            project_id: &str,
+            commit_id: &[u8],
+        ) -> StoreResult<Option<u64>> {
+            self.inner
+                .get_commit_generation(project_id, commit_id)
+                .await
+        }
+        async fn put_commit(
+            &self,
+            project_id: &str,
+            commit_id: &[u8],
+            commit: &ProtoCommit,
+            generation: u64,
+        ) -> StoreResult<()> {
+            self.inner
+                .put_commit(project_id, commit_id, commit, generation)
+                .await
+        }
+        async fn list_commit_ids(
+            &self,
+            project_id: &str,
+            after_commit_id: Option<&[u8]>,
+            limit: usize,
+        ) -> StoreResult<Vec<StoreCommitId>> {
+            self.inner
+                .list_commit_ids(project_id, after_commit_id, limit)
+                .await
+        }
+        async fn current_commit_watermark(&self, project_id: &str) -> StoreResult<Vec<u8>> {
+            self.inner.current_commit_watermark(project_id).await
+        }
+        async fn list_commit_ids_since(
+            &self,
+            project_id: &str,
+            since_token: &[u8],
+            limit: usize,
+        ) -> StoreResult<(Vec<StoreCommitId>, Vec<u8>, bool)> {
+            self.inner
+                .list_commit_ids_since(project_id, since_token, limit)
+                .await
+        }
+        async fn resolve_commit_id_prefix(
+            &self,
+            project_id: &str,
+            min_id: &[u8],
+            max_id: &[u8],
+        ) -> StoreResult<Vec<StoreCommitId>> {
+            self.inner
+                .resolve_commit_id_prefix(project_id, min_id, max_id)
+                .await
+        }
+        async fn resolve_change_id_prefix(
+            &self,
+            project_id: &str,
+            min_id: &[u8],
+            max_id: &[u8],
+            limit: usize,
+        ) -> StoreResult<Vec<(Vec<u8>, Vec<StoreCommitId>)>> {
+            self.inner
+                .resolve_change_id_prefix(project_id, min_id, max_id, limit)
+                .await
+        }
+        async fn get_tree(
+            &self,
+            project_id: &str,
+            tree_id: &[u8],
+        ) -> StoreResult<Option<Vec<TreeEntry>>> {
+            self.inner.get_tree(project_id, tree_id).await
+        }
+        async fn put_tree(
+            &self,
+            project_id: &str,
+            tree_id: &[u8],
+            entries: &[TreeEntry],
+        ) -> StoreResult<()> {
+            self.inner.put_tree(project_id, tree_id, entries).await
+        }
+        async fn find_existing_trees(
+            &self,
+            project_id: &str,
+            tree_ids: &[Vec<u8>],
+        ) -> StoreResult<HashSet<Vec<u8>>> {
+            self.inner.find_existing_trees(project_id, tree_ids).await
+        }
+        async fn get_symlink(
+            &self,
+            project_id: &str,
+            symlink_id: &[u8],
+        ) -> StoreResult<Option<String>> {
+            self.inner.get_symlink(project_id, symlink_id).await
+        }
+        async fn put_symlink(
+            &self,
+            project_id: &str,
+            symlink_id: &[u8],
+            target: &str,
+        ) -> StoreResult<()> {
+            self.inner.put_symlink(project_id, symlink_id, target).await
+        }
+        async fn find_existing_symlinks(
+            &self,
+            project_id: &str,
+            symlink_ids: &[Vec<u8>],
+        ) -> StoreResult<HashSet<Vec<u8>>> {
+            self.inner
+                .find_existing_symlinks(project_id, symlink_ids)
+                .await
+        }
+        async fn get_blob_record(
+            &self,
+            project_id: &str,
+            blob_id: &[u8],
+        ) -> StoreResult<Option<BlobRecord>> {
+            self.inner.get_blob_record(project_id, blob_id).await
+        }
+        async fn get_blob_sizes_batch(
+            &self,
+            project_id: &str,
+            blob_ids: &[Vec<u8>],
+        ) -> StoreResult<HashMap<Vec<u8>, u64>> {
+            self.inner.get_blob_sizes_batch(project_id, blob_ids).await
+        }
+        async fn get_global_blob_record(&self, blob_id: &[u8]) -> StoreResult<Option<BlobRecord>> {
+            self.inner.get_global_blob_record(blob_id).await
+        }
+        async fn put_blob_record(&self, project_id: &str, record: &BlobRecord) -> StoreResult<()> {
+            self.inner.put_blob_record(project_id, record).await
+        }
+        async fn add_blob_replica_location(
+            &self,
+            blob_id: &[u8],
+            location: &str,
+        ) -> StoreResult<()> {
+            self.inner
+                .add_blob_replica_location(blob_id, location)
+                .await
+        }
+        async fn get_operation(
+            &self,
+            repo_id: &str,
+            op_id: &[u8],
+        ) -> StoreResult<Option<ProtoOperation>> {
+            self.inner.get_operation(repo_id, op_id).await
+        }
+        async fn put_operation(
+            &self,
+            repo_id: &str,
+            op_id: &[u8],
+            op: &ProtoOperation,
+        ) -> StoreResult<()> {
+            self.inner.put_operation(repo_id, op_id, op).await
+        }
+        async fn put_operation_for_project(
+            &self,
+            repo_id: &str,
+            expected_project_id: &str,
+            op_id: &[u8],
+            op: &ProtoOperation,
+            require_dependencies_exist: bool,
+        ) -> StoreResult<()> {
+            self.maybe_swap(SwapStage::PutOperation).await?;
+            self.inner
+                .put_operation_for_project(
+                    repo_id,
+                    expected_project_id,
+                    op_id,
+                    op,
+                    require_dependencies_exist,
+                )
+                .await
+        }
+        async fn resolve_operation_id_prefix(
+            &self,
+            repo_id: &str,
+            min_id: &[u8],
+            max_id: &[u8],
+        ) -> StoreResult<Vec<OpId>> {
+            self.inner
+                .resolve_operation_id_prefix(repo_id, min_id, max_id)
+                .await
+        }
+        async fn get_view(&self, repo_id: &str, view_id: &[u8]) -> StoreResult<Option<ProtoView>> {
+            self.inner.get_view(repo_id, view_id).await
+        }
+        async fn put_view(
+            &self,
+            repo_id: &str,
+            view_id: &[u8],
+            view: &ProtoView,
+        ) -> StoreResult<()> {
+            self.inner.put_view(repo_id, view_id, view).await
+        }
+        async fn put_view_for_project(
+            &self,
+            repo_id: &str,
+            expected_project_id: &str,
+            view_id: &[u8],
+            view: &ProtoView,
+        ) -> StoreResult<()> {
+            *self.last_put_view_id.lock().unwrap() = Some(view_id.to_vec());
+            self.maybe_swap(SwapStage::PutView).await?;
+            self.inner
+                .put_view_for_project(repo_id, expected_project_id, view_id, view)
+                .await
+        }
+        async fn get_op_heads(&self, repo_id: &str) -> StoreResult<Option<Vec<OpId>>> {
+            self.inner.get_op_heads(repo_id).await
+        }
+        async fn update_op_heads(
+            &self,
+            repo_id: &str,
+            old_ids: &[Vec<u8>],
+            new_id: &[u8],
+        ) -> StoreResult<Vec<OpId>> {
+            self.inner.update_op_heads(repo_id, old_ids, new_id).await
+        }
+        async fn update_op_heads_for_project(
+            &self,
+            repo_id: &str,
+            expected_project_id: &str,
+            old_head_ids: &[Vec<u8>],
+            new_head_id: &[u8],
+            require_op_exists: bool,
+        ) -> StoreResult<Vec<OpId>> {
+            self.inner
+                .update_op_heads_for_project(
+                    repo_id,
+                    expected_project_id,
+                    old_head_ids,
+                    new_head_id,
+                    require_op_exists,
+                )
+                .await
+        }
+        async fn publish_operation_atomic(
+            &self,
+            repo_id: &str,
+            view_id: &[u8],
+            view: &ProtoView,
+            op_id: &[u8],
+            op: &ProtoOperation,
+            old_ids: &[Vec<u8>],
+        ) -> StoreResult<Vec<OpId>> {
+            self.inner
+                .publish_operation_atomic(repo_id, view_id, view, op_id, op, old_ids)
+                .await
+        }
+        #[allow(clippy::too_many_arguments)]
+        async fn publish_operation_for_project(
+            &self,
+            repo_id: &str,
+            expected_project_id: &str,
+            view_id: &[u8],
+            view: &ProtoView,
+            op_id: &[u8],
+            op: &ProtoOperation,
+            old_op_head_ids: &[Vec<u8>],
+            require_dependencies_exist: bool,
+        ) -> StoreResult<Vec<OpId>> {
+            self.inner
+                .publish_operation_for_project(
+                    repo_id,
+                    expected_project_id,
+                    view_id,
+                    view,
+                    op_id,
+                    op,
+                    old_op_head_ids,
+                    require_dependencies_exist,
+                )
+                .await
+        }
+        async fn compare_and_swap_op_heads(
+            &self,
+            repo_id: &str,
+            expected_old_ids: &[Vec<u8>],
+            new_id: &[u8],
+        ) -> StoreResult<()> {
+            self.inner
+                .compare_and_swap_op_heads(repo_id, expected_old_ids, new_id)
+                .await
+        }
+        async fn update_op_heads_cas_for_project(
+            &self,
+            repo_id: &str,
+            expected_project_id: &str,
+            expected_exact_heads: &[Vec<u8>],
+            new_head_id: &[u8],
+            require_op_exists: bool,
+        ) -> StoreResult<()> {
+            self.maybe_swap(SwapStage::CasOpHeads).await?;
+            self.inner
+                .update_op_heads_cas_for_project(
+                    repo_id,
+                    expected_project_id,
+                    expected_exact_heads,
+                    new_head_id,
+                    require_op_exists,
+                )
+                .await
+        }
+        async fn get_workspace(
+            &self,
+            repo_id: &str,
+            user: &str,
+            workspace_name: &str,
+        ) -> StoreResult<Option<WorkspaceState>> {
+            self.inner
+                .get_workspace(repo_id, user, workspace_name)
+                .await
+        }
+        async fn put_workspace_cas(
+            &self,
+            workspace: &WorkspaceState,
+            expected_operation_id: Option<&[u8]>,
+        ) -> StoreResult<()> {
+            self.inner
+                .put_workspace_cas(workspace, expected_operation_id)
+                .await
+        }
+        async fn put_workspace_cas_for_project(
+            &self,
+            expected_project_id: &str,
+            workspace: &WorkspaceState,
+            expected_operation_id: Option<&[u8]>,
+            require_operation_exists: bool,
+        ) -> StoreResult<()> {
+            self.inner
+                .put_workspace_cas_for_project(
+                    expected_project_id,
+                    workspace,
+                    expected_operation_id,
+                    require_operation_exists,
+                )
+                .await
+        }
+        async fn list_workspaces(&self, repo_id: &str) -> StoreResult<Vec<WorkspaceState>> {
+            self.inner.list_workspaces(repo_id).await
+        }
+        async fn delete_workspace(
+            &self,
+            repo_id: &str,
+            user: &str,
+            workspace_name: &str,
+        ) -> StoreResult<bool> {
+            self.inner
+                .delete_workspace(repo_id, user, workspace_name)
+                .await
+        }
+    }
+
+    let cases = [
+        ("before_put_view", SwapStage::PutView),
+        ("before_put_operation", SwapStage::PutOperation),
+        ("before_cas_op_heads", SwapStage::CasOpHeads),
+    ];
+
+    for (label, stage) in cases {
+        let repo_id = format!("repo-reconcile-rebind-{label}");
+        let meta = Arc::new(SwapProjectMidReconcileMeta {
+            inner: MemoryMetadataStore::new(),
+            repo_id: repo_id.clone(),
+            old_project: "proj-a".to_string(),
+            new_project: "proj-b".to_string(),
+            stage,
+            armed: AtomicBool::new(false),
+            last_put_view_id: Mutex::new(None),
+        });
+        let store = Arc::new(CompositeStore::new(
+            meta.clone(),
+            Arc::new(MemoryBlobStore::new()),
+        ));
+        store.register_project("proj-a", None).await.unwrap();
+        store.register_project("proj-b", None).await.unwrap();
+        store
+            .register_repo_in_project(&repo_id, Some("proj-a"), None)
+            .await
+            .unwrap();
+
+        let root_op = cc_common::ROOT_OPERATION_ID_BYTES.to_vec();
+        let c1 = vec![0x11; 20];
+        let c2 = vec![0x22; 20];
+        for cid in [&c1, &c2] {
+            store
+                .put_commit(
+                    "proj-a",
+                    cid,
+                    &make_test_proto_commit(cid, cid[0], cc_common::ROOT_COMMIT_ID_BYTES.to_vec()),
+                )
+                .await
+                .unwrap();
+        }
+
+        let op_a = put_view_and_op(
+            &store,
+            &repo_id,
+            vec![c1.clone()],
+            vec![root_op.clone()],
+            "branch a",
+            new_commit_predecessors(c1),
+        )
+        .await;
+        let op_b = put_view_and_op(
+            &store,
+            &repo_id,
+            vec![c2.clone()],
+            vec![root_op.clone()],
+            "branch b",
+            new_commit_predecessors(c2),
+        )
+        .await;
+        store
+            .update_op_heads(&repo_id, std::slice::from_ref(&root_op), &op_a)
+            .await
+            .unwrap();
+        store.update_op_heads(&repo_id, &[], &op_b).await.unwrap();
+
+        // Arm the mid-reconcile swap (`proj-a` -> `proj-b`) and run ReconcileOpHeads.
+        meta.armed.store(true, Ordering::SeqCst);
+        let err = reconcile_repo_op_heads_proto(store.clone(), &repo_id)
+            .await
+            .expect_err(&format!(
+                "{label}: reconcile must fail when repo is re-bound"
+            ));
+        assert_eq!(
+            err.code(),
+            tonic::Code::FailedPrecondition,
+            "{label}: expected FailedPrecondition, got {err:?}"
+        );
+
+        // Confirm repo now belongs to proj-b with clean state and zero leaked views/ops/commits.
+        let attempted_view_id = meta
+            .last_put_view_id
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("reconcile should have attempted to persist merged view");
+        assert!(
+            meta.inner
+                .get_view(&repo_id, &attempted_view_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "{label}: merged proj-a view must not leak into proj-b repo"
+        );
+        assert_eq!(
+            store
+                .resolve_repo_project(&repo_id, "verify")
+                .await
+                .unwrap(),
+            "proj-b",
+            "{label}"
+        );
+        assert_eq!(
+            store.get_op_heads(&repo_id).await.unwrap(),
+            vec![root_op.clone()],
+            "{label}: proj-b repo must retain clean [root] op_heads"
+        );
+        assert!(
+            meta.inner
+                .resolve_operation_id_prefix(
+                    &repo_id,
+                    &[0x00; cc_common::OPERATION_ID_LENGTH],
+                    &[0xff; cc_common::OPERATION_ID_LENGTH],
+                )
+                .await
+                .unwrap()
+                .is_empty(),
+            "{label}: no proj-a operations may leak into proj-b repo"
+        );
+        let (proj_b_commits, _) = store.list_commits("proj-b", &[], 100).await.unwrap();
+        assert!(
+            proj_b_commits.is_empty(),
+            "{label}: no proj-a commits may leak into proj-b"
         );
     }
 }

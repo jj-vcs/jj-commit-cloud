@@ -23,6 +23,8 @@ use bytes::Bytes;
 use cc_common::backend::{Commit, TreeEntry};
 use cc_common::workspace::WorkspaceState;
 use google_cloud_gax::error::rpc::Code as RpcCode;
+use google_cloud_spanner::key;
+use google_cloud_spanner::key::KeySet;
 use google_cloud_spanner::mutation::Mutation;
 use google_cloud_spanner::result::{ResultSet, Row};
 use google_cloud_spanner::statement::{Statement, StatementBuilder};
@@ -409,4 +411,27 @@ pub(super) fn build_project_blob_upsert_mutation(project_id: &str, blob_id: &[u8
         .set("BlobId")
         .to(blob_id)
         .build()
+}
+
+pub(super) fn build_workspace_delete_mutation(
+    repo_id: &str,
+    keys: &[(String, String)],
+) -> Mutation {
+    let mut builder = KeySet::builder();
+    for (user_email, workspace_name) in keys {
+        builder = builder.add_key(key![repo_id, user_email.as_str(), workspace_name.as_str()]);
+    }
+    Mutation::delete("Workspaces", builder.build())
+}
+
+pub(super) fn build_binary_child_delete_mutation(
+    table: &str,
+    repo_id: &str,
+    child_ids: &[Vec<u8>],
+) -> Mutation {
+    let mut builder = KeySet::builder();
+    for child_id in child_ids {
+        builder = builder.add_key(key![repo_id, child_id.as_slice()]);
+    }
+    Mutation::delete(table, builder.build())
 }

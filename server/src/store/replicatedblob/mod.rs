@@ -91,6 +91,7 @@ impl Default for ReplicatedBlobStoreConfig {
 #[derive(Debug, Default)]
 pub struct ReplicationStats {
     pub cache_hits: AtomicU64,
+    pub cache_misses: AtomicU64,
     pub local_hits: AtomicU64,
     pub origin_fallbacks: AtomicU64,
     pub read_repairs_completed: AtomicU64,
@@ -457,12 +458,17 @@ impl ReplicatedBlobStore {
         blob_id: &[u8],
         known_record: Option<&BlobRecord>,
     ) -> StoreResult<Option<Bytes>> {
-        if let Some(cached) = self
-            .inner
-            .cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(blob_id)
+        let cacheable = match known_record {
+            Some(record) => self.inner.can_cache_blob(blob_id, record.content_size),
+            None => self.inner.config.cache_capacity_bytes > 0,
+        };
+        if cacheable
+            && let Some(cached) = self
+                .inner
+                .cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(blob_id)
         {
             if let Some(record) = known_record {
                 validate_full_blob_size(blob_id, &cached, record.content_size)?;
@@ -477,12 +483,13 @@ impl ReplicatedBlobStore {
                 .inflight
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if let Some(cached) = self
-                .inner
-                .cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(blob_id)
+            if cacheable
+                && let Some(cached) = self
+                    .inner
+                    .cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(blob_id)
             {
                 if let Some(record) = known_record {
                     validate_full_blob_size(blob_id, &cached, record.content_size)?;
@@ -491,12 +498,24 @@ impl ReplicatedBlobStore {
                 return Ok(Some(cached));
             }
             if let Some(existing_rx) = inflight.get(blob_id) {
+                if cacheable {
+                    self.inner
+                        .stats
+                        .cache_misses
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 self.inner
                     .stats
                     .singleflight_coalesced
                     .fetch_add(1, Ordering::Relaxed);
                 (existing_rx.clone(), None)
             } else {
+                if cacheable {
+                    self.inner
+                        .stats
+                        .cache_misses
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 let (tx, rx) = watch::channel(None);
                 let blob_id_owned = blob_id.to_vec();
                 inflight.insert(blob_id_owned.clone(), rx.clone());

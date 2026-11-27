@@ -1462,3 +1462,83 @@ async fn test_write_and_read_commit_external_ids_roundtrip_and_validation() {
         );
     }
 }
+
+#[tokio::test]
+async fn test_delete_repository_rpc_validation_precondition_and_metrics() {
+    let store = Arc::new(CompositeStore::in_memory());
+    let metrics = ServerMetrics::new();
+    let svc = CommitCloudBackendService::with_metrics(store.clone(), metrics.clone());
+
+    // Invalid repo_id and empty/invalid optional project_id return INVALID_ARGUMENT.
+    for (repo_id, project_id) in [
+        ("", None),
+        ("../bad", None),
+        ("valid-repo", Some("")),
+        ("valid-repo", Some("../bad")),
+    ] {
+        let err = svc
+            .delete_repository(Request::new(DeleteRepositoryRequest {
+                repo_id: repo_id.to_string(),
+                project_id: project_id.map(str::to_string),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    // Absent repo returns existed = false.
+    let absent = svc
+        .delete_repository(Request::new(DeleteRepositoryRequest {
+            repo_id: "missing-repo".to_string(),
+            project_id: None,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!absent.existed);
+
+    svc.register_repository(Request::new(RegisterRepositoryRequest {
+        project_id: "proj-del".to_string(),
+        repo_id: Some("repo-del".to_string()),
+        name: None,
+        hash_algorithm: HashAlgorithm::Sha1 as i32,
+    }))
+    .await
+    .unwrap();
+    metrics.record_workspace_upsert("repo-del", "alice", "default");
+    assert_eq!(metrics.snapshot().active_workspaces, 1);
+
+    // Mismatched project_id returns FAILED_PRECONDITION and leaves workspace gauge intact.
+    let mismatch = svc
+        .delete_repository(Request::new(DeleteRepositoryRequest {
+            repo_id: "repo-del".to_string(),
+            project_id: Some("other-proj".to_string()),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(mismatch.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(metrics.snapshot().active_workspaces, 1);
+
+    // Matching project_id deletes repository and drops its tracked workspaces.
+    let deleted = svc
+        .delete_repository(Request::new(DeleteRepositoryRequest {
+            repo_id: "repo-del".to_string(),
+            project_id: Some("proj-del".to_string()),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(deleted.existed);
+    assert_eq!(metrics.snapshot().active_workspaces, 0);
+
+    // Idempotent second call returns existed = false.
+    let repeat = svc
+        .delete_repository(Request::new(DeleteRepositoryRequest {
+            repo_id: "repo-del".to_string(),
+            project_id: Some("proj-del".to_string()),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!repeat.existed);
+}

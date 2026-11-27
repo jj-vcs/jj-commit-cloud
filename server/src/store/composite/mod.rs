@@ -38,6 +38,7 @@ mod ops;
 mod workspace;
 
 pub use ops::{apply_op_heads_mutation, op_heads_sets_equal};
+pub(crate) use ops::{collect_non_root_op_parents, verify_optional_repo_project};
 pub(crate) use workspace::check_workspace_cas_precondition;
 
 #[derive(Clone, Debug)]
@@ -82,10 +83,6 @@ impl<V> BoundedNamespaceCache<V> {
         self.map.contains_key(key)
     }
 
-    pub(super) fn get(&self, key: &str) -> Option<&V> {
-        self.map.get(key)
-    }
-
     pub(super) fn insert(&mut self, key: String, value: V) {
         if let Some(existing) = self.map.get_mut(&key) {
             *existing = value;
@@ -109,7 +106,6 @@ pub struct CompositeStore {
     blobs: Arc<dyn BlobStore>,
     config: CompositeStoreConfig,
     registered_projects: Arc<RwLock<BoundedNamespaceCache<()>>>,
-    repo_projects: Arc<RwLock<BoundedNamespaceCache<String>>>,
     stream_memory_budget: Arc<Semaphore>,
     stream_memory_budget_bytes: usize,
 }
@@ -129,9 +125,6 @@ impl CompositeStore {
             blobs,
             config,
             registered_projects: Arc::new(RwLock::new(BoundedNamespaceCache::with_capacity(
-                MAX_NAMESPACE_CACHE_ENTRIES,
-            ))),
-            repo_projects: Arc::new(RwLock::new(BoundedNamespaceCache::with_capacity(
                 MAX_NAMESPACE_CACHE_ENTRIES,
             ))),
             stream_memory_budget: Arc::new(Semaphore::new(DEFAULT_STREAM_MEMORY_BUDGET_BYTES)),
@@ -172,31 +165,16 @@ impl CompositeStore {
         &self.blobs
     }
 
-    /// Resolves and caches the immutable `project_id` bound to `repo_id`, returning
-    /// `StoreError::RepoNotFound` when `repo_id` has not been registered.
+    /// Resolves the `project_id` bound to `repo_id` directly from `MetadataStore`, returning
+    /// `StoreError::RepoNotFound` when `repo_id` is not registered.
     pub async fn resolve_repo_project(&self, repo_id: &str, action: &str) -> StoreResult<String> {
-        if let Some(cached) = self
-            .repo_projects
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(repo_id)
-            .cloned()
-        {
-            return Ok(cached);
-        }
-        let project_id = self
-            .metadata
+        self.metadata
             .get_repo_project_id(repo_id)
             .await?
             .ok_or_else(|| StoreError::RepoNotFound {
                 repo_id: repo_id.to_string(),
                 action: action.to_string(),
-            })?;
-        self.repo_projects
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(repo_id.to_string(), project_id.clone());
-        Ok(project_id)
+            })
     }
 
     /// Resolves `namespace_id` for `BackendService` object operations: checks `Projects`
@@ -215,15 +193,6 @@ impl CompositeStore {
         {
             return Ok(namespace_id.to_string());
         }
-        if let Some(cached) = self
-            .repo_projects
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(namespace_id)
-            .cloned()
-        {
-            return Ok(cached);
-        }
         if self.metadata.is_project_registered(namespace_id).await? {
             self.registered_projects
                 .write()
@@ -237,6 +206,21 @@ impl CompositeStore {
     pub async fn ensure_repo_registered(&self, repo_id: &str, action: &str) -> StoreResult<()> {
         let _ = self.resolve_repo_project(repo_id, action).await?;
         Ok(())
+    }
+
+    pub async fn verify_repo_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+        action: &str,
+    ) -> StoreResult<()> {
+        let actual = self.metadata.get_repo_project_id(repo_id).await?;
+        verify_optional_repo_project(
+            repo_id,
+            actual.as_deref(),
+            Some(expected_project_id),
+            action,
+        )
     }
 
     pub async fn register_project(&self, project_id: &str, name: Option<&str>) -> StoreResult<()> {
@@ -266,10 +250,6 @@ impl CompositeStore {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(bound_project.clone(), ());
-        self.repo_projects
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(repo_id.to_string(), bound_project.clone());
         Ok(bound_project)
     }
 
@@ -277,5 +257,23 @@ impl CompositeStore {
         self.register_repo_in_project(repo_id, None, name)
             .await
             .map(|_| ())
+    }
+
+    pub async fn delete_repository(
+        &self,
+        repo_id: &str,
+        expected_project_id: Option<&str>,
+    ) -> StoreResult<bool> {
+        let res = self
+            .metadata
+            .delete_repository(repo_id, expected_project_id)
+            .await;
+        if !matches!(
+            res,
+            Err(StoreError::FailedPrecondition(_) | StoreError::InvalidArgument(_))
+        ) {
+            crate::jj_lib_adapters::invalidate_repo_operation_cache(self, repo_id);
+        }
+        res
     }
 }

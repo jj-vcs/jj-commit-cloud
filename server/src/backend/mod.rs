@@ -46,6 +46,7 @@ use cc_common::backend::*;
 use crate::hash_utils::{
     compute_git_tree_hash, try_compute_git_blob_hash, verify_or_compute_git_commit_hash,
 };
+use crate::metrics::ServerMetrics;
 use crate::store::{ChangePrefixResolution, CompositeStore, IdPrefixResolution, StoreError};
 
 const MAX_IDENTIFIER_LEN: usize = 128;
@@ -109,13 +110,19 @@ pub(crate) fn validate_digest_len(
 pub struct CommitCloudBackendService {
     store: Arc<CompositeStore>,
     write_stream_spill_threshold: usize,
+    metrics: ServerMetrics,
 }
 
 impl CommitCloudBackendService {
     pub fn new(store: Arc<CompositeStore>) -> Self {
+        Self::with_metrics(store, ServerMetrics::new())
+    }
+
+    pub fn with_metrics(store: Arc<CompositeStore>, metrics: ServerMetrics) -> Self {
         Self {
             store,
             write_stream_spill_threshold: DEFAULT_WRITE_STREAM_SPILL_THRESHOLD_BYTES,
+            metrics,
         }
     }
 
@@ -259,6 +266,31 @@ impl BackendService for CommitCloudBackendService {
         }))
     }
 
+    async fn delete_repository(
+        &self,
+        request: tonic::Request<DeleteRepositoryRequest>,
+    ) -> Result<tonic::Response<DeleteRepositoryResponse>, tonic::Status> {
+        let req = request.into_inner();
+        validate_identifier(&req.repo_id, "repo_id")?;
+        let expected_project_id = match req.project_id.as_deref() {
+            Some(raw) => {
+                validate_identifier(raw, "project_id")?;
+                Some(raw)
+            }
+            None => None,
+        };
+        info!(
+            "Deleting repository: {} (expected project: {:?})",
+            req.repo_id, expected_project_id
+        );
+        let existed = self
+            .store
+            .delete_repository(&req.repo_id, expected_project_id)
+            .await?;
+        self.metrics.record_repository_deleted(&req.repo_id);
+        Ok(tonic::Response::new(DeleteRepositoryResponse { existed }))
+    }
+
     async fn read_commit(
         &self,
         request: tonic::Request<ReadCommitRequest>,
@@ -339,6 +371,7 @@ impl BackendService for CommitCloudBackendService {
         self.store
             .put_commit(&req.project_id, &commit_id, &commit)
             .await?;
+        self.metrics.record_commit();
         Ok(tonic::Response::new(WriteCommitResponse { commit_id }))
     }
 

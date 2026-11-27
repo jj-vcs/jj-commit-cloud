@@ -478,12 +478,14 @@ async fn test_cross_reconcile_caches_retain_commits_and_operations() {
     let key_op = (
         store_cache_key(&store),
         "cache-repo".to_string(),
+        "cache-repo".to_string(),
         jj_op_id.clone(),
     );
     assert!(
         OPERATION_CACHE
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .entries
             .get(&key_op)
             .is_some()
     );
@@ -537,6 +539,15 @@ impl MetadataStore for FaultyCommitMeta {
     ) -> crate::store::StoreResult<String> {
         self.inner
             .register_repo_in_project(repo_id, project_id, name)
+            .await
+    }
+    async fn delete_repository(
+        &self,
+        repo_id: &str,
+        expected_project_id: Option<&str>,
+    ) -> crate::store::StoreResult<bool> {
+        self.inner
+            .delete_repository(repo_id, expected_project_id)
             .await
     }
     async fn get_commit(
@@ -731,6 +742,24 @@ impl MetadataStore for FaultyCommitMeta {
     ) -> crate::store::StoreResult<()> {
         self.inner.put_operation(repo_id, op_id, op).await
     }
+    async fn put_operation_for_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+        op_id: &[u8],
+        op: &ProtoOperation,
+        require_dependencies_exist: bool,
+    ) -> crate::store::StoreResult<()> {
+        self.inner
+            .put_operation_for_project(
+                repo_id,
+                expected_project_id,
+                op_id,
+                op,
+                require_dependencies_exist,
+            )
+            .await
+    }
     async fn resolve_operation_id_prefix(
         &self,
         repo_id: &str,
@@ -756,6 +785,17 @@ impl MetadataStore for FaultyCommitMeta {
     ) -> crate::store::StoreResult<()> {
         self.inner.put_view(repo_id, view_id, view).await
     }
+    async fn put_view_for_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+        view_id: &[u8],
+        view: &ProtoView,
+    ) -> crate::store::StoreResult<()> {
+        self.inner
+            .put_view_for_project(repo_id, expected_project_id, view_id, view)
+            .await
+    }
     async fn get_op_heads(
         &self,
         repo_id: &str,
@@ -770,6 +810,24 @@ impl MetadataStore for FaultyCommitMeta {
     ) -> crate::store::StoreResult<Vec<crate::store::OpId>> {
         self.inner.update_op_heads(repo_id, old_ids, new_id).await
     }
+    async fn update_op_heads_for_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+        old_head_ids: &[Vec<u8>],
+        new_head_id: &[u8],
+        require_op_exists: bool,
+    ) -> crate::store::StoreResult<Vec<crate::store::OpId>> {
+        self.inner
+            .update_op_heads_for_project(
+                repo_id,
+                expected_project_id,
+                old_head_ids,
+                new_head_id,
+                require_op_exists,
+            )
+            .await
+    }
     async fn publish_operation_atomic(
         &self,
         repo_id: &str,
@@ -783,6 +841,31 @@ impl MetadataStore for FaultyCommitMeta {
             .publish_operation_atomic(repo_id, view_id, view, op_id, op, old_ids)
             .await
     }
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_operation_for_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+        view_id: &[u8],
+        view: &ProtoView,
+        op_id: &[u8],
+        op: &ProtoOperation,
+        old_op_head_ids: &[Vec<u8>],
+        require_dependencies_exist: bool,
+    ) -> crate::store::StoreResult<Vec<crate::store::OpId>> {
+        self.inner
+            .publish_operation_for_project(
+                repo_id,
+                expected_project_id,
+                view_id,
+                view,
+                op_id,
+                op,
+                old_op_head_ids,
+                require_dependencies_exist,
+            )
+            .await
+    }
     async fn compare_and_swap_op_heads(
         &self,
         repo_id: &str,
@@ -791,6 +874,24 @@ impl MetadataStore for FaultyCommitMeta {
     ) -> crate::store::StoreResult<()> {
         self.inner
             .compare_and_swap_op_heads(repo_id, expected_old_ids, new_id)
+            .await
+    }
+    async fn update_op_heads_cas_for_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+        expected_exact_heads: &[Vec<u8>],
+        new_head_id: &[u8],
+        require_op_exists: bool,
+    ) -> crate::store::StoreResult<()> {
+        self.inner
+            .update_op_heads_cas_for_project(
+                repo_id,
+                expected_project_id,
+                expected_exact_heads,
+                new_head_id,
+                require_op_exists,
+            )
             .await
     }
     async fn get_workspace(
@@ -810,6 +911,22 @@ impl MetadataStore for FaultyCommitMeta {
     ) -> crate::store::StoreResult<()> {
         self.inner
             .put_workspace_cas(workspace, expected_operation_id)
+            .await
+    }
+    async fn put_workspace_cas_for_project(
+        &self,
+        expected_project_id: &str,
+        workspace: &cc_common::workspace::WorkspaceState,
+        expected_operation_id: Option<&[u8]>,
+        require_operation_exists: bool,
+    ) -> crate::store::StoreResult<()> {
+        self.inner
+            .put_workspace_cas_for_project(
+                expected_project_id,
+                workspace,
+                expected_operation_id,
+                require_operation_exists,
+            )
             .await
     }
     async fn list_workspaces(
@@ -985,7 +1102,6 @@ async fn test_server_backend_symlink_nul_rejection() {
         other => panic!("expected BackendError::Other(Corruption), got {other:?}"),
     }
 }
-
 #[tokio::test]
 async fn test_server_index_is_ancestor_heads_and_common_ancestors_walk_budgets() {
     let meta = Arc::new(MemoryMetadataStore::new());
@@ -1136,4 +1252,167 @@ async fn test_server_index_is_ancestor_heads_and_common_ancestors_walk_budgets()
     // First walk visits c1 and c0 (2 aggregate visits); second visits c1 (3rd) and c0 (4th -> err).
     assert!(!idx_a.is_ancestor(&jj_c_side, &jj_c1).await.unwrap());
     assert_budget_err(idx_b.is_ancestor(&jj_c_side, &jj_c1).await.unwrap_err(), 3);
+}
+
+#[tokio::test]
+async fn test_server_op_store_operation_cache_invalidated_on_delete_and_scoped_by_project() {
+    let meta = Arc::new(MemoryMetadataStore::new());
+    let store = Arc::new(CompositeStore::new(
+        meta.clone(),
+        Arc::new(MemoryBlobStore::new()),
+    ));
+    store.register_project("proj-a", None).await.unwrap();
+    store.register_project("proj-b", None).await.unwrap();
+    store
+        .register_repo_in_project("cache-del-repo", Some("proj-a"), None)
+        .await
+        .unwrap();
+
+    let op_proto = ProtoOperation {
+        view_id: cc_common::ROOT_VIEW_ID_BYTES.to_vec(),
+        parents: vec![cc_common::ROOT_OPERATION_ID_BYTES.to_vec()],
+        metadata: None,
+        commit_predecessors: Vec::new(),
+        commit_predecessors_set: true,
+    };
+    let op_id_bytes = hash_operation(&op_proto).unwrap();
+    let jj_op_id = OperationId::from_bytes(&op_id_bytes);
+    let root_op_id = OperationId::from_bytes(&cc_common::ROOT_OPERATION_ID_BYTES);
+    store
+        .put_operation("cache-del-repo", &op_id_bytes, &op_proto)
+        .await
+        .unwrap();
+
+    // Warm OPERATION_CACHE with both a persisted operation and the synthesized root operation.
+    let unpinned = ServerOpStore::new(store.clone(), "cache-del-repo".to_string());
+    let pinned_a = ServerOpStore::with_project_id(
+        store.clone(),
+        "cache-del-repo".to_string(),
+        "proj-a".to_string(),
+    );
+    unpinned.read_operation(&jj_op_id).await.unwrap();
+    unpinned.read_operation(&root_op_id).await.unwrap();
+    pinned_a.read_operation(&jj_op_id).await.unwrap();
+
+    // A rejected DeleteRepository (mismatched project_id -> FailedPrecondition) must NOT
+    // evict this repository's cached entries from `OPERATION_CACHE`.
+    let cache_key = (
+        store_cache_key(&store),
+        "cache-del-repo".to_string(),
+        "proj-a".to_string(),
+        jj_op_id.clone(),
+    );
+    assert!(matches!(
+        store
+            .delete_repository("cache-del-repo", Some("proj-b"))
+            .await,
+        Err(StoreError::FailedPrecondition(_))
+    ));
+    {
+        let cache = OPERATION_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(cache.entries.get(&cache_key).is_some());
+    }
+
+    // After DeleteRepository, neither unpinned nor pinned ServerOpStore may serve cached
+    // operations or cached root ops.
+    assert!(
+        store
+            .delete_repository("cache-del-repo", Some("proj-a"))
+            .await
+            .unwrap()
+    );
+    for (label, res) in [
+        ("unpinned op", unpinned.read_operation(&jj_op_id).await),
+        ("unpinned root", unpinned.read_operation(&root_op_id).await),
+        ("pinned op", pinned_a.read_operation(&jj_op_id).await),
+        ("pinned root", pinned_a.read_operation(&root_op_id).await),
+    ] {
+        let err = res.expect_err(&format!("{label} must fail after DeleteRepository"));
+        match err {
+            OpStoreError::Other(source) => {
+                assert!(
+                    matches!(
+                        source.downcast_ref::<StoreError>(),
+                        Some(StoreError::RepoNotFound { .. })
+                    ),
+                    "{label}: expected RepoNotFound, got {source:?}"
+                );
+            }
+            other => {
+                panic!("{label}: expected OpStoreError::Other(RepoNotFound), got {other:?}")
+            }
+        }
+    }
+
+    // Re-registering under the same project must still NOT serve the deleted cached op.
+    store
+        .register_repo_in_project("cache-del-repo", Some("proj-a"), None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        unpinned.read_operation(&jj_op_id).await,
+        Err(OpStoreError::ObjectNotFound { .. })
+    ));
+    assert!(matches!(
+        pinned_a.read_operation(&jj_op_id).await,
+        Err(OpStoreError::ObjectNotFound { .. })
+    ));
+
+    // Even if another replica deletes directly in MetadataStore (without invoking local
+    // CompositeStore::delete_repository) and re-registers under proj-b, project_id scoping in
+    // OPERATION_CACHE prevents serving proj-a's cached operation to proj-b.
+    store
+        .put_operation("cache-del-repo", &op_id_bytes, &op_proto)
+        .await
+        .unwrap();
+    unpinned.read_operation(&jj_op_id).await.unwrap();
+
+    assert!(
+        meta.delete_repository("cache-del-repo", Some("proj-a"))
+            .await
+            .unwrap()
+    );
+    meta.register_repo_in_project("cache-del-repo", "proj-b", None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        unpinned.read_operation(&jj_op_id).await,
+        Err(OpStoreError::ObjectNotFound { .. })
+    ));
+    let pinned_b = ServerOpStore::with_project_id(
+        store.clone(),
+        "cache-del-repo".to_string(),
+        "proj-b".to_string(),
+    );
+    assert!(matches!(
+        pinned_b.read_operation(&jj_op_id).await,
+        Err(OpStoreError::ObjectNotFound { .. })
+    ));
+
+    // ServerBackend::with_project_id stays strictly pinned to proj-a even after
+    // cache-del-repo is re-bound to proj-b, never writing proj-a's objects into proj-b.
+    let pinned_backend = ServerBackend::with_project_id(
+        store.clone(),
+        "cache-del-repo".to_string(),
+        "proj-a".to_string(),
+    );
+    let mut content = futures::io::Cursor::new(b"pinned proj-a payload".to_vec());
+    let file_id = pinned_backend
+        .write_file(RepoPath::root(), &mut content)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_file_range("proj-a", file_id.as_bytes(), 0, None)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"pinned proj-a payload"
+    );
+    assert!(matches!(
+        store
+            .get_file_range("proj-b", file_id.as_bytes(), 0, None)
+            .await,
+        Err(StoreError::ObjectNotFound { .. })
+    ));
 }

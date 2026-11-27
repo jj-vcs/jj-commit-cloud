@@ -973,6 +973,12 @@ async fn read_tree_giant_tree_coalesced_waiters_fail_fast_without_redundant_full
         ) -> Result<Response<RegisterRepositoryResponse>, Status> {
             unused()
         }
+        async fn delete_repository(
+            &self,
+            _: Request<DeleteRepositoryRequest>,
+        ) -> Result<Response<DeleteRepositoryResponse>, Status> {
+            unused()
+        }
         async fn read_commit(
             &self,
             _: Request<ReadCommitRequest>,
@@ -1312,6 +1318,12 @@ async fn read_tree_unpaginated_waiter_coalesced_on_paginated_leader_retries_afte
             &self,
             _: Request<RegisterRepositoryRequest>,
         ) -> Result<Response<RegisterRepositoryResponse>, Status> {
+            unused()
+        }
+        async fn delete_repository(
+            &self,
+            _: Request<DeleteRepositoryRequest>,
+        ) -> Result<Response<DeleteRepositoryResponse>, Status> {
             unused()
         }
         async fn read_commit(

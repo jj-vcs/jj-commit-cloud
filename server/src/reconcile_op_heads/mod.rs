@@ -16,10 +16,12 @@
 //! tree merge algebra against [`CompositeStore`].
 //!
 //! # Authority and Crash-Safety Ordering
-//! `reconcile_repo_op_heads_proto` writes the merged `View` and `Operation` through
-//! [`ServerOpStore`] before atomically swapping the validated head snapshot via pinned
-//! [`ServerOpHeadsStore::with_expected_heads`] CAS. Server-authored merge operations carry
-//! `"jj-cc-server"` hostname and username metadata.
+//! `reconcile_repo_op_heads_proto` resolves `project_id` once per attempt alongside `heads` and
+//! pins all adapters (`ServerBackend`, `ServerOpStore`, `ServerOpHeadsStore`, `ServerIndex`,
+//! `ServerIndexStore`) to that `project_id`, writing the merged `View` and `Operation`
+//! through project-pinned `*_for_project` calls before atomically swapping the validated
+//! head snapshot via [`ServerOpHeadsStore::with_expected_heads_for_project`] CAS. Server-authored
+//! merge operations carry `"jj-cc-server"` hostname and username metadata.
 //!
 //! # Concurrency and Merge Invariants
 //! In-process callers targeting the same `repo_id` serialize behind a per-repository
@@ -127,6 +129,18 @@ fn single_head_response(
     })
 }
 
+pub async fn reconcile_repo_op_heads_proto_with_metrics(
+    store: Arc<CompositeStore>,
+    repo_id: &str,
+    metrics: Option<&crate::metrics::ServerMetrics>,
+) -> Result<cc_common::op_store::ReconcileOpHeadsResponse, tonic::Status> {
+    let response = reconcile_repo_op_heads_proto(store, repo_id).await?;
+    if let Some(m) = metrics {
+        m.record_reconcile_op_heads(response.client_resolution_required);
+    }
+    Ok(response)
+}
+
 pub async fn reconcile_repo_op_heads_proto(
     store: Arc<CompositeStore>,
     repo_id: &str,
@@ -159,6 +173,9 @@ pub(crate) async fn reconcile_repo_op_heads_with_limits(
 
     let mut attempt = 0usize;
     loop {
+        let project_id = store
+            .resolve_repo_project(repo_id, "reconciling op heads")
+            .await?;
         let heads = store.get_op_heads(repo_id).await?;
         if heads.len() <= 1 {
             return single_head_response(repo_id, heads);
@@ -167,22 +184,26 @@ pub(crate) async fn reconcile_repo_op_heads_with_limits(
 
         let store_clone = store.clone();
         let repo_id_owned = repo_id.to_string();
+        let project_id_owned = project_id.clone();
 
         let handle = tokio::task::spawn_blocking(move || {
             pollster::block_on(async move {
-                let op_store: Arc<dyn OpStore> = Arc::new(ServerOpStore::new(
+                let op_store: Arc<dyn OpStore> = Arc::new(ServerOpStore::with_project_id(
                     store_clone.clone(),
                     repo_id_owned.clone(),
+                    project_id_owned.clone(),
                 ));
                 let walk_budget = IndexWalkBudget::new(walk_limits);
-                let index = ServerIndex::with_budget(
+                let index = ServerIndex::with_project_id_and_budget(
                     store_clone.clone(),
                     repo_id_owned.clone(),
+                    project_id_owned.clone(),
                     walk_budget.clone(),
                 );
                 if requires_client_rewrite_resolution(
                     &store_clone,
                     &repo_id_owned,
+                    &project_id_owned,
                     &op_store,
                     &index,
                     &heads,
@@ -197,23 +218,30 @@ pub(crate) async fn reconcile_repo_op_heads_with_limits(
                     status: tonic::Status::internal(format!("failed to initialize signer: {e}")),
                     transient: false,
                 })?;
-                let index_store = Arc::new(ServerIndexStore::with_budget(
+                let index_store = Arc::new(ServerIndexStore::with_project_id_and_budget(
                     store_clone.clone(),
                     repo_id_owned.clone(),
+                    project_id_owned.clone(),
                     walk_budget,
                 ));
                 let submodule_store = Arc::new(ServerSubmoduleStore);
 
-                let server_backend = Box::new(ServerBackend::new(
+                let server_backend = Box::new(ServerBackend::with_project_id(
                     store_clone.clone(),
                     repo_id_owned.clone(),
+                    project_id_owned.clone(),
                 ));
                 let jj_store = JjStore::new(server_backend, signer, merge_options.clone());
-                // Pin the validated `heads` snapshot so `RepoLoader::load_at_head()` merges only
-                // these heads and atomically CAS-swaps the full snapshot via `compare_and_swap_op_heads`.
-                let op_heads_store: Arc<dyn OpHeadsStore> = Arc::new(
-                    ServerOpHeadsStore::with_expected_heads(store_clone, repo_id_owned, heads),
-                );
+                // Pin both `project_id` and the validated `heads` snapshot so
+                // `RepoLoader::load_at_head()` merges strictly within `project_id` and atomically
+                // CAS-swaps the full snapshot via `compare_and_swap_op_heads_for_project`.
+                let op_heads_store: Arc<dyn OpHeadsStore> =
+                    Arc::new(ServerOpHeadsStore::with_expected_heads_for_project(
+                        store_clone,
+                        repo_id_owned,
+                        project_id_owned,
+                        heads,
+                    ));
 
                 let repo_loader = RepoLoader::new(
                     user_settings.clone(),
@@ -366,6 +394,7 @@ async fn collect_exclusive_commits(
 async fn requires_client_rewrite_resolution(
     store: &CompositeStore,
     repo_id: &str,
+    project_id: &str,
     op_store: &Arc<dyn OpStore>,
     index: &ServerIndex,
     raw_head_ids: &[Vec<u8>],
@@ -401,11 +430,6 @@ async fn requires_client_rewrite_resolution(
     if filtered_vec.len() > MAX_DIVERGENT_OP_HEADS {
         return Ok(true);
     }
-
-    let project_id = store
-        .resolve_repo_project(repo_id, "reconciling op heads")
-        .await
-        .map_err(ReconcileError::from_store)?;
 
     let mut head_views = Vec::with_capacity(filtered_vec.len());
     for h in &filtered_vec {
@@ -476,7 +500,7 @@ async fn requires_client_rewrite_resolution(
             for bv in &pair_base_views {
                 let Some(removed) = collect_exclusive_commits(
                     store,
-                    &project_id,
+                    project_id,
                     index,
                     bv.heads(),
                     head_views[i].heads(),
@@ -496,7 +520,7 @@ async fn requires_client_rewrite_resolution(
             for bv in &pair_base_views {
                 let Some(added_in_j) = collect_exclusive_commits(
                     store,
-                    &project_id,
+                    project_id,
                     index,
                     other_view.heads(),
                     bv.heads(),

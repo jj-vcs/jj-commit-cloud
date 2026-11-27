@@ -75,6 +75,12 @@ impl BackendService for UnaryOnlyBackendServer {
             project_id: r.project_id,
         }))
     }
+    async fn delete_repository(
+        &self,
+        _: Request<DeleteRepositoryRequest>,
+    ) -> Result<Response<DeleteRepositoryResponse>, Status> {
+        unimpl()
+    }
     async fn read_commit(
         &self,
         _: Request<ReadCommitRequest>,
@@ -1036,6 +1042,12 @@ impl BackendService for MockTreeAndStreamBackend {
             project_id: r.project_id,
         }))
     }
+    async fn delete_repository(
+        &self,
+        _: Request<DeleteRepositoryRequest>,
+    ) -> Result<Response<DeleteRepositoryResponse>, Status> {
+        unimpl()
+    }
     async fn read_commit(
         &self,
         _: Request<ReadCommitRequest>,
@@ -1557,6 +1569,12 @@ fn test_read_file_mid_stream_not_found_maps_to_object_not_found() {
                 project_id: r.project_id,
             }))
         }
+        async fn delete_repository(
+            &self,
+            _: Request<cc_common::backend::DeleteRepositoryRequest>,
+        ) -> Result<Response<cc_common::backend::DeleteRepositoryResponse>, Status> {
+            unimpl()
+        }
         async fn read_commit(
             &self,
             _: Request<ReadCommitRequest>,
@@ -1701,6 +1719,12 @@ impl BackendService for IntegrityMockBackend {
             repo_id: r.repo_id.unwrap_or_else(|| "repo-integrity".to_string()),
             project_id: r.project_id,
         }))
+    }
+    async fn delete_repository(
+        &self,
+        _: Request<cc_common::backend::DeleteRepositoryRequest>,
+    ) -> Result<Response<cc_common::backend::DeleteRepositoryResponse>, Status> {
+        unimpl()
     }
     async fn read_commit(
         &self,

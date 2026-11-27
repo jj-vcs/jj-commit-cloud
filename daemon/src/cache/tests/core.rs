@@ -24,7 +24,8 @@ use prost::Message;
 use tokio::sync::watch;
 
 use super::super::l1::{
-    ByteBoundedLru, Flight, FlightOutcome, L1_ENTRY_OVERHEAD_BYTES, L1Key, l1_entry_weight,
+    ByteBoundedLru, Flight, FlightOutcome, L1_ENTRY_OVERHEAD_BYTES, L1Key, L1Partition,
+    l1_entry_weight,
 };
 use super::super::l2::l2_payload_is_valid;
 use super::super::{
@@ -166,7 +167,12 @@ async fn singleflight_waiter_sees_result_published_before_it_starts_waiting() {
     let cache = TwoTierCache::new(dir.path().to_path_buf(), 1024 * 1024).unwrap();
     let scope = CacheScope::new("http://127.0.0.1:8080", "repo-alpha");
     let id = vec![0x11; 20];
-    let key = (scope.scope_hex.clone(), ObjectKind::Tree, id.clone());
+    let key = (
+        cache.purge_epoch(),
+        scope.scope_hex.clone(),
+        ObjectKind::Tree,
+        id.clone(),
+    );
 
     let Flight::Leader(leader) = cache.join_flight(&key) else {
         panic!("first caller leads")
@@ -267,7 +273,12 @@ async fn singleflight_waiters_retry_with_their_own_fetch_after_leader_failure() 
     let cache = Arc::new(TwoTierCache::new(dir.path().to_path_buf(), 1024 * 1024).unwrap());
     let scope = CacheScope::new("http://127.0.0.1:8080", "repo-alpha");
     let id = vec![0x22; 20];
-    let key = (scope.scope_hex.clone(), ObjectKind::Tree, id.clone());
+    let key = (
+        cache.purge_epoch(),
+        scope.scope_hex.clone(),
+        ObjectKind::Tree,
+        id.clone(),
+    );
 
     let Flight::Leader(leader) = cache.join_flight(&key) else {
         panic!("test leads")
@@ -587,9 +598,7 @@ async fn empty_oversized_and_directory_paths_are_rejected_across_public_methods(
 
     // Directories planted at valid marker or blob paths must never pass `.is_file()` checks.
     let valid_id = vec![0x33; 20];
-    let marker_path = cache
-        .inner
-        .scoped_path(scope.scope_hex(), ObjectKind::File, &valid_id);
+    let marker_path = cache.inner.scoped_path(&scope, ObjectKind::File, &valid_id);
     fs::create_dir_all(&marker_path).unwrap();
     assert!(!cache.is_authorized(&scope, ObjectKind::File, &valid_id));
 
@@ -847,7 +856,13 @@ async fn validation_rejects_nul_symlinks_partial_trees_and_mismatched_ids() {
 #[test]
 fn byte_bounded_lru_enforces_zero_budget_and_key_overhead() {
     let mut zero_lru = ByteBoundedLru::new(0);
-    let key: L1Key = ("u".repeat(64), ObjectKind::File, vec![0x01; 20]);
+    let key: L1Key = (
+        L1Partition::Shared {
+            upstream_hex: "u".repeat(64),
+        },
+        ObjectKind::File,
+        vec![0x01; 20],
+    );
     assert!(!zero_lru.put(key.clone(), Bytes::new()));
     assert_eq!(zero_lru.map.len(), 0);
     assert_eq!(zero_lru.current_bytes, 0);
@@ -856,7 +871,13 @@ fn byte_bounded_lru_enforces_zero_budget_and_key_overhead() {
     assert_eq!(entry_weight, 64 + 20 + L1_ENTRY_OVERHEAD_BYTES);
     // Budget fits exactly one empty-payload entry, so inserting a second must evict the first.
     let mut tight_lru = ByteBoundedLru::new(entry_weight);
-    let key2: L1Key = ("u".repeat(64), ObjectKind::File, vec![0x02; 20]);
+    let key2: L1Key = (
+        L1Partition::Shared {
+            upstream_hex: "u".repeat(64),
+        },
+        ObjectKind::File,
+        vec![0x02; 20],
+    );
     assert!(tight_lru.put(key.clone(), Bytes::new()));
     assert_eq!(tight_lru.map.len(), 1);
     assert_eq!(tight_lru.current_bytes, entry_weight);

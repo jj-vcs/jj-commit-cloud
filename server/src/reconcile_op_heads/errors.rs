@@ -248,6 +248,7 @@ pub(super) fn is_transient_store_error(err: &StoreError) -> bool {
         | StoreError::ProjectAlreadyExists(_)
         | StoreError::ObjectNotFound { .. }
         | StoreError::MissingDependency { .. }
+        | StoreError::FailedPrecondition(_)
         | StoreError::InvalidArgument(_)
         | StoreError::OutOfRange(_)
         | StoreError::Corruption(_)

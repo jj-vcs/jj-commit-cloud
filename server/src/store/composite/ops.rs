@@ -133,11 +133,24 @@ impl CompositeStore {
 
     pub async fn put_view(&self, repo_id: &str, view_id: &[u8], view: &View) -> StoreResult<()> {
         let project_id = self.resolve_repo_project(repo_id, "writing views").await?;
+        self.put_view_for_project(repo_id, &project_id, view_id, view)
+            .await
+    }
+
+    pub async fn put_view_for_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+        view_id: &[u8],
+        view: &View,
+    ) -> StoreResult<()> {
         if self.config.validate_dependencies {
-            self.validate_view_and_op_commits(&project_id, Some(view), None)
+            self.validate_view_and_op_commits(expected_project_id, Some(view), None)
                 .await?;
         }
-        self.metadata.put_view(repo_id, view_id, view).await
+        self.metadata
+            .put_view_for_project(repo_id, expected_project_id, view_id, view)
+            .await
     }
 
     pub async fn get_view(&self, repo_id: &str, view_id: &[u8]) -> StoreResult<Option<View>> {
@@ -152,6 +165,28 @@ impl CompositeStore {
         self.metadata.has_view(repo_id, view_id).await
     }
 
+    pub async fn get_view_for_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+        view_id: &[u8],
+    ) -> StoreResult<Option<View>> {
+        self.verify_repo_project(repo_id, expected_project_id, "reading views")
+            .await?;
+        self.metadata.get_view(repo_id, view_id).await
+    }
+
+    pub async fn has_view_for_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+        view_id: &[u8],
+    ) -> StoreResult<bool> {
+        self.verify_repo_project(repo_id, expected_project_id, "checking views")
+            .await?;
+        self.metadata.has_view(repo_id, view_id).await
+    }
+
     pub async fn put_operation(
         &self,
         repo_id: &str,
@@ -161,6 +196,17 @@ impl CompositeStore {
         let project_id = self
             .resolve_repo_project(repo_id, "writing operations")
             .await?;
+        self.put_operation_for_project(repo_id, &project_id, op_id, op)
+            .await
+    }
+
+    pub async fn put_operation_for_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+        op_id: &[u8],
+        op: &Operation,
+    ) -> StoreResult<()> {
         if self.config.validate_dependencies {
             if op.view_id.as_slice() != cc_common::ROOT_VIEW_ID_BYTES
                 && self
@@ -169,17 +215,43 @@ impl CompositeStore {
                     .await?
                     .is_none()
             {
+                let actual = self.metadata.get_repo_project_id(repo_id).await?;
+                verify_optional_repo_project(
+                    repo_id,
+                    actual.as_deref(),
+                    Some(expected_project_id),
+                    "writing operations",
+                )?;
                 return Err(StoreError::MissingDependency {
                     parent_kind: "operation",
                     missing_kind: "view",
                     id_hex: hex::encode(&op.view_id),
                 });
             }
-            self.validate_operation_parents(repo_id, op).await?;
-            self.validate_view_and_op_commits(&project_id, None, Some(op))
+            if let Err(err) = self.validate_operation_parents(repo_id, op).await {
+                if matches!(err, StoreError::MissingDependency { .. }) {
+                    let actual = self.metadata.get_repo_project_id(repo_id).await?;
+                    verify_optional_repo_project(
+                        repo_id,
+                        actual.as_deref(),
+                        Some(expected_project_id),
+                        "writing operations",
+                    )?;
+                }
+                return Err(err);
+            }
+            self.validate_view_and_op_commits(expected_project_id, None, Some(op))
                 .await?;
         }
-        self.metadata.put_operation(repo_id, op_id, op).await
+        self.metadata
+            .put_operation_for_project(
+                repo_id,
+                expected_project_id,
+                op_id,
+                op,
+                self.config.validate_dependencies,
+            )
+            .await
     }
 
     pub async fn get_operation(
@@ -192,6 +264,22 @@ impl CompositeStore {
         self.metadata.get_operation(repo_id, op_id).await
     }
 
+    pub async fn get_operation_for_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+        op_id: &[u8],
+    ) -> StoreResult<Option<Operation>> {
+        let actual = self.metadata.get_repo_project_id(repo_id).await?;
+        verify_optional_repo_project(
+            repo_id,
+            actual.as_deref(),
+            Some(expected_project_id),
+            "reading operations",
+        )?;
+        self.metadata.get_operation(repo_id, op_id).await
+    }
+
     pub async fn resolve_operation_prefix(
         &self,
         repo_id: &str,
@@ -199,7 +287,32 @@ impl CompositeStore {
     ) -> StoreResult<IdPrefixResolution> {
         self.ensure_repo_registered(repo_id, "resolving operation prefixes")
             .await?;
+        self.resolve_operation_prefix_inner(repo_id, hex_prefix)
+            .await
+    }
 
+    pub async fn resolve_operation_prefix_for_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+        hex_prefix: &str,
+    ) -> StoreResult<IdPrefixResolution> {
+        let actual = self.metadata.get_repo_project_id(repo_id).await?;
+        verify_optional_repo_project(
+            repo_id,
+            actual.as_deref(),
+            Some(expected_project_id),
+            "resolving operation prefixes",
+        )?;
+        self.resolve_operation_prefix_inner(repo_id, hex_prefix)
+            .await
+    }
+
+    async fn resolve_operation_prefix_inner(
+        &self,
+        repo_id: &str,
+        hex_prefix: &str,
+    ) -> StoreResult<IdPrefixResolution> {
         let normalized = hex_prefix.to_ascii_lowercase();
         let Some((min_id, max_id)) =
             hex_prefix_byte_bounds(&normalized, cc_common::OPERATION_ID_LENGTH)?
@@ -228,13 +341,28 @@ impl CompositeStore {
     }
 
     pub async fn get_op_heads(&self, repo_id: &str) -> StoreResult<Vec<OpId>> {
-        self.ensure_repo_registered(repo_id, "requesting op heads")
-            .await?;
-        Ok(self
-            .metadata
+        self.metadata
             .get_op_heads(repo_id)
             .await?
-            .unwrap_or_else(|| vec![cc_common::ROOT_OPERATION_ID_BYTES.to_vec()]))
+            .ok_or_else(|| StoreError::RepoNotFound {
+                repo_id: repo_id.to_string(),
+                action: "requesting op heads".to_string(),
+            })
+    }
+
+    pub async fn get_op_heads_for_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+    ) -> StoreResult<Vec<OpId>> {
+        let actual = self.metadata.get_repo_project_id(repo_id).await?;
+        verify_optional_repo_project(
+            repo_id,
+            actual.as_deref(),
+            Some(expected_project_id),
+            "requesting op heads",
+        )?;
+        self.get_op_heads(repo_id).await
     }
 
     pub async fn update_op_heads(
@@ -248,23 +376,33 @@ impl CompositeStore {
                 "new_op_head_id must not be ROOT_OPERATION_ID".to_string(),
             ));
         }
-        self.ensure_repo_registered(repo_id, "updating op heads")
+        let project_id = self
+            .resolve_repo_project(repo_id, "updating op heads")
             .await?;
-        if self.config.validate_dependencies
-            && self
-                .metadata
-                .get_operation(repo_id, new_id)
-                .await?
-                .is_none()
-        {
-            return Err(StoreError::MissingDependency {
-                parent_kind: "op_heads",
-                missing_kind: "operation",
-                id_hex: hex::encode(new_id),
-            });
+        self.update_op_heads_for_project(repo_id, &project_id, old_ids, new_id)
+            .await
+    }
+
+    pub async fn update_op_heads_for_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+        old_ids: &[Vec<u8>],
+        new_id: &[u8],
+    ) -> StoreResult<Vec<OpId>> {
+        if new_id == cc_common::ROOT_OPERATION_ID_BYTES {
+            return Err(StoreError::InvalidArgument(
+                "new_op_head_id must not be ROOT_OPERATION_ID".to_string(),
+            ));
         }
         self.metadata
-            .update_op_heads(repo_id, old_ids, new_id)
+            .update_op_heads_for_project(
+                repo_id,
+                expected_project_id,
+                old_ids,
+                new_id,
+                self.config.validate_dependencies,
+            )
             .await
     }
 
@@ -294,18 +432,45 @@ impl CompositeStore {
                     .await?
                     .is_none()
             {
+                let actual = self.metadata.get_repo_project_id(repo_id).await?;
+                verify_optional_repo_project(
+                    repo_id,
+                    actual.as_deref(),
+                    Some(&project_id),
+                    "publishing operation",
+                )?;
                 return Err(StoreError::MissingDependency {
                     parent_kind: "operation",
                     missing_kind: "view",
                     id_hex: hex::encode(&op.view_id),
                 });
             }
-            self.validate_operation_parents(repo_id, op).await?;
+            if let Err(err) = self.validate_operation_parents(repo_id, op).await {
+                if matches!(err, StoreError::MissingDependency { .. }) {
+                    let actual = self.metadata.get_repo_project_id(repo_id).await?;
+                    verify_optional_repo_project(
+                        repo_id,
+                        actual.as_deref(),
+                        Some(&project_id),
+                        "publishing operation",
+                    )?;
+                }
+                return Err(err);
+            }
             self.validate_view_and_op_commits(&project_id, Some(view), Some(op))
                 .await?;
         }
         self.metadata
-            .publish_operation_atomic(repo_id, view_id, view, op_id, op, old_ids)
+            .publish_operation_for_project(
+                repo_id,
+                &project_id,
+                view_id,
+                view,
+                op_id,
+                op,
+                old_ids,
+                self.config.validate_dependencies,
+            )
             .await
     }
 
@@ -320,25 +485,70 @@ impl CompositeStore {
                 "new_op_head_id must not be ROOT_OPERATION_ID".to_string(),
             ));
         }
-        self.ensure_repo_registered(repo_id, "comparing and swapping op heads")
+        let project_id = self
+            .resolve_repo_project(repo_id, "comparing and swapping op heads")
             .await?;
-        if self.config.validate_dependencies
-            && self
-                .metadata
-                .get_operation(repo_id, new_id)
-                .await?
-                .is_none()
-        {
-            return Err(StoreError::MissingDependency {
-                parent_kind: "op_heads",
-                missing_kind: "operation",
-                id_hex: hex::encode(new_id),
-            });
-        }
-        self.metadata
-            .compare_and_swap_op_heads(repo_id, expected_old_ids, new_id)
+        self.compare_and_swap_op_heads_for_project(repo_id, &project_id, expected_old_ids, new_id)
             .await
     }
+
+    pub async fn compare_and_swap_op_heads_for_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+        expected_old_ids: &[Vec<u8>],
+        new_id: &[u8],
+    ) -> StoreResult<()> {
+        if new_id == cc_common::ROOT_OPERATION_ID_BYTES {
+            return Err(StoreError::InvalidArgument(
+                "new_op_head_id must not be ROOT_OPERATION_ID".to_string(),
+            ));
+        }
+        self.metadata
+            .update_op_heads_cas_for_project(
+                repo_id,
+                expected_project_id,
+                expected_old_ids,
+                new_id,
+                self.config.validate_dependencies,
+            )
+            .await
+    }
+}
+
+pub(crate) fn collect_non_root_op_parents(op: &Operation) -> Vec<Vec<u8>> {
+    let mut seen: HashSet<&[u8]> = HashSet::with_capacity(op.parents.len());
+    let mut parents = Vec::with_capacity(op.parents.len());
+    for parent_id in &op.parents {
+        if parent_id.as_slice() != cc_common::ROOT_OPERATION_ID_BYTES
+            && seen.insert(parent_id.as_slice())
+        {
+            parents.push(parent_id.clone());
+        }
+    }
+    parents
+}
+
+pub(crate) fn verify_optional_repo_project(
+    repo_id: &str,
+    actual_project_id: Option<&str>,
+    expected_project_id: Option<&str>,
+    action: &str,
+) -> StoreResult<()> {
+    let Some(actual) = actual_project_id else {
+        return Err(StoreError::RepoNotFound {
+            repo_id: repo_id.to_string(),
+            action: action.to_string(),
+        });
+    };
+    if let Some(expected) = expected_project_id
+        && actual != expected
+    {
+        return Err(StoreError::FailedPrecondition(format!(
+            "repository '{repo_id}' belongs to project '{actual}', expected '{expected}'"
+        )));
+    }
+    Ok(())
 }
 
 pub fn op_heads_sets_equal(a: &[Vec<u8>], b: &[Vec<u8>]) -> bool {

@@ -88,6 +88,12 @@ impl BackendService for FileOnlyUpstream {
     ) -> Result<Response<RegisterRepositoryResponse>, Status> {
         unused()
     }
+    async fn delete_repository(
+        &self,
+        _: Request<DeleteRepositoryRequest>,
+    ) -> Result<Response<DeleteRepositoryResponse>, Status> {
+        unused()
+    }
     async fn read_commit(
         &self,
         _: Request<ReadCommitRequest>,
@@ -190,6 +196,10 @@ struct MockUpstreamState {
     last_write_file_stream_auth: Option<String>,
     last_write_file_stream_timeout: Option<String>,
     last_write_file_stream_had_upstream_header: bool,
+    register_repository_calls: usize,
+    delete_repository_calls: usize,
+    delete_repository_error: Option<tonic::Code>,
+    repos: std::collections::HashMap<String, String>,
     commits: std::collections::HashMap<(String, Vec<u8>), Commit>,
     trees: std::collections::HashMap<Vec<u8>, Vec<ReadTreeResponse>>,
     dynamic_trees: std::collections::HashMap<Vec<u8>, Vec<TreeEntry>>,
@@ -264,9 +274,57 @@ impl BackendService for MockUpstream {
     }
     async fn register_repository(
         &self,
-        _: Request<RegisterRepositoryRequest>,
+        request: Request<RegisterRepositoryRequest>,
     ) -> Result<Response<RegisterRepositoryResponse>, Status> {
-        unused()
+        self.check_auth(request.metadata())?;
+        let req = request.into_inner();
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.register_repository_calls += 1;
+        let repo_id = req
+            .repo_id
+            .unwrap_or_else(|| format!("auto-repo-{}", st.register_repository_calls));
+        let project_id = if req.project_id.is_empty() {
+            repo_id.clone()
+        } else {
+            req.project_id
+        };
+        if let Some(existing) = st.repos.get(&repo_id)
+            && existing != &project_id
+        {
+            return Err(Status::already_exists(format!(
+                "repo '{repo_id}' already bound to '{existing}'"
+            )));
+        }
+        st.repos.insert(repo_id.clone(), project_id.clone());
+        Ok(Response::new(RegisterRepositoryResponse {
+            repo_id,
+            project_id,
+        }))
+    }
+    async fn delete_repository(
+        &self,
+        request: Request<DeleteRepositoryRequest>,
+    ) -> Result<Response<DeleteRepositoryResponse>, Status> {
+        self.check_auth(request.metadata())?;
+        let req = request.into_inner();
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.delete_repository_calls += 1;
+        if let Some(code) = st.delete_repository_error.take() {
+            return Err(Status::new(code, "injected delete_repository failure"));
+        }
+        let Some(actual_project) = st.repos.get(&req.repo_id).cloned() else {
+            return Ok(Response::new(DeleteRepositoryResponse { existed: false }));
+        };
+        if let Some(expected) = req.project_id
+            && actual_project != expected
+        {
+            return Err(Status::failed_precondition(format!(
+                "repo '{}' belongs to '{}', not '{}'",
+                req.repo_id, actual_project, expected
+            )));
+        }
+        st.repos.remove(&req.repo_id);
+        Ok(Response::new(DeleteRepositoryResponse { existed: true }))
     }
     async fn read_commit(
         &self,

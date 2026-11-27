@@ -109,6 +109,7 @@ impl OpStoreService for DaemonProxy {
         let meta = request.metadata().clone();
         let req = request.into_inner();
         let scope = self.scope_for(&meta, &req.repo_id)?;
+        let cache_epoch = self.inner.cache.purge_epoch();
         let op_clone = req.operation.clone();
         let out = self.inner.upstream.prepare_outbound(&meta, req)?;
         let channel = self.inner.upstream.channel_for(&meta).await?;
@@ -118,11 +119,12 @@ impl OpStoreService for DaemonProxy {
         if let Some(op) = op_clone {
             self.inner
                 .cache
-                .put_write_through_async(
+                .put_write_through_if_epoch_async(
                     scope,
                     ObjectKind::Operation,
                     res.operation_id.clone(),
                     Bytes::from(op.encode_to_vec()),
+                    Some(cache_epoch),
                 )
                 .await;
         }
@@ -212,6 +214,7 @@ impl OpStoreService for DaemonProxy {
         let meta = request.metadata().clone();
         let req = request.into_inner();
         let scope = self.scope_for(&meta, &req.repo_id)?;
+        let cache_epoch = self.inner.cache.purge_epoch();
         let view_clone = req.view.clone();
         let out = self.inner.upstream.prepare_outbound(&meta, req)?;
         let channel = self.inner.upstream.channel_for(&meta).await?;
@@ -221,11 +224,12 @@ impl OpStoreService for DaemonProxy {
         if let Some(v) = view_clone {
             self.inner
                 .cache
-                .put_write_through_async(
+                .put_write_through_if_epoch_async(
                     scope,
                     ObjectKind::View,
                     res.view_id.clone(),
                     Bytes::from(v.encode_to_vec()),
+                    Some(cache_epoch),
                 )
                 .await;
         }
@@ -295,6 +299,7 @@ impl OpStoreService for DaemonProxy {
         let meta = request.metadata().clone();
         let req = request.into_inner();
         let scope = self.scope_for(&meta, &req.repo_id)?;
+        let cache_epoch = self.inner.cache.purge_epoch();
         let view_clone = req.view.clone();
         let op_clone = req.operation.clone();
         let out = self.inner.upstream.prepare_outbound(&meta, req)?;
@@ -305,11 +310,12 @@ impl OpStoreService for DaemonProxy {
         if let Some(v) = view_clone {
             self.inner
                 .cache
-                .put_write_through_async(
+                .put_write_through_if_epoch_async(
                     scope.clone(),
                     ObjectKind::View,
                     res.view_id.clone(),
                     Bytes::from(v.encode_to_vec()),
+                    Some(cache_epoch),
                 )
                 .await;
         }
@@ -317,11 +323,12 @@ impl OpStoreService for DaemonProxy {
             op.view_id = res.view_id.clone();
             self.inner
                 .cache
-                .put_write_through_async(
+                .put_write_through_if_epoch_async(
                     scope,
                     ObjectKind::Operation,
                     res.operation_id.clone(),
                     Bytes::from(op.encode_to_vec()),
+                    Some(cache_epoch),
                 )
                 .await;
         }

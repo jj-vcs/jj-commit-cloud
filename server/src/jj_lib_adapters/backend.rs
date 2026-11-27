@@ -141,6 +141,7 @@ fn validate_stored_commit(
 pub struct ServerBackend {
     store: Arc<CompositeStore>,
     repo_id: String,
+    pinned_project_id: Option<String>,
     root_commit_id: CommitId,
     root_change_id: ChangeId,
     empty_tree_id: TreeId,
@@ -150,6 +151,7 @@ impl Debug for ServerBackend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ServerBackend")
             .field("repo_id", &self.repo_id)
+            .field("pinned_project_id", &self.pinned_project_id)
             .finish()
     }
 }
@@ -159,6 +161,22 @@ impl ServerBackend {
         Self {
             store,
             repo_id,
+            pinned_project_id: None,
+            root_commit_id: CommitId::from_bytes(&cc_common::ROOT_COMMIT_ID_BYTES),
+            root_change_id: ChangeId::from_bytes(&cc_common::ROOT_CHANGE_ID_BYTES),
+            empty_tree_id: TreeId::from_hex(cc_common::EMPTY_TREE_ID_HEX),
+        }
+    }
+
+    pub fn with_project_id(
+        store: Arc<CompositeStore>,
+        repo_id: String,
+        project_id: String,
+    ) -> Self {
+        Self {
+            store,
+            repo_id,
+            pinned_project_id: Some(project_id),
             root_commit_id: CommitId::from_bytes(&cc_common::ROOT_COMMIT_ID_BYTES),
             root_change_id: ChangeId::from_bytes(&cc_common::ROOT_CHANGE_ID_BYTES),
             empty_tree_id: TreeId::from_hex(cc_common::EMPTY_TREE_ID_HEX),
@@ -166,6 +184,9 @@ impl ServerBackend {
     }
 
     async fn resolve_project_id(&self, action: &str) -> BackendResult<String> {
+        if let Some(project_id) = &self.pinned_project_id {
+            return Ok(project_id.clone());
+        }
         self.store
             .resolve_repo_project(&self.repo_id, action)
             .await

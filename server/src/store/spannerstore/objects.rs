@@ -721,10 +721,12 @@ impl SpannerMetadataStore {
         let incoming_inline: Option<Vec<u8>> = record.inline_content.as_ref().map(|b| b.to_vec());
         let incoming_primary = record.primary_location.clone();
         let incoming_replicated = record.replicated_locations.clone();
+        let retry_tracker = self.new_retry_tracker();
         let runner = self.rw_transaction().build();
 
         runner
             .run(async move |tx| -> google_cloud_spanner::Result<()> {
+                retry_tracker.record_attempt();
                 let stmt = Statement::builder(
                     "SELECT InlineContent, PrimaryLocation, ReplicatedLocations
                      FROM Blobs WHERE BlobId = @blob_id",

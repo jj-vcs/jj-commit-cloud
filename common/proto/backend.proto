@@ -39,7 +39,8 @@ package commit_cloud.backend;
 // - `NOT_FOUND`: `project_id` is unregistered, or the requested object digest
 //   does not exist.
 // - `FAILED_PRECONDITION`: A `WriteTree` or `WriteCommit` references missing
-//   dependencies.
+//   dependencies, or `DeleteRepository` supplies a `project_id` that does not
+//   match the repository's registered `project_id`.
 // - `INVALID_ARGUMENT`: Malformed identifier or digest length, hash mismatch,
 //   duplicate or invalid tree entry name, unsupported `File.copy_id`, invalid
 //   symlink target, missing payload, or invalid cursor.
@@ -49,6 +50,9 @@ package commit_cloud.backend;
 // - `RESOURCE_EXHAUSTED`: `WriteFileStream` upload exceeds the server's maximum
 //   blob size (512 MiB).
 // - `DATA_LOSS`: Stored symlink bytes are not valid UTF-8 or contain NUL bytes.
+// - `UNAVAILABLE`: Transient storage or backend unavailability (including
+//   `DeleteRepository` exceeding its per-call batch cap under sustained
+//   concurrent writes); callers may safely retry idempotent RPCs.
 // - `UNIMPLEMENTED`: Requested option or repository `HashAlgorithm` is not yet
 //   enabled on this server.
 service BackendService {
@@ -61,6 +65,36 @@ service BackendService {
   // bound to `project_id` (defaults to `repo_id` when `project_id` is empty).
   rpc RegisterRepository(RegisterRepositoryRequest)
       returns (RegisterRepositoryResponse);
+
+  // Deletes a registered `repo_id` and all repository-scoped state (`Views`,
+  // `Operations`, `OpHeads`, and `Workspaces`) while preserving shared project
+  // objects (`Commits`, `Trees`, `Symlinks`, `Blobs`, and `ProjectBlobs`) for
+  // sibling repositories.
+  //
+  // Idempotency & Isolation Contract:
+  // - Idempotent: returns `existed = false` when `repo_id` is already absent.
+  // - When `project_id` is supplied and does not match the registered
+  //   `project_id` of `repo_id`, fails with `FAILED_PRECONDITION` without
+  //   deleting the repository.
+  // - Executes in a single serializable transaction whenever repository-scoped
+  //   child rows fit within backend mutation limits. For very large
+  //   repositories exceeding a single transaction's mutation budget, drains
+  //   child rows in bounded serializable batches (verifying `project_id` on
+  //   every batch) before deleting the repository row and remaining children
+  //   together, returning `UNAVAILABLE` for idempotent retry if sustained
+  //   concurrent writes prevent convergence within the batch cap.
+  // - Multi-batch caveats (repositories exceeding the single-transaction child
+  //   row limit, e.g. >5,000 child rows on Cloud Spanner): until a follow-up
+  //   schema migration adds a `Deleting` tombstone state or monotonic
+  //   repository generation column, (a) concurrent readers between intermediate
+  //   drain batches can observe partially deleted child rows while the
+  //   repository row still exists, and (b) if another caller completes deletion
+  //   between batches and a client immediately re-registers the same `repo_id`
+  //   under the same `project_id`, subsequent batches see the matching
+  //   `project_id` and continue deleting the newly registered repository
+  //   (cross-project re-registration is detected and aborted).
+  rpc DeleteRepository(DeleteRepositoryRequest)
+      returns (DeleteRepositoryResponse);
 
   // Reads a commit header by `commit_id`, synthesizing the virtual all-zero
   // `ROOT_COMMIT_ID` when no physical root commit row is stored.
@@ -180,6 +214,19 @@ message RegisterRepositoryRequest {
 message RegisterRepositoryResponse {
   string repo_id = 1;
   string project_id = 2;
+}
+
+message DeleteRepositoryRequest {
+  string repo_id = 1;
+  // Optional guard: when set, the server verifies `repo_id` is registered under
+  // this `project_id` before deleting it, returning `FAILED_PRECONDITION` on
+  // mismatch (`Some("")` or invalid identifier returns `INVALID_ARGUMENT`).
+  optional string project_id = 2;
+}
+
+message DeleteRepositoryResponse {
+  // True if `repo_id` existed and was deleted; false if it was already absent.
+  bool existed = 1;
 }
 
 message Timestamp {

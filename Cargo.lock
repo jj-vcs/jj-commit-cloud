@@ -237,6 +237,8 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "itoa",
  "matchit",
  "memchr",
@@ -245,10 +247,15 @@ dependencies = [
  "pin-project-lite",
  "rustversion",
  "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "serde_urlencoded",
  "sync_wrapper",
+ "tokio",
  "tower 0.5.3",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -269,6 +276,7 @@ dependencies = [
  "sync_wrapper",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]
@@ -4067,6 +4075,7 @@ version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "async-trait",
+ "axum",
  "bytes",
  "cc-common",
  "cc-lib",
@@ -4078,12 +4087,14 @@ dependencies = [
  "google-cloud-spanner",
  "google-cloud-storage",
  "hex",
+ "http",
  "jj-lib",
  "pollster 0.4.0",
  "predicates",
  "prost 0.13.5",
  "rand 0.8.6",
  "rusqlite",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "subtle",
@@ -4094,6 +4105,7 @@ dependencies = [
  "tokio-stream",
  "tonic 0.12.3",
  "tonic-health",
+ "tower 0.4.13",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -6166,6 +6178,17 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "serde_path_to_error"
+version = "0.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10a9ff822e371bb5403e391ecd83e182e0e77ba7f6fe0160b795797109d1b457"
+dependencies = [
+ "itoa",
+ "serde",
+ "serde_core",
 ]
 
 [[package]]

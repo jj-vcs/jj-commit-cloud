@@ -222,4 +222,59 @@ impl SqliteMetadataStore {
         })
         .await
     }
+
+    pub(super) async fn delete_repository_impl(
+        &self,
+        repo_id: &str,
+        expected_project_id: Option<&str>,
+    ) -> StoreResult<bool> {
+        let repo_id = repo_id.to_string();
+        let expected_project_id = expected_project_id.map(ToOwned::to_owned);
+        self.with_write_conn(move |conn| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|e| {
+                    StoreError::Backend(format!("SQLite begin delete_repository tx failed: {e}"))
+                })?;
+
+            let existing_project: Option<String> = tx
+                .query_row(
+                    "SELECT project_id FROM repositories WHERE repo_id = ?1",
+                    params![repo_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| {
+                    StoreError::Backend(format!("SQLite delete_repository lookup failed: {e}"))
+                })?;
+
+            let Some(actual_project_id) = existing_project else {
+                return Ok(false);
+            };
+            if let Some(expected) = &expected_project_id
+                && actual_project_id != *expected
+            {
+                return Err(StoreError::FailedPrecondition(format!(
+                    "repository '{repo_id}' belongs to project '{actual_project_id}', not '{expected}'"
+                )));
+            }
+
+            for sql in [
+                "DELETE FROM workspaces WHERE repo_id = ?1",
+                "DELETE FROM operations WHERE repo_id = ?1",
+                "DELETE FROM views WHERE repo_id = ?1",
+                "DELETE FROM repositories WHERE repo_id = ?1",
+            ] {
+                tx.execute(sql, params![repo_id]).map_err(|e| {
+                    StoreError::Backend(format!("SQLite delete_repository ({sql}) failed: {e}"))
+                })?;
+            }
+
+            tx.commit().map_err(|e| {
+                StoreError::Backend(format!("SQLite commit delete_repository failed: {e}"))
+            })?;
+            Ok(true)
+        })
+        .await
+    }
 }

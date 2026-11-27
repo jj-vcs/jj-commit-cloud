@@ -37,6 +37,7 @@ pub mod auth;
 pub mod backend;
 pub mod hash_utils;
 pub mod jj_lib_adapters;
+pub mod metrics;
 pub mod op_store;
 pub mod reconcile_op_heads;
 pub mod store;

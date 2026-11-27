@@ -176,6 +176,9 @@ impl DaemonProxy {
         // `MAX_L1_OBJECT_BYTES`, spilling to L2 disk staging up to `max_l2_object_bytes`, and
         // continuing pass-through with no hard size cap above that.
         let file_id = req.file_id.clone();
+        // Capture `purge_epoch` before dialing upstream so any `DeleteRepository` purge that
+        // completes while `ReadFile` is in flight prevents resurrecting authorization markers.
+        let mut spooler = self.inner.cache.new_read_blob_spooler();
         let out = self.inner.upstream.prepare_outbound(&meta, req)?;
         let channel = self.inner.upstream.channel_for(&meta).await?;
         self.inner.cache.record_miss();
@@ -186,7 +189,6 @@ impl DaemonProxy {
         let (tx, rx) = tokio::sync::mpsc::channel(STREAM_CHANNEL_CAPACITY);
         let proxy_for_pump = self.clone();
         tokio::spawn(async move {
-            let mut spooler = proxy_for_pump.inner.cache.new_read_blob_spooler();
             let mut clean_eof = false;
             loop {
                 let next = tokio::select! {
@@ -236,6 +238,7 @@ impl DaemonProxy {
         let meta = request.metadata().clone();
         let req = request.into_inner();
         let scope = self.scope_for(&meta, &req.project_id)?;
+        let cache_epoch = self.inner.cache.purge_epoch();
         let content_len = req.content.len();
         let max_l2 = self.inner.cache.max_l2_object_bytes();
         let cacheable =
@@ -249,11 +252,12 @@ impl DaemonProxy {
         if let Some(content_bytes) = content_bytes {
             self.inner
                 .cache
-                .put_write_through_async(
+                .put_write_through_if_epoch_async(
                     scope,
                     ObjectKind::File,
                     res.file_id.clone(),
                     content_bytes,
+                    Some(cache_epoch),
                 )
                 .await;
         }

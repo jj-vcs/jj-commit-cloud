@@ -22,10 +22,12 @@
 //!
 //! # Concurrency and Merge Invariants
 //! Point reads, `UNNEST` dependency checks, and prefix scans use lock-free `single_use()`
-//! reads. All mutable transitions (`register_project`, `register_repo`, `put_blob_record`,
-//! `update_op_heads`, `publish_operation_atomic`, `compare_and_swap_op_heads`,
-//! `put_workspace_cas`, `delete_workspace`) run in `Serializable` `ReadWriteTransaction`s;
-//! workspace CAS uses `Insert` for new rows and transactional DML deletes.
+//! reads. All mutable transitions (`register_project`, `register_repo`, `*_for_project`,
+//! `put_blob_record`, `update_op_heads`, `publish_operation_atomic`, `compare_and_swap_op_heads`,
+//! `put_workspace_cas`, `delete_workspace`, `delete_repository`) run in `Serializable`
+//! `ReadWriteTransaction`s verifying `Repositories.ProjectId` atomically. `delete_repository`
+//! removes `Workspaces`, `Operations`, `Views`, and `Repositories` atomically when within
+//! Spanner's mutation budget and drains in bounded batches for very large repositories.
 //!
 //! # Cross-Process and RPC Boundaries
 //! Supports Cloud Spanner via ADC, Spanner Omni via custom endpoints and CA/mTLS, and the
@@ -41,9 +43,12 @@ mod workspaces;
 #[cfg(test)]
 mod tests;
 
+pub use repo::{MAX_DELETE_BATCH_ITERATIONS, SPANNER_DELETE_BATCH_LIMIT};
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -58,6 +63,7 @@ use google_cloud_spanner::omni::{InstanceType, TlsConfig};
 use google_cloud_spanner::transaction::ReadWriteTransaction;
 
 use super::{BlobRecord, CommitId, MetadataStore, OpId, StoreError, StoreResult};
+use repo::{clamp_delete_batch_limit, clamp_max_delete_batch_iterations};
 use schema::ensure_database_and_schema;
 
 const UNNEST_BATCH_SIZE: usize = 5_000;
@@ -87,10 +93,28 @@ pub struct SpannerConnectConfig {
     pub emulator: bool,
 }
 
+struct TxRetryTracker {
+    attempts: AtomicUsize,
+    counter: Option<Arc<AtomicU64>>,
+}
+
+impl TxRetryTracker {
+    fn record_attempt(&self) {
+        if self.attempts.fetch_add(1, Ordering::Relaxed) > 0
+            && let Some(counter) = &self.counter
+        {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct SpannerMetadataStore {
     _spanner: Spanner,
     db_client: DatabaseClient,
+    tx_retries: Option<Arc<AtomicU64>>,
+    delete_batch_limit: i64,
+    max_delete_batch_iterations: usize,
 }
 
 impl SpannerMetadataStore {
@@ -166,7 +190,36 @@ impl SpannerMetadataStore {
         Ok(Self {
             _spanner: spanner,
             db_client,
+            tx_retries: None,
+            delete_batch_limit: SPANNER_DELETE_BATCH_LIMIT,
+            max_delete_batch_iterations: MAX_DELETE_BATCH_ITERATIONS,
         })
+    }
+
+    pub fn with_tx_retries_counter(mut self, counter: Arc<AtomicU64>) -> Self {
+        self.tx_retries = Some(counter);
+        self
+    }
+
+    /// Overrides the per-transaction child-row delete batch cap (clamped to
+    /// `1..=SPANNER_DELETE_BATCH_LIMIT`), primarily for multi-batch integration tests.
+    pub fn with_delete_batch_limit(mut self, limit: i64) -> Self {
+        self.delete_batch_limit = clamp_delete_batch_limit(limit);
+        self
+    }
+
+    /// Overrides the maximum delete-batch transactions per `delete_repository` call (clamped to
+    /// `1..=MAX_DELETE_BATCH_ITERATIONS`), primarily for integration tests.
+    pub fn with_max_delete_batch_iterations(mut self, limit: usize) -> Self {
+        self.max_delete_batch_iterations = clamp_max_delete_batch_iterations(limit);
+        self
+    }
+
+    fn new_retry_tracker(&self) -> TxRetryTracker {
+        TxRetryTracker {
+            attempts: AtomicUsize::new(0),
+            counter: self.tx_retries.clone(),
+        }
     }
 
     fn rw_transaction(&self) -> TransactionRunnerBuilder {
@@ -188,9 +241,11 @@ impl SpannerMetadataStore {
         let early_exit: Arc<std::sync::Mutex<Option<StoreResult<T>>>> =
             Arc::new(std::sync::Mutex::new(None));
         let early_exit_cb = Arc::clone(&early_exit);
+        let retry_tracker = self.new_retry_tracker();
         let runner = self.rw_transaction().build();
         let res = runner
             .run(async move |tx| {
+                retry_tracker.record_attempt();
                 *early_exit_cb.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 match work(tx).await? {
                     TxAction::Commit(val) => Ok(val),
@@ -360,6 +415,17 @@ impl MetadataStore for SpannerMetadataStore {
     ) -> StoreResult<String> {
         self.register_repo_in_project_impl(repo_id, project_id, name)
             .await
+    }
+
+    async fn delete_repository(
+        &self,
+        repo_id: &str,
+        expected_project_id: Option<&str>,
+    ) -> StoreResult<bool> {
+        self.delete_repository_with_after_batch_hook(repo_id, expected_project_id, |_| {
+            std::future::ready(())
+        })
+        .await
     }
 
     async fn get_commit(&self, project_id: &str, commit_id: &[u8]) -> StoreResult<Option<Commit>> {
@@ -547,7 +613,26 @@ impl MetadataStore for SpannerMetadataStore {
     }
 
     async fn put_operation(&self, repo_id: &str, op_id: &[u8], op: &Operation) -> StoreResult<()> {
-        self.put_operation_impl(repo_id, op_id, op).await
+        self.put_operation_inner(repo_id, None, op_id, op, false)
+            .await
+    }
+
+    async fn put_operation_for_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+        op_id: &[u8],
+        op: &Operation,
+        require_dependencies_exist: bool,
+    ) -> StoreResult<()> {
+        self.put_operation_inner(
+            repo_id,
+            Some(expected_project_id),
+            op_id,
+            op,
+            require_dependencies_exist,
+        )
+        .await
     }
 
     async fn resolve_operation_id_prefix(
@@ -569,7 +654,18 @@ impl MetadataStore for SpannerMetadataStore {
     }
 
     async fn put_view(&self, repo_id: &str, view_id: &[u8], view: &View) -> StoreResult<()> {
-        self.put_view_impl(repo_id, view_id, view).await
+        self.put_view_inner(repo_id, None, view_id, view).await
+    }
+
+    async fn put_view_for_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+        view_id: &[u8],
+        view: &View,
+    ) -> StoreResult<()> {
+        self.put_view_inner(repo_id, Some(expected_project_id), view_id, view)
+            .await
     }
 
     async fn get_op_heads(&self, repo_id: &str) -> StoreResult<Option<Vec<OpId>>> {
@@ -582,7 +678,26 @@ impl MetadataStore for SpannerMetadataStore {
         old_ids: &[Vec<u8>],
         new_id: &[u8],
     ) -> StoreResult<Vec<OpId>> {
-        self.update_op_heads_impl(repo_id, old_ids, new_id).await
+        self.update_op_heads_inner(repo_id, None, old_ids, new_id, false)
+            .await
+    }
+
+    async fn update_op_heads_for_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+        old_head_ids: &[Vec<u8>],
+        new_head_id: &[u8],
+        require_op_exists: bool,
+    ) -> StoreResult<Vec<OpId>> {
+        self.update_op_heads_inner(
+            repo_id,
+            Some(expected_project_id),
+            old_head_ids,
+            new_head_id,
+            require_op_exists,
+        )
+        .await
     }
 
     async fn publish_operation_atomic(
@@ -594,8 +709,33 @@ impl MetadataStore for SpannerMetadataStore {
         op: &Operation,
         old_ids: &[Vec<u8>],
     ) -> StoreResult<Vec<OpId>> {
-        self.publish_operation_atomic_impl(repo_id, view_id, view, op_id, op, old_ids)
+        self.publish_operation_inner(repo_id, None, view_id, view, op_id, op, old_ids, false)
             .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_operation_for_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+        view_id: &[u8],
+        view: &View,
+        op_id: &[u8],
+        op: &Operation,
+        old_op_head_ids: &[Vec<u8>],
+        require_dependencies_exist: bool,
+    ) -> StoreResult<Vec<OpId>> {
+        self.publish_operation_inner(
+            repo_id,
+            Some(expected_project_id),
+            view_id,
+            view,
+            op_id,
+            op,
+            old_op_head_ids,
+            require_dependencies_exist,
+        )
+        .await
     }
 
     async fn compare_and_swap_op_heads(
@@ -604,8 +744,26 @@ impl MetadataStore for SpannerMetadataStore {
         expected_old_ids: &[Vec<u8>],
         new_id: &[u8],
     ) -> StoreResult<()> {
-        self.compare_and_swap_op_heads_impl(repo_id, expected_old_ids, new_id)
+        self.compare_and_swap_op_heads_inner(repo_id, None, expected_old_ids, new_id, false)
             .await
+    }
+
+    async fn update_op_heads_cas_for_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+        expected_exact_heads: &[Vec<u8>],
+        new_head_id: &[u8],
+        require_op_exists: bool,
+    ) -> StoreResult<()> {
+        self.compare_and_swap_op_heads_inner(
+            repo_id,
+            Some(expected_project_id),
+            expected_exact_heads,
+            new_head_id,
+            require_op_exists,
+        )
+        .await
     }
 
     async fn get_workspace(
@@ -617,14 +775,29 @@ impl MetadataStore for SpannerMetadataStore {
         self.get_workspace_impl(repo_id, user, workspace_name).await
     }
 
-    #[allow(deprecated)]
     async fn put_workspace_cas(
         &self,
         workspace: &WorkspaceState,
         expected_operation_id: Option<&[u8]>,
     ) -> StoreResult<()> {
-        self.put_workspace_cas_impl(workspace, expected_operation_id)
+        self.put_workspace_cas_inner(None, workspace, expected_operation_id, false)
             .await
+    }
+
+    async fn put_workspace_cas_for_project(
+        &self,
+        expected_project_id: &str,
+        workspace: &WorkspaceState,
+        expected_operation_id: Option<&[u8]>,
+        require_operation_exists: bool,
+    ) -> StoreResult<()> {
+        self.put_workspace_cas_inner(
+            Some(expected_project_id),
+            workspace,
+            expected_operation_id,
+            require_operation_exists,
+        )
+        .await
     }
 
     async fn list_workspaces(&self, repo_id: &str) -> StoreResult<Vec<WorkspaceState>> {

@@ -481,6 +481,12 @@ async fn idle_timeout_waits_for_active_rpc_and_then_shuts_down() {
         ) -> Result<tonic::Response<RegisterRepositoryResponse>, tonic::Status> {
             unimpl()
         }
+        async fn delete_repository(
+            &self,
+            _: Request<DeleteRepositoryRequest>,
+        ) -> Result<tonic::Response<DeleteRepositoryResponse>, tonic::Status> {
+            unimpl()
+        }
         async fn read_commit(
             &self,
             request: Request<ReadCommitRequest>,

@@ -530,13 +530,26 @@ async fn test_spanner_shared_project_deduplicates_objects_and_paginates_list_com
     assert!(isolated_list.is_empty());
 
     // Verify interleaved `Workspaces` persistence on Spanner (including multi-tree conflict roots).
+    let ws_op_id = vec![0x11; 16];
+    store
+        .put_operation(
+            "agent-1",
+            &ws_op_id,
+            &Operation {
+                view_id: cc_common::ROOT_VIEW_ID_BYTES.to_vec(),
+                parents: vec![cc_common::ROOT_OPERATION_ID_BYTES.to_vec()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
     #[allow(deprecated)]
     let ws = cc_common::workspace::WorkspaceState {
         repo_id: "agent-1".to_string(),
         user: "bot@example.com".to_string(),
         workspace_name: "sandbox-01".to_string(),
         commit_id: vec![0x05; 20],
-        operation_id: vec![0x11; 16],
+        operation_id: ws_op_id,
         tree_id: vec![0xaa; 20],
         sparse_patterns: vec!["crates/core".to_string(), "crates/api".to_string()],
         tree_ids: vec![vec![0xaa; 20], vec![0xbb; 20], vec![0xcc; 20]],
@@ -693,4 +706,1063 @@ async fn test_spanner_large_tree_over_4000_entries_stages_and_preserves_ready_st
     );
     let via_project = store.get_tree("wide-proj", &large_tree_id).await.unwrap();
     assert_eq!(via_project.len(), entry_count);
+}
+
+#[tokio::test]
+async fn test_spanner_delete_repository_cascades_interleaved_children_and_preserves_shared_project()
+{
+    let Some(emulator) = testutils::SpannerEmulatorGuard::start_or_skip(
+        "test_spanner_delete_repository_cascades_interleaved_children_and_preserves_shared_project",
+        false,
+    )
+    .await
+    else {
+        return;
+    };
+
+    let cfg = SpannerConnectConfig {
+        database: emulator.database_uri(&unique_db_id("cc_del_repo")),
+        endpoint: Some(emulator.grpc_endpoint()),
+        admin_endpoint: Some(emulator.rest_endpoint().to_string()),
+        auto_migrate: true,
+        emulator: true,
+        ..Default::default()
+    };
+    let meta = Arc::new(SpannerMetadataStore::connect(&cfg).await.unwrap());
+    let store = CompositeStore::new(meta.clone(), Arc::new(MemoryBlobStore::new()));
+
+    store
+        .register_project("shared-proj", Some("Spanner Shared"))
+        .await
+        .unwrap();
+    store
+        .register_repo_in_project("repo-del", Some("shared-proj"), None)
+        .await
+        .unwrap();
+    store
+        .register_repo_in_project("repo-keep", Some("shared-proj"), None)
+        .await
+        .unwrap();
+
+    // Populate shared project objects (blob, symlink, tree, commit).
+    let file_id = vec![0x11; 20];
+    store
+        .put_file("repo-del", &file_id, Bytes::from_static(b"spanner shared"))
+        .await
+        .unwrap();
+    let sym_id = vec![0x22; 20];
+    store
+        .put_symlink("repo-del", &sym_id, "../shared-link")
+        .await
+        .unwrap();
+    let tree_id = vec![0x33; 20];
+    store
+        .put_tree(
+            "repo-del",
+            &tree_id,
+            &[
+                TreeEntry {
+                    name: "a.txt".to_string(),
+                    value: Some(TreeValue {
+                        value: Some(tree_value::Value::File(File {
+                            id: file_id.clone(),
+                            executable: false,
+                            copy_id: Vec::new(),
+                            size_bytes: None,
+                        })),
+                    }),
+                },
+                TreeEntry {
+                    name: "b.link".to_string(),
+                    value: Some(TreeValue {
+                        value: Some(tree_value::Value::SymlinkId(sym_id.clone())),
+                    }),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    let commit_id = vec![0x44; 20];
+    store
+        .put_commit(
+            "repo-del",
+            &commit_id,
+            &Commit {
+                commit_id: commit_id.clone(),
+                change_id: vec![0x55; 16],
+                parent_commit_ids: vec![cc_common::ROOT_COMMIT_ID_BYTES.to_vec()],
+                root_tree_id: vec![tree_id.clone()],
+                description: "spanner commit\n".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // Populate interleaved Views, Operations, OpHeads, and Workspaces on both repos.
+    let view_id = vec![0x66; 16];
+    let view = View {
+        head_ids: vec![commit_id.clone()],
+        ..Default::default()
+    };
+    let op_id = vec![0x77; 16];
+    let op = Operation {
+        view_id: view_id.clone(),
+        parents: vec![cc_common::ROOT_OPERATION_ID_BYTES.to_vec()],
+        ..Default::default()
+    };
+    for repo in ["repo-del", "repo-keep"] {
+        store
+            .publish_operation(
+                repo,
+                &view_id,
+                &view,
+                &op_id,
+                &op,
+                &[cc_common::ROOT_OPERATION_ID_BYTES.to_vec()],
+            )
+            .await
+            .unwrap();
+        #[allow(deprecated)]
+        let ws = cc_common::workspace::WorkspaceState {
+            repo_id: repo.to_string(),
+            user: "alice@example.com".to_string(),
+            workspace_name: "default".to_string(),
+            commit_id: commit_id.clone(),
+            operation_id: op_id.clone(),
+            tree_id: tree_id.clone(),
+            tree_ids: vec![tree_id.clone()],
+            conflict_labels: Vec::new(),
+            sparse_patterns: vec![String::new()],
+            sparse_patterns_set: true,
+        };
+        store.put_workspace(&ws).await.unwrap();
+    }
+
+    // Absent repo returns Ok(false).
+    assert!(
+        !store
+            .delete_repository("nonexistent-repo", None)
+            .await
+            .unwrap()
+    );
+
+    // Mismatched project_id fails with FailedPrecondition without deleting repo-del.
+    let err = store
+        .delete_repository("repo-del", Some("wrong-proj"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StoreError::FailedPrecondition(_)), "{err:?}");
+    assert_eq!(
+        store.get_op_heads("repo-del").await.unwrap(),
+        vec![op_id.clone()]
+    );
+    assert_eq!(store.list_workspaces("repo-del").await.unwrap().len(), 1);
+
+    // Matching project_id deletes Repositories row and cascades interleaved Views/Operations/Workspaces.
+    assert!(
+        store
+            .delete_repository("repo-del", Some("shared-proj"))
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .delete_repository("repo-del", Some("shared-proj"))
+            .await
+            .unwrap()
+    );
+
+    assert!(matches!(
+        store.get_op_heads("repo-del").await,
+        Err(StoreError::RepoNotFound { .. })
+    ));
+    assert!(meta.get_view("repo-del", &view_id).await.unwrap().is_none());
+    assert!(
+        meta.get_operation("repo-del", &op_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(meta.list_workspaces("repo-del").await.unwrap().is_empty());
+
+    // Direct MetadataStore writes targeting the deleted repository must all return RepoNotFound
+    // (including non-empty expected_operation_id CAS workspace updates, not CasConflict).
+    assert!(matches!(
+        meta.put_view("repo-del", &view_id, &view).await,
+        Err(StoreError::RepoNotFound { .. })
+    ));
+    assert!(matches!(
+        meta.put_operation("repo-del", &op_id, &op).await,
+        Err(StoreError::RepoNotFound { .. })
+    ));
+    assert!(matches!(
+        meta.update_op_heads("repo-del", &[], &op_id).await,
+        Err(StoreError::RepoNotFound { .. })
+    ));
+    assert!(matches!(
+        meta.publish_operation_atomic("repo-del", &view_id, &view, &op_id, &op, &[])
+            .await,
+        Err(StoreError::RepoNotFound { .. })
+    ));
+    assert!(matches!(
+        meta.compare_and_swap_op_heads("repo-del", &[], &op_id)
+            .await,
+        Err(StoreError::RepoNotFound { .. })
+    ));
+    #[allow(deprecated)]
+    let del_ws = cc_common::workspace::WorkspaceState {
+        repo_id: "repo-del".to_string(),
+        user: "alice@example.com".to_string(),
+        workspace_name: "default".to_string(),
+        commit_id: commit_id.clone(),
+        operation_id: op_id.clone(),
+        tree_id: tree_id.clone(),
+        tree_ids: vec![tree_id.clone()],
+        conflict_labels: Vec::new(),
+        sparse_patterns: vec![String::new()],
+        sparse_patterns_set: true,
+    };
+    for expected in [None, Some([].as_slice()), Some(op_id.as_slice())] {
+        let err = meta.put_workspace_cas(&del_ws, expected).await.unwrap_err();
+        assert!(
+            matches!(err, StoreError::RepoNotFound { .. }),
+            "expected RepoNotFound for put_workspace_cas(expected={expected:?}), got {err:?}"
+        );
+    }
+
+    // Shared project objects remain readable via sibling repo-keep and shared-proj.
+    assert_eq!(
+        store
+            .get_file_range("repo-keep", &file_id, 0, None)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"spanner shared"
+    );
+    assert_eq!(
+        store.get_symlink("repo-keep", &sym_id).await.unwrap(),
+        "../shared-link"
+    );
+    assert_eq!(
+        store.get_tree("repo-keep", &tree_id).await.unwrap().len(),
+        2
+    );
+    assert_eq!(
+        store
+            .get_commit("repo-keep", &commit_id)
+            .await
+            .unwrap()
+            .description,
+        "spanner commit\n"
+    );
+    assert_eq!(store.get_op_heads("repo-keep").await.unwrap(), vec![op_id]);
+    assert_eq!(store.list_workspaces("repo-keep").await.unwrap().len(), 1);
+
+    // Re-registering repo-del starts clean with no leftover Views/Operations/Workspaces.
+    store
+        .register_repo_in_project("repo-del", Some("shared-proj"), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_op_heads("repo-del").await.unwrap(),
+        vec![cc_common::ROOT_OPERATION_ID_BYTES.to_vec()]
+    );
+    assert!(
+        store
+            .get_view("repo-del", &view_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.list_workspaces("repo-del").await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_spanner_delete_repository_multi_batch_and_project_checked_writes_prevent_toctou() {
+    let Some(emulator) = testutils::SpannerEmulatorGuard::start_or_skip(
+        "test_spanner_delete_repository_multi_batch_and_project_checked_writes_prevent_toctou",
+        false,
+    )
+    .await
+    else {
+        return;
+    };
+
+    let cfg = SpannerConnectConfig {
+        database: emulator.database_uri(&unique_db_id("cc_del_batch")),
+        endpoint: Some(emulator.grpc_endpoint()),
+        admin_endpoint: Some(emulator.rest_endpoint().to_string()),
+        auto_migrate: true,
+        emulator: true,
+        ..Default::default()
+    };
+    // Configure a tiny batch size (2 rows/tx) so deleting 7 views, 7 operations, and 7
+    // workspaces exercises multi-transaction batched deletion end to end.
+    let meta = Arc::new(
+        SpannerMetadataStore::connect(&cfg)
+            .await
+            .unwrap()
+            .with_delete_batch_limit(2),
+    );
+    let store = CompositeStore::new(meta.clone(), Arc::new(MemoryBlobStore::new()));
+
+    store
+        .register_project("proj-a", Some("Batch Proj A"))
+        .await
+        .unwrap();
+    store
+        .register_project("proj-b", Some("Batch Proj B"))
+        .await
+        .unwrap();
+    store
+        .register_repo_in_project("repo-batch", Some("proj-a"), None)
+        .await
+        .unwrap();
+    store
+        .register_repo_in_project("repo-keep", Some("proj-a"), None)
+        .await
+        .unwrap();
+
+    // Seed shared proj-a blob, tree, and commit.
+    let file_id = vec![0x21; cc_common::FILE_ID_LENGTH];
+    store
+        .put_file(
+            "repo-batch",
+            &file_id,
+            Bytes::from_static(b"spanner batched delete shared"),
+        )
+        .await
+        .unwrap();
+    let tree_id = vec![0x31; cc_common::TREE_ID_LENGTH];
+    store
+        .put_tree(
+            "repo-batch",
+            &tree_id,
+            &[TreeEntry {
+                name: "shared.txt".to_string(),
+                value: Some(TreeValue {
+                    value: Some(tree_value::Value::File(File {
+                        id: file_id.clone(),
+                        executable: false,
+                        copy_id: Vec::new(),
+                        size_bytes: None,
+                    })),
+                }),
+            }],
+        )
+        .await
+        .unwrap();
+    let commit_id = vec![0x41; cc_common::COMMIT_ID_LENGTH];
+    store
+        .put_commit(
+            "repo-batch",
+            &commit_id,
+            &Commit {
+                commit_id: commit_id.clone(),
+                change_id: vec![0x51; cc_common::CHANGE_ID_LENGTH],
+                parent_commit_ids: vec![cc_common::ROOT_COMMIT_ID_BYTES.to_vec()],
+                root_tree_id: vec![tree_id.clone()],
+                description: "shared batch commit\n".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // Seed 7 Views, 7 Operations, and 7 Workspaces on repo-batch (each spans 4+ batches of 2)
+    // plus 1 operation + 1 workspace on sibling repo-keep.
+    let mut prev_op = cc_common::ROOT_OPERATION_ID_BYTES.to_vec();
+    let mut view_ids = Vec::new();
+    let mut op_ids = Vec::new();
+    for idx in 1u8..=7u8 {
+        let mut vid = vec![0x60; cc_common::VIEW_ID_LENGTH];
+        vid[15] = idx;
+        let mut oid = vec![0x70; cc_common::OPERATION_ID_LENGTH];
+        oid[15] = idx;
+        let view = View {
+            head_ids: vec![commit_id.clone()],
+            ..Default::default()
+        };
+        let op = Operation {
+            view_id: vid.clone(),
+            parents: vec![prev_op.clone()],
+            ..Default::default()
+        };
+        store
+            .publish_operation(
+                "repo-batch",
+                &vid,
+                &view,
+                &oid,
+                &op,
+                std::slice::from_ref(&prev_op),
+            )
+            .await
+            .unwrap();
+        #[allow(deprecated)]
+        let ws = cc_common::workspace::WorkspaceState {
+            repo_id: "repo-batch".to_string(),
+            user: format!("user{idx}@example.com"),
+            workspace_name: format!("ws-{idx}"),
+            commit_id: commit_id.clone(),
+            operation_id: oid.clone(),
+            tree_id: tree_id.clone(),
+            tree_ids: vec![tree_id.clone()],
+            conflict_labels: Vec::new(),
+            sparse_patterns: vec![String::new()],
+            sparse_patterns_set: true,
+        };
+        store.put_workspace(&ws).await.unwrap();
+        view_ids.push(vid);
+        op_ids.push(oid.clone());
+        prev_op = oid;
+    }
+
+    // Re-writing an already-published operation via put_operation_for_project must preserve
+    // Published=true so retrying publish_operation_for_project does not resurrect it.
+    let op1_dup = Operation {
+        view_id: view_ids[0].clone(),
+        parents: vec![cc_common::ROOT_OPERATION_ID_BYTES.to_vec()],
+        ..Default::default()
+    };
+    meta.put_operation_for_project("repo-batch", "proj-a", &op_ids[0], &op1_dup, true)
+        .await
+        .unwrap();
+    let heads_after_retry = meta
+        .publish_operation_for_project(
+            "repo-batch",
+            "proj-a",
+            &view_ids[0],
+            &View {
+                head_ids: vec![commit_id.clone()],
+                ..Default::default()
+            },
+            &op_ids[0],
+            &op1_dup,
+            &[cc_common::ROOT_OPERATION_ID_BYTES.to_vec()],
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(heads_after_retry, vec![prev_op.clone()]);
+
+    // Transactional dependency checks reject missing non-root parent ops and external views
+    // when `require_dependencies_exist = true`.
+    let missing_parent_id = vec![0xee; cc_common::OPERATION_ID_LENGTH];
+    let bad_parent_op_id = vec![0xef; cc_common::OPERATION_ID_LENGTH];
+    let bad_parent_err = meta
+        .publish_operation_for_project(
+            "repo-batch",
+            "proj-a",
+            &view_ids[0],
+            &View {
+                head_ids: vec![commit_id.clone()],
+                ..Default::default()
+            },
+            &bad_parent_op_id,
+            &Operation {
+                view_id: view_ids[0].clone(),
+                parents: vec![missing_parent_id],
+                ..Default::default()
+            },
+            std::slice::from_ref(&prev_op),
+            true,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        bad_parent_err,
+        StoreError::MissingDependency {
+            parent_kind: "operation",
+            missing_kind: "parent operation",
+            ..
+        }
+    ));
+    let missing_ext_view_id = vec![0xed; cc_common::VIEW_ID_LENGTH];
+    let bad_view_err = meta
+        .publish_operation_for_project(
+            "repo-batch",
+            "proj-a",
+            &view_ids[0],
+            &View {
+                head_ids: vec![commit_id.clone()],
+                ..Default::default()
+            },
+            &bad_parent_op_id,
+            &Operation {
+                view_id: missing_ext_view_id,
+                parents: vec![cc_common::ROOT_OPERATION_ID_BYTES.to_vec()],
+                ..Default::default()
+            },
+            std::slice::from_ref(&prev_op),
+            true,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        bad_view_err,
+        StoreError::MissingDependency {
+            parent_kind: "operation",
+            missing_kind: "view",
+            ..
+        }
+    ));
+
+    // Populate sibling repo-keep.
+    let keep_view_id = vec![0x81; cc_common::VIEW_ID_LENGTH];
+    let keep_op_id = vec![0x82; cc_common::OPERATION_ID_LENGTH];
+    store
+        .publish_operation(
+            "repo-keep",
+            &keep_view_id,
+            &View {
+                head_ids: vec![commit_id.clone()],
+                ..Default::default()
+            },
+            &keep_op_id,
+            &Operation {
+                view_id: keep_view_id.clone(),
+                parents: vec![cc_common::ROOT_OPERATION_ID_BYTES.to_vec()],
+                ..Default::default()
+            },
+            &[cc_common::ROOT_OPERATION_ID_BYTES.to_vec()],
+        )
+        .await
+        .unwrap();
+
+    // Multi-batch delete_repository removes all 7 views, 7 operations, 7 workspaces, and the
+    // parent row while leaving shared proj-a objects and sibling repo-keep intact.
+    assert!(
+        store
+            .delete_repository("repo-batch", Some("proj-a"))
+            .await
+            .unwrap()
+    );
+    assert!(meta.get_op_heads("repo-batch").await.unwrap().is_none());
+    assert!(meta.list_workspaces("repo-batch").await.unwrap().is_empty());
+    for vid in &view_ids {
+        assert!(meta.get_view("repo-batch", vid).await.unwrap().is_none());
+    }
+    for oid in &op_ids {
+        assert!(
+            meta.get_operation("repo-batch", oid)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert_eq!(
+        store
+            .get_file_range("repo-keep", &file_id, 0, None)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"spanner batched delete shared"
+    );
+    assert_eq!(
+        store.get_tree("repo-keep", &tree_id).await.unwrap().len(),
+        1
+    );
+    assert_eq!(
+        store
+            .get_commit("repo-keep", &commit_id)
+            .await
+            .unwrap()
+            .description,
+        "shared batch commit\n"
+    );
+    assert_eq!(
+        store.get_op_heads("repo-keep").await.unwrap(),
+        vec![keep_op_id]
+    );
+
+    // Re-register repo-batch under proj-b and verify every *_for_project write with stale
+    // expected_project_id = "proj-a" fails atomically with FailedPrecondition.
+    store
+        .register_repo_in_project("repo-batch", Some("proj-b"), None)
+        .await
+        .unwrap();
+    let root_op = cc_common::ROOT_OPERATION_ID_BYTES.to_vec();
+    let stale_view = View {
+        head_ids: vec![commit_id.clone()],
+        ..Default::default()
+    };
+    let stale_op = Operation {
+        view_id: view_ids[0].clone(),
+        parents: vec![root_op.clone()],
+        ..Default::default()
+    };
+    #[allow(deprecated)]
+    let stale_ws = cc_common::workspace::WorkspaceState {
+        repo_id: "repo-batch".to_string(),
+        user: "alice@example.com".to_string(),
+        workspace_name: "stale".to_string(),
+        commit_id: commit_id.clone(),
+        operation_id: root_op.clone(),
+        tree_id: tree_id.clone(),
+        tree_ids: vec![tree_id.clone()],
+        conflict_labels: Vec::new(),
+        sparse_patterns: vec![String::new()],
+        sparse_patterns_set: true,
+    };
+
+    assert!(matches!(
+        meta.put_view_for_project("repo-batch", "proj-a", &view_ids[0], &stale_view)
+            .await,
+        Err(StoreError::FailedPrecondition(_))
+    ));
+    assert!(matches!(
+        meta.put_operation_for_project("repo-batch", "proj-a", &op_ids[0], &stale_op, true)
+            .await,
+        Err(StoreError::FailedPrecondition(_))
+    ));
+    assert!(matches!(
+        meta.publish_operation_for_project(
+            "repo-batch",
+            "proj-a",
+            &view_ids[0],
+            &stale_view,
+            &op_ids[0],
+            &stale_op,
+            std::slice::from_ref(&root_op),
+            true,
+        )
+        .await,
+        Err(StoreError::FailedPrecondition(_))
+    ));
+    assert!(matches!(
+        meta.update_op_heads_for_project(
+            "repo-batch",
+            "proj-a",
+            std::slice::from_ref(&root_op),
+            &op_ids[0],
+            true,
+        )
+        .await,
+        Err(StoreError::FailedPrecondition(_))
+    ));
+    assert!(matches!(
+        meta.update_op_heads_cas_for_project(
+            "repo-batch",
+            "proj-a",
+            std::slice::from_ref(&root_op),
+            &op_ids[0],
+            true,
+        )
+        .await,
+        Err(StoreError::FailedPrecondition(_))
+    ));
+    for expected in [None, Some([].as_slice()), Some(root_op.as_slice())] {
+        assert!(matches!(
+            meta.put_workspace_cas_for_project("proj-a", &stale_ws, expected, true)
+                .await,
+            Err(StoreError::FailedPrecondition(_))
+        ));
+    }
+
+    // Even when expected_project_id matches "proj-b", requiring dependency existence inside
+    // the serializable transaction rejects committing deleted/missing views, parent ops,
+    // operation heads, and workspace operations.
+    assert!(matches!(
+        meta.put_operation_for_project("repo-batch", "proj-b", &op_ids[0], &stale_op, true)
+            .await,
+        Err(StoreError::MissingDependency {
+            parent_kind: "operation",
+            missing_kind: "view",
+            ..
+        })
+    ));
+    let missing_parent_op = Operation {
+        view_id: cc_common::ROOT_VIEW_ID_BYTES.to_vec(),
+        parents: vec![op_ids[0].clone()],
+        ..Default::default()
+    };
+    assert!(matches!(
+        meta.put_operation_for_project(
+            "repo-batch",
+            "proj-b",
+            &op_ids[1],
+            &missing_parent_op,
+            true,
+        )
+        .await,
+        Err(StoreError::MissingDependency {
+            parent_kind: "operation",
+            missing_kind: "parent operation",
+            ..
+        })
+    ));
+    let mut stale_op_ws = stale_ws.clone();
+    stale_op_ws.operation_id = op_ids[0].clone();
+    assert!(matches!(
+        meta.put_workspace_cas_for_project("proj-b", &stale_op_ws, None, true)
+            .await,
+        Err(StoreError::MissingDependency {
+            parent_kind: "workspace",
+            missing_kind: "operation",
+            ..
+        })
+    ));
+    assert!(matches!(
+        meta.update_op_heads_for_project(
+            "repo-batch",
+            "proj-b",
+            std::slice::from_ref(&root_op),
+            &op_ids[0],
+            true,
+        )
+        .await,
+        Err(StoreError::MissingDependency {
+            parent_kind: "op_heads",
+            missing_kind: "operation",
+            ..
+        })
+    ));
+    assert!(matches!(
+        meta.update_op_heads_cas_for_project(
+            "repo-batch",
+            "proj-b",
+            std::slice::from_ref(&root_op),
+            &op_ids[0],
+            true,
+        )
+        .await,
+        Err(StoreError::MissingDependency {
+            parent_kind: "op_heads",
+            missing_kind: "operation",
+            ..
+        })
+    ));
+
+    // Confirm nothing was persisted into repo-batch under proj-b.
+    assert!(
+        meta.get_view("repo-batch", &view_ids[0])
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        meta.get_operation("repo-batch", &op_ids[0])
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        meta.get_op_heads("repo-batch").await.unwrap(),
+        Some(vec![root_op])
+    );
+    assert!(meta.list_workspaces("repo-batch").await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_spanner_delete_repository_atomic_fast_path_unconditional_replacement_and_batch_cap() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let Some(emulator) = testutils::SpannerEmulatorGuard::start_or_skip(
+        "test_spanner_delete_repository_atomic_fast_path_unconditional_replacement_and_batch_cap",
+        false,
+    )
+    .await
+    else {
+        return;
+    };
+
+    let cfg = SpannerConnectConfig {
+        database: emulator.database_uri(&unique_db_id("cc_del_atom")),
+        endpoint: Some(emulator.grpc_endpoint()),
+        admin_endpoint: Some(emulator.rest_endpoint().to_string()),
+        auto_migrate: true,
+        emulator: true,
+        ..Default::default()
+    };
+    let meta = Arc::new(
+        SpannerMetadataStore::connect(&cfg)
+            .await
+            .unwrap()
+            .with_delete_batch_limit(3),
+    );
+    let store = CompositeStore::new(meta.clone(), Arc::new(MemoryBlobStore::new()));
+    store.register_project("proj-a", None).await.unwrap();
+    store.register_project("proj-b", None).await.unwrap();
+
+    // Exact boundary fast path (1 Workspace + 1 Operation + 1 View == batch_limit 3):
+    // must delete everything in ONE Serializable transaction (0 drain-batch hook invocations).
+    store
+        .register_repo_in_project("repo-fast", Some("proj-a"), None)
+        .await
+        .unwrap();
+    let fast_view_id = vec![0x11; cc_common::VIEW_ID_LENGTH];
+    let fast_op_id = vec![0x12; cc_common::OPERATION_ID_LENGTH];
+    store
+        .publish_operation(
+            "repo-fast",
+            &fast_view_id,
+            &View {
+                head_ids: vec![cc_common::ROOT_COMMIT_ID_BYTES.to_vec()],
+                ..Default::default()
+            },
+            &fast_op_id,
+            &Operation {
+                view_id: fast_view_id.clone(),
+                parents: vec![cc_common::ROOT_OPERATION_ID_BYTES.to_vec()],
+                ..Default::default()
+            },
+            &[cc_common::ROOT_OPERATION_ID_BYTES.to_vec()],
+        )
+        .await
+        .unwrap();
+    #[allow(deprecated)]
+    let fast_ws = cc_common::workspace::WorkspaceState {
+        repo_id: "repo-fast".to_string(),
+        user: "alice@example.com".to_string(),
+        workspace_name: "default".to_string(),
+        commit_id: cc_common::ROOT_COMMIT_ID_BYTES.to_vec(),
+        operation_id: fast_op_id.clone(),
+        tree_id: cc_common::EMPTY_TREE_ID_BYTES.to_vec(),
+        tree_ids: vec![cc_common::EMPTY_TREE_ID_BYTES.to_vec()],
+        conflict_labels: Vec::new(),
+        sparse_patterns: vec![String::new()],
+        sparse_patterns_set: true,
+    };
+    store.put_workspace(&fast_ws).await.unwrap();
+
+    let fast_batches = Arc::new(AtomicUsize::new(0));
+    let fast_batches_hook = Arc::clone(&fast_batches);
+    assert!(
+        meta.delete_repository_with_after_batch_hook("repo-fast", Some("proj-a"), move |_| {
+            let counter = Arc::clone(&fast_batches_hook);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+        .await
+        .unwrap()
+    );
+    assert_eq!(
+        fast_batches.load(Ordering::SeqCst),
+        0,
+        "child count == batch_limit must commit atomically in a single Serializable transaction"
+    );
+    assert!(meta.get_op_heads("repo-fast").await.unwrap().is_none());
+    assert!(
+        meta.get_view("repo-fast", &fast_view_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        meta.get_operation("repo-fast", &fast_op_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(meta.list_workspaces("repo-fast").await.unwrap().is_empty());
+
+    // Unconditional delete (`expected_project_id == None`) encountering concurrent delete +
+    // re-register under `proj-b` after batch 0 must return `Ok(false)` (not `FailedPrecondition`)
+    // and leave `proj-b`'s new repository and child rows untouched.
+    let small_meta = Arc::new(meta.as_ref().clone().with_delete_batch_limit(2));
+    let seed_oversized = |repo_id: &'static str| {
+        let store = store.clone();
+        async move {
+            store
+                .register_repo_in_project(repo_id, Some("proj-a"), None)
+                .await
+                .unwrap();
+            let mut prev_op = cc_common::ROOT_OPERATION_ID_BYTES.to_vec();
+            for idx in 1u8..=3u8 {
+                let mut vid = vec![0x30; cc_common::VIEW_ID_LENGTH];
+                vid[15] = idx;
+                let mut oid = vec![0x40; cc_common::OPERATION_ID_LENGTH];
+                oid[15] = idx;
+                store
+                    .publish_operation(
+                        repo_id,
+                        &vid,
+                        &View {
+                            head_ids: vec![cc_common::ROOT_COMMIT_ID_BYTES.to_vec()],
+                            ..Default::default()
+                        },
+                        &oid,
+                        &Operation {
+                            view_id: vid.clone(),
+                            parents: vec![prev_op.clone()],
+                            ..Default::default()
+                        },
+                        std::slice::from_ref(&prev_op),
+                    )
+                    .await
+                    .unwrap();
+                prev_op = oid;
+            }
+        }
+    };
+
+    seed_oversized("repo-uncond").await;
+    let new_proj_b_view = vec![0x91; cc_common::VIEW_ID_LENGTH];
+    let new_proj_b_op = vec![0x92; cc_common::OPERATION_ID_LENGTH];
+    let meta_for_replace = Arc::clone(&meta);
+    let view_for_replace = new_proj_b_view.clone();
+    let op_for_replace = new_proj_b_op.clone();
+    let uncond_res = small_meta
+        .delete_repository_with_after_batch_hook("repo-uncond", None, move |batch_idx| {
+            let meta = Arc::clone(&meta_for_replace);
+            let view_id = view_for_replace.clone();
+            let op_id = op_for_replace.clone();
+            async move {
+                if batch_idx == 0 {
+                    assert!(
+                        meta.delete_repository("repo-uncond", Some("proj-a"))
+                            .await
+                            .unwrap()
+                    );
+                    meta.register_repo_in_project("repo-uncond", "proj-b", None)
+                        .await
+                        .unwrap();
+                    meta.publish_operation_for_project(
+                        "repo-uncond",
+                        "proj-b",
+                        &view_id,
+                        &View {
+                            head_ids: vec![cc_common::ROOT_COMMIT_ID_BYTES.to_vec()],
+                            ..Default::default()
+                        },
+                        &op_id,
+                        &Operation {
+                            view_id: view_id.clone(),
+                            parents: vec![cc_common::ROOT_OPERATION_ID_BYTES.to_vec()],
+                            ..Default::default()
+                        },
+                        &[cc_common::ROOT_OPERATION_ID_BYTES.to_vec()],
+                        true,
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+        })
+        .await
+        .expect("unconditional delete after concurrent replacement must return Ok(false)");
+    assert!(!uncond_res);
+    assert_eq!(
+        meta.get_repo_project_id("repo-uncond")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("proj-b")
+    );
+    assert_eq!(
+        meta.get_op_heads("repo-uncond").await.unwrap(),
+        Some(vec![new_proj_b_op.clone()])
+    );
+    assert!(
+        meta.get_view("repo-uncond", &new_proj_b_view)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    // Conditional delete (`expected_project_id == Some("proj-a")`) encountering concurrent
+    // replacement under `proj-b` returns `FailedPrecondition` and leaves `proj-b` intact.
+    seed_oversized("repo-cond").await;
+    let meta_for_cond = Arc::clone(&meta);
+    let cond_err = small_meta
+        .delete_repository_with_after_batch_hook("repo-cond", Some("proj-a"), move |batch_idx| {
+            let meta = Arc::clone(&meta_for_cond);
+            async move {
+                if batch_idx == 0 {
+                    assert!(
+                        meta.delete_repository("repo-cond", Some("proj-a"))
+                            .await
+                            .unwrap()
+                    );
+                    meta.register_repo_in_project("repo-cond", "proj-b", None)
+                        .await
+                        .unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(cond_err, StoreError::FailedPrecondition(_)),
+        "expected FailedPrecondition, got {cond_err:?}"
+    );
+    assert_eq!(
+        meta.get_repo_project_id("repo-cond")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("proj-b")
+    );
+
+    // Multi-batch drain with concurrent child write mid-drain leaves zero orphaned rows,
+    // and hitting `max_delete_batch_iterations` returns `StoreError::Unavailable` for retry.
+    seed_oversized("repo-cap").await;
+    let capped_meta = meta
+        .as_ref()
+        .clone()
+        .with_delete_batch_limit(2)
+        .with_max_delete_batch_iterations(1);
+    let cap_err = capped_meta
+        .delete_repository("repo-cap", Some("proj-a"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(cap_err, StoreError::Unavailable(_)),
+        "exceeding max_delete_batch_iterations must return Unavailable, got {cap_err:?}"
+    );
+    // Retrying with normal iteration budget drains remaining rows + concurrent write.
+    let late_view = vec![0xa1; cc_common::VIEW_ID_LENGTH];
+    let late_op = vec![0xa2; cc_common::OPERATION_ID_LENGTH];
+    let meta_for_late = Arc::clone(&meta);
+    let late_view_hook = late_view.clone();
+    let late_op_hook = late_op.clone();
+    assert!(
+        small_meta
+            .delete_repository_with_after_batch_hook("repo-cap", Some("proj-a"), move |batch_idx| {
+                let meta = Arc::clone(&meta_for_late);
+                let vid = late_view_hook.clone();
+                let oid = late_op_hook.clone();
+                async move {
+                    if batch_idx == 0 {
+                        let _ = meta
+                            .publish_operation_for_project(
+                                "repo-cap",
+                                "proj-a",
+                                &vid,
+                                &View {
+                                    head_ids: vec![cc_common::ROOT_COMMIT_ID_BYTES.to_vec()],
+                                    ..Default::default()
+                                },
+                                &oid,
+                                &Operation {
+                                    view_id: vid.clone(),
+                                    parents: vec![cc_common::ROOT_OPERATION_ID_BYTES.to_vec()],
+                                    ..Default::default()
+                                },
+                                &[cc_common::ROOT_OPERATION_ID_BYTES.to_vec()],
+                                true,
+                            )
+                            .await;
+                    }
+                }
+            })
+            .await
+            .unwrap()
+    );
+    assert!(meta.get_op_heads("repo-cap").await.unwrap().is_none());
+    assert!(
+        meta.get_view("repo-cap", &late_view)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        meta.get_operation("repo-cap", &late_op)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }

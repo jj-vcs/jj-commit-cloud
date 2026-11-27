@@ -71,8 +71,10 @@ package commit_cloud.workspace;
 // - `FAILED_PRECONDITION`: `UpdateWorkspace` specifies a non-empty, non-root
 //   `operation_id` whose `Operation` or non-root `View` has not been persisted
 //   yet, a non-`ROOT_COMMIT_ID` resolved `commit_id` absent from the
-//   repository's project store, or any non-`EMPTY_TREE_ID` entry in `tree_ids`
-//   absent from the repository's project store.
+//   repository's project store, any non-`EMPTY_TREE_ID` entry in `tree_ids`
+//   absent from the repository's project store, or `repo_id` was concurrently
+//   deleted and re-bound to a different `project_id` during `UpdateWorkspace`
+//   or `CheckWorkingCopyChanges`.
 // - `ABORTED`: `UpdateWorkspace` specified `expected_operation_id`, and the
 //   persisted workspace record neither matched `expected_operation_id` nor
 //   equaled the normalized target `WorkspaceState`.
