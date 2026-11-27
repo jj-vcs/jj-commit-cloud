@@ -9,6 +9,7 @@ Use these rules when reading, editing, testing, or reviewing code in [jj-commit-
 * **Commit Cloud Server ([server/](server/), `jj-commit-cloud-server`, binary jj-cc-server):** Serves gRPC endpoints, computes canonical object digests via [gitoxide](https://github.com/GitoxideLabs/gitoxide), reconciles divergent operation heads, and persists repository state behind the `Store` trait (`MemoryStore`, `SqliteStore`, `SpannerStore`).
 * **Custom CLI ([cli/](cli/), binary jj):** Embeds `jj_cli` alongside the `jj cc` subcommand family while keeping local `GitBackend` repositories working unchanged.
 * **Local Proxy Daemon ([daemon/](daemon/), `jj-commit-cloud-daemon`, binary jj-cc-daemon):** Runs a local Unix domain socket gRPC proxy forwarding `BackendService`, `OpStoreService`, and `WorkspaceService` calls over a shared upstream connection.
+* **Storage Traits ([storage/](storage/), `cc-storage`):** Defines the backend-neutral `ObjectStore`, `MetadataStore` and `BlobStore` contracts with in-memory, SQLite and local-disk implementations and conformance suites; not yet used by the server.
 * **Integration Test Utilities ([testutils/](testutils/)):** Builds and spawns ephemeral jj-cc-server and jj-cc-daemon instances for automated tests.
 
 ## Codebase, Proto, and Comment Conventions

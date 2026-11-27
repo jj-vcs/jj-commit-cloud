@@ -1,0 +1,30 @@
+[package]
+name = "cc-storage"
+version = "0.0.0"
+edition = "2024"
+description = "Backend-neutral storage traits for the Commit Cloud server"
+publish = false
+
+[features]
+# Off by default, so a dependent builds only what it asks for; this crate's
+# own tests turn them all on (see dev-dependencies).
+default = []
+# Generic test suites any implementation can run (the seed of DEV-93).
+conformance = ["dep:tokio"]
+# Local-disk blob store (DEV-194).
+local-disk = ["dep:tokio"]
+# SQLite metadata store: persistent single-node fallback for Demo 2.
+sqlite = ["dep:tokio", "dep:rusqlite"]
+
+[dependencies]
+async-trait = "0.1"
+bytes = "1"
+sha1 = "0.10"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt", "macros", "sync"], optional = true }
+rusqlite = { version = "0.31", features = ["bundled"], optional = true }
+
+[dev-dependencies]
+cc-storage = { path = ".", features = ["conformance", "local-disk", "sqlite"] }
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
