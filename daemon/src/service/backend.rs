@@ -45,6 +45,55 @@ pub(super) fn decode_symlink_target(raw: &[u8]) -> Result<String, Status> {
         .map_err(|e| Status::data_loss(format!("symlink target is not valid UTF-8: {e}")))
 }
 
+struct DeletePurgeGuard {
+    proxy: DaemonProxy,
+    target_url: String,
+    repo_id: String,
+    armed: bool,
+}
+
+impl DeletePurgeGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DeletePurgeGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Mark the namespace as pending purge, advance `purge_epoch`, and clear in-memory L1/auth
+        // and `giant_trees` immediately so no L1 or L2 read can serve stale deleted data before
+        // full disk cleanup completes.
+        let pending_guard = self
+            .proxy
+            .inner
+            .cache
+            .begin_pending_purge(&self.target_url, &self.repo_id);
+        self.proxy
+            .purge_giant_trees_for_namespace(&self.target_url, &self.repo_id);
+        let proxy = self.proxy.clone();
+        let target_url = self.target_url.clone();
+        let repo_id = self.repo_id.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                proxy
+                    .purge_namespace_state_with_guard(&target_url, &repo_id, pending_guard)
+                    .await;
+            });
+        } else {
+            self.proxy.inner.cache.purge_namespace_blocking_with_guard(
+                &self.target_url,
+                &self.repo_id,
+                pending_guard,
+            );
+            self.proxy
+                .purge_giant_trees_for_namespace(&self.target_url, &self.repo_id);
+        }
+    }
+}
+
 #[tonic::async_trait]
 impl BackendService for DaemonProxy {
     async fn register_project(
@@ -71,16 +120,77 @@ impl BackendService for DaemonProxy {
     ) -> Result<Response<RegisterRepositoryResponse>, Status> {
         let _active = self.track_active_rpc();
         let meta = request.metadata().clone();
-        let out = self
-            .inner
-            .upstream
-            .prepare_outbound(&meta, request.into_inner())?;
+        let req = request.into_inner();
+        let explicit_repo_id = req.repo_id.as_deref().is_some_and(|s| !s.trim().is_empty());
+        let out = self.inner.upstream.prepare_outbound(&meta, req)?;
+        let target_url = self.inner.upstream.resolve_target_url(&meta)?;
         let channel = self.inner.upstream.channel_for(&meta).await?;
         self.inner.cache.record_upstream_rpc();
         let mut client = backend_client(channel);
         let res = client.register_repository(out).await?.into_inner();
+        // When registering an explicit `repo_id`, purge any stale cached scoped objects and
+        // authorization markers for that `repo_id` (e.g. if another client deleted and re-bound
+        // it directly on the server, bypassing this daemon's `DeleteRepository`). Skip
+        // server-allocated UUIDs (`req.repo_id.is_none()`) to avoid unnecessary epoch bumps.
+        if explicit_repo_id && !res.repo_id.is_empty() {
+            self.purge_namespace_state(&target_url, &res.repo_id).await;
+        }
         self.maybe_flush_stats();
         Ok(Response::new(res))
+    }
+
+    async fn delete_repository(
+        &self,
+        request: Request<DeleteRepositoryRequest>,
+    ) -> Result<Response<DeleteRepositoryResponse>, Status> {
+        let _active = self.track_active_rpc();
+        let meta = request.metadata().clone();
+        let req = request.into_inner();
+        let repo_id = req.repo_id.clone();
+        let out = self.inner.upstream.prepare_outbound(&meta, req)?;
+        let target_url = self.inner.upstream.resolve_target_url(&meta)?;
+        let channel = self.inner.upstream.channel_for(&meta).await?;
+        self.inner.cache.record_upstream_rpc();
+        let mut client = backend_client(channel);
+        let mut purge_guard = DeletePurgeGuard {
+            proxy: self.clone(),
+            target_url: target_url.clone(),
+            repo_id: repo_id.clone(),
+            armed: true,
+        };
+        match client.delete_repository(out).await {
+            Ok(resp) => {
+                // Purge all locally cached scoped objects, authorization markers, and giant-tree
+                // entries for `repo_id` unconditionally on success (even if `existed == false`,
+                // e.g. deleted by another client or on an earlier attempt) so read-after-delete
+                // and delete+re-register never serve stale views, operations, commits, or
+                // cross-project authorized objects.
+                self.purge_namespace_state(&target_url, &repo_id).await;
+                purge_guard.disarm();
+                self.maybe_flush_stats();
+                Ok(Response::new(resp.into_inner()))
+            }
+            Err(status) => {
+                // Keep cached state intact on definitive non-mutating rejections, but purge on
+                // ambiguous/partial-drain errors (`UNAVAILABLE`, `DEADLINE_EXCEEDED`, `CANCELLED`,
+                // etc.) where upstream may have already deleted some or all repository rows.
+                if matches!(
+                    status.code(),
+                    tonic::Code::InvalidArgument
+                        | tonic::Code::FailedPrecondition
+                        | tonic::Code::Unauthenticated
+                        | tonic::Code::PermissionDenied
+                        | tonic::Code::Unimplemented
+                ) {
+                    purge_guard.disarm();
+                } else {
+                    self.purge_namespace_state(&target_url, &repo_id).await;
+                    purge_guard.disarm();
+                }
+                self.maybe_flush_stats();
+                Err(status)
+            }
+        }
     }
 
     async fn read_commit(
@@ -270,6 +380,7 @@ impl BackendService for DaemonProxy {
         let meta = request.metadata().clone();
         let req = request.into_inner();
         let scope = self.scope_for(&meta, &req.project_id)?;
+        let cache_epoch = self.inner.cache.purge_epoch();
         let target_bytes = Bytes::from(req.target.clone().into_bytes());
         let out = self.inner.upstream.prepare_outbound(&meta, req)?;
         let channel = self.inner.upstream.channel_for(&meta).await?;
@@ -278,11 +389,12 @@ impl BackendService for DaemonProxy {
         let res = client.write_symlink(out).await?.into_inner();
         self.inner
             .cache
-            .put_write_through_async(
+            .put_write_through_if_epoch_async(
                 scope,
                 ObjectKind::Symlink,
                 res.symlink_id.clone(),
                 target_bytes,
+                Some(cache_epoch),
             )
             .await;
         self.maybe_flush_stats();

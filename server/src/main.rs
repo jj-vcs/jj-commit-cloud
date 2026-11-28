@@ -25,7 +25,8 @@
 //! Loads optional Bearer tokens from `--auth-token` / `--auth-token-file`, scrubs raw
 //! secret buffers after building [`BearerAuthInterceptor`], fails closed on empty token
 //! specs or unauthenticated non-loopback binds (unless `--allow-unauthenticated`), and
-//! exposes gRPC health probes unauthenticated for readiness checks.
+//! exposes gRPC health probes and optional HTTP `--metrics-listen` (`/healthz`, `/statz`,
+//! `/metrics`) endpoints unauthenticated for readiness checks and telemetry scraping.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -46,6 +47,7 @@ use jj_commit_cloud_server::auth::{
 use jj_commit_cloud_server::backend::{
     CommitCloudBackendService, DEFAULT_WRITE_STREAM_SPILL_THRESHOLD_BYTES,
 };
+use jj_commit_cloud_server::metrics::{MetricsLayer, ServerMetrics, bind_and_serve_metrics};
 use jj_commit_cloud_server::op_store::CommitCloudOpStoreService;
 use jj_commit_cloud_server::store::gcsblob::{normalize_bucket_identifiers, validate_gcs_endpoint};
 use jj_commit_cloud_server::store::{
@@ -219,6 +221,11 @@ struct Args {
     /// behind Cloud Run IAM, Identity-Aware Proxy, or an isolated container network)
     #[arg(long, env = "JJ_CC_ALLOW_UNAUTHENTICATED")]
     allow_unauthenticated: bool,
+
+    /// Optional HTTP listen address for unauthenticated observability endpoints
+    /// (`/healthz`, `/statz`, `/metrics`), e.g. `127.0.0.1:9090` (disabled when unset or blank)
+    #[arg(long, env = "METRICS_LISTEN")]
+    metrics_listen: Option<String>,
 }
 
 const DEFAULT_BLOB_CACHE_BYTES: usize = 64 * 1024 * 1024;
@@ -262,6 +269,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .spanner_database
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    let metrics_listen_addr: Option<std::net::SocketAddr> = args
+        .metrics_listen
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|raw| {
+            raw.parse::<std::net::SocketAddr>().map_err(|e| {
+                format!(
+                    "invalid --metrics-listen address '{raw}' \
+                     (expected ip:port, e.g. 127.0.0.1:9090): {e}"
+                )
+            })
+        })
+        .transpose()?;
     let mut combined_tokens = std::mem::take(&mut args.auth_tokens);
     if let Some(token_file) = &args.auth_token_file {
         match load_tokens_from_file(token_file) {
@@ -438,6 +459,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         local_peer_specs.push((loc_uri.to_string(), dir_str.to_string()));
     }
 
+    let metrics = ServerMetrics::new();
+
     let metadata_store: Arc<dyn MetadataStore> = match args.store_type {
         StoreType::Memory => Arc::new(MemoryMetadataStore::new()),
         StoreType::Sqlite => {
@@ -463,7 +486,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 auto_migrate: args.spanner_auto_migrate,
                 emulator: args.spanner_emulator,
             };
-            Arc::new(SpannerMetadataStore::connect(&cfg).await?)
+            Arc::new(
+                SpannerMetadataStore::connect(&cfg)
+                    .await?
+                    .with_tx_retries_counter(metrics.db_tx_retries_counter()),
+            )
         }
     };
     if effective_blob_store == BlobStoreType::Memory && args.store_type != StoreType::Memory {
@@ -534,7 +561,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let blob_store: Arc<dyn BlobStore> =
         if !peer_stores.is_empty() || cache_capacity_bytes > 0 || args.gcs_replication_retry_ms > 0
         {
-            Arc::new(ReplicatedBlobStore::new(
+            let replicated = ReplicatedBlobStore::new(
                 primary_blob_store,
                 peer_stores,
                 metadata_store.clone(),
@@ -544,7 +571,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     initial_retry_backoff: Duration::from_millis(20),
                     async_write_fanout: args.gcs_async_write_fanout,
                 },
-            ))
+            );
+            metrics.attach_replication_stats(replicated.stats().clone());
+            Arc::new(replicated)
         } else {
             primary_blob_store
         };
@@ -574,15 +603,44 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = tokio::net::TcpListener::bind(listen_addrs.as_slice()).await?;
     let local_addr = listener.local_addr()?;
+
+    let (shutdown_tx, mut grpc_shutdown_rx) = tokio::sync::watch::channel(false);
+    let (bound_metrics_addr, metrics_task) = if let Some(metrics_addr) = metrics_listen_addr {
+        let mut metrics_shutdown_rx = grpc_shutdown_rx.clone();
+        let (bound, handle) = bind_and_serve_metrics(metrics_addr, metrics.clone(), async move {
+            let _ = metrics_shutdown_rx.wait_for(|&stopped| stopped).await;
+        })
+        .await?;
+        (Some(bound), Some(handle))
+    } else {
+        (None, None)
+    };
+
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = shutdown_tx.send(true);
+    });
+
+    if let Some(bound) = bound_metrics_addr {
+        if !bound.ip().is_loopback() {
+            warn!(
+                "Observability HTTP server (--metrics-listen) bound to non-loopback address {}; \
+                 /healthz, /statz, and /metrics are unauthenticated",
+                bound
+            );
+        }
+        info!("jj-cc-server metrics server bound to {}", bound);
+    }
     info!("jj-cc-server listening on {}", local_addr);
 
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-    let backend_service = CommitCloudBackendService::new(store.clone());
-    let op_store_service = CommitCloudOpStoreService::new(store.clone());
-    let workspace_service = CommitCloudWorkspaceService::new(store);
+    let backend_service = CommitCloudBackendService::with_metrics(store.clone(), metrics.clone());
+    let op_store_service = CommitCloudOpStoreService::with_metrics(store.clone(), metrics.clone());
+    let workspace_service = CommitCloudWorkspaceService::with_metrics(store, metrics.clone());
 
     Server::builder()
         .http2_max_header_list_size(64 * 1024)
+        .layer(MetricsLayer::new(metrics))
         .add_service(health_service)
         .add_service(tonic::service::interceptor::InterceptedService::new(
             BackendServiceServer::new(backend_service)
@@ -602,8 +660,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .max_encoding_message_size(cc_common::MAX_GRPC_MESSAGE_BYTES),
             auth,
         ))
-        .serve_with_incoming_shutdown(incoming, shutdown_signal())
+        .serve_with_incoming_shutdown(incoming, async move {
+            let _ = grpc_shutdown_rx.wait_for(|&stopped| stopped).await;
+        })
         .await?;
+
+    if let Some(mut handle) = metrics_task
+        && tokio::time::timeout(Duration::from_secs(5), &mut handle)
+            .await
+            .is_err()
+    {
+        warn!(
+            "Observability HTTP server did not shut down within 5s; aborting remaining connections"
+        );
+        handle.abort();
+    }
 
     Ok(())
 }

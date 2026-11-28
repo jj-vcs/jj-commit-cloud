@@ -24,9 +24,10 @@
 //!
 //! # Concurrency and Merge Invariants
 //! File-backed databases open a dedicated writer connection alongside a pool of read-only
-//! `WAL` snapshot connections so concurrent agent reads never contend on the writer mutex,
-//! while `update_op_heads` and `publish_operation_atomic` acquire `TransactionBehavior::Immediate`
-//! write locks to apply [`super::apply_op_heads_mutation`] without read-modify-write races.
+//! `WAL` snapshot connections so concurrent agent reads never contend on the writer mutex.
+//! `TransactionBehavior::Immediate` transactions serialize `update_op_heads`,
+//! `publish_operation_atomic`, atomic `*_for_project` project-binding checks, and
+//! `delete_repository` (cascading repo-scoped tables while preserving shared project data).
 //!
 //! # Cross-Process and RPC Boundaries
 //! Blocking `rusqlite` operations run on Tokio's `spawn_blocking` pool and map SQLite
@@ -195,6 +196,15 @@ impl MetadataStore for SqliteMetadataStore {
         name: Option<&str>,
     ) -> StoreResult<String> {
         self.register_repo_in_project_impl(repo_id, project_id, name)
+            .await
+    }
+
+    async fn delete_repository(
+        &self,
+        repo_id: &str,
+        expected_project_id: Option<&str>,
+    ) -> StoreResult<bool> {
+        self.delete_repository_impl(repo_id, expected_project_id)
             .await
     }
 
@@ -386,6 +396,24 @@ impl MetadataStore for SqliteMetadataStore {
         self.put_operation_impl(repo_id, op_id, op).await
     }
 
+    async fn put_operation_for_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+        op_id: &[u8],
+        op: &Operation,
+        require_dependencies_exist: bool,
+    ) -> StoreResult<()> {
+        self.put_operation_for_project_impl(
+            repo_id,
+            expected_project_id,
+            op_id,
+            op,
+            require_dependencies_exist,
+        )
+        .await
+    }
+
     async fn resolve_operation_id_prefix(
         &self,
         repo_id: &str,
@@ -408,6 +436,17 @@ impl MetadataStore for SqliteMetadataStore {
         self.put_view_impl(repo_id, view_id, view).await
     }
 
+    async fn put_view_for_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+        view_id: &[u8],
+        view: &View,
+    ) -> StoreResult<()> {
+        self.put_view_for_project_impl(repo_id, expected_project_id, view_id, view)
+            .await
+    }
+
     async fn get_op_heads(&self, repo_id: &str) -> StoreResult<Option<Vec<OpId>>> {
         self.get_op_heads_impl(repo_id).await
     }
@@ -419,6 +458,24 @@ impl MetadataStore for SqliteMetadataStore {
         new_id: &[u8],
     ) -> StoreResult<Vec<OpId>> {
         self.update_op_heads_impl(repo_id, old_ids, new_id).await
+    }
+
+    async fn update_op_heads_for_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+        old_head_ids: &[Vec<u8>],
+        new_head_id: &[u8],
+        require_op_exists: bool,
+    ) -> StoreResult<Vec<OpId>> {
+        self.update_op_heads_for_project_impl(
+            repo_id,
+            expected_project_id,
+            old_head_ids,
+            new_head_id,
+            require_op_exists,
+        )
+        .await
     }
 
     async fn publish_operation_atomic(
@@ -434,6 +491,31 @@ impl MetadataStore for SqliteMetadataStore {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_operation_for_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+        view_id: &[u8],
+        view: &View,
+        op_id: &[u8],
+        op: &Operation,
+        old_op_head_ids: &[Vec<u8>],
+        require_dependencies_exist: bool,
+    ) -> StoreResult<Vec<OpId>> {
+        self.publish_operation_for_project_impl(
+            repo_id,
+            expected_project_id,
+            view_id,
+            view,
+            op_id,
+            op,
+            old_op_head_ids,
+            require_dependencies_exist,
+        )
+        .await
+    }
+
     async fn compare_and_swap_op_heads(
         &self,
         repo_id: &str,
@@ -442,6 +524,24 @@ impl MetadataStore for SqliteMetadataStore {
     ) -> StoreResult<()> {
         self.compare_and_swap_op_heads_impl(repo_id, expected_old_ids, new_id)
             .await
+    }
+
+    async fn update_op_heads_cas_for_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+        expected_exact_heads: &[Vec<u8>],
+        new_head_id: &[u8],
+        require_op_exists: bool,
+    ) -> StoreResult<()> {
+        self.update_op_heads_cas_for_project_impl(
+            repo_id,
+            expected_project_id,
+            expected_exact_heads,
+            new_head_id,
+            require_op_exists,
+        )
+        .await
     }
 
     async fn get_workspace(
@@ -453,7 +553,6 @@ impl MetadataStore for SqliteMetadataStore {
         self.get_workspace_impl(repo_id, user, workspace_name).await
     }
 
-    #[allow(deprecated)]
     async fn put_workspace_cas(
         &self,
         workspace: &WorkspaceState,
@@ -461,6 +560,22 @@ impl MetadataStore for SqliteMetadataStore {
     ) -> StoreResult<()> {
         self.put_workspace_cas_impl(workspace, expected_operation_id)
             .await
+    }
+
+    async fn put_workspace_cas_for_project(
+        &self,
+        expected_project_id: &str,
+        workspace: &WorkspaceState,
+        expected_operation_id: Option<&[u8]>,
+        require_operation_exists: bool,
+    ) -> StoreResult<()> {
+        self.put_workspace_cas_for_project_impl(
+            expected_project_id,
+            workspace,
+            expected_operation_id,
+            require_operation_exists,
+        )
+        .await
     }
 
     #[allow(deprecated)]

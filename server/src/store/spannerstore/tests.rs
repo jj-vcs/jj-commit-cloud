@@ -13,11 +13,17 @@
 // limitations under the License.
 
 use super::codec::*;
+use super::repo::*;
 use super::schema::*;
 use super::*;
 
 use crate::store::StoreError;
 use google_cloud_gax::error::rpc::{Code as RpcCode, Status as RpcStatus};
+use google_cloud_spanner::key;
+use google_cloud_spanner::key::KeySet;
+use google_cloud_spanner::mutation::Mutation;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 fn service_error(code: RpcCode) -> google_cloud_spanner::Error {
     google_cloud_gax::error::Error::service(
@@ -553,4 +559,119 @@ fn validate_existing_spanner_ddl_accepts_current_and_rejects_pre_split_poc() {
         .unwrap(),
         vec!["CREATE TABLE A (Id INT64) PRIMARY KEY(Id)".to_string()]
     );
+}
+
+#[test]
+fn tx_retry_tracker_counts_retries_only_after_initial_attempt() {
+    let shared = Arc::new(AtomicU64::new(0));
+    let tracker = TxRetryTracker {
+        attempts: AtomicUsize::new(0),
+        counter: Some(Arc::clone(&shared)),
+    };
+
+    tracker.record_attempt();
+    assert_eq!(shared.load(Ordering::Relaxed), 0);
+
+    tracker.record_attempt();
+    assert_eq!(shared.load(Ordering::Relaxed), 1);
+
+    tracker.record_attempt();
+    assert_eq!(shared.load(Ordering::Relaxed), 2);
+
+    let no_counter = TxRetryTracker {
+        attempts: AtomicUsize::new(0),
+        counter: None,
+    };
+    no_counter.record_attempt();
+    no_counter.record_attempt();
+    assert_eq!(no_counter.attempts.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn delete_batch_helpers_clamp_limits_evaluate_project_binding_and_build_key_sets() {
+    assert_eq!(clamp_delete_batch_limit(-10), 1);
+    assert_eq!(clamp_delete_batch_limit(0), 1);
+    assert_eq!(clamp_delete_batch_limit(2), 2);
+    assert_eq!(
+        clamp_delete_batch_limit(SPANNER_DELETE_BATCH_LIMIT),
+        SPANNER_DELETE_BATCH_LIMIT
+    );
+    assert_eq!(
+        clamp_delete_batch_limit(SPANNER_DELETE_BATCH_LIMIT + 10_000),
+        SPANNER_DELETE_BATCH_LIMIT
+    );
+
+    assert_eq!(clamp_max_delete_batch_iterations(0), 1);
+    assert_eq!(clamp_max_delete_batch_iterations(5), 5);
+    assert_eq!(
+        clamp_max_delete_batch_iterations(MAX_DELETE_BATCH_ITERATIONS + 500),
+        MAX_DELETE_BATCH_ITERATIONS
+    );
+
+    // Absent repo returns RepoGone for both conditional and unconditional deletes.
+    assert_eq!(
+        evaluate_delete_repo_project("r", None, None, None).unwrap(),
+        DeleteRepoProjectCheck::RepoGone
+    );
+    assert_eq!(
+        evaluate_delete_repo_project("r", None, Some("proj-a"), Some("proj-a")).unwrap(),
+        DeleteRepoProjectCheck::RepoGone
+    );
+
+    // Explicit expected_project_id matches or fails with FailedPrecondition.
+    assert_eq!(
+        evaluate_delete_repo_project("r", Some("proj-a"), Some("proj-a"), None).unwrap(),
+        DeleteRepoProjectCheck::Proceed("proj-a")
+    );
+    assert!(matches!(
+        evaluate_delete_repo_project("r", Some("proj-b"), Some("proj-a"), None),
+        Err(StoreError::FailedPrecondition(_))
+    ));
+    assert!(matches!(
+        evaluate_delete_repo_project("r", Some("proj-b"), Some("proj-a"), Some("proj-a")),
+        Err(StoreError::FailedPrecondition(_))
+    ));
+
+    // Unconditional delete proceeds on batch 0 and matching pinned batches, and returns
+    // RepoGone (Ok(false)) instead of FailedPrecondition if replaced under another project.
+    assert_eq!(
+        evaluate_delete_repo_project("r", Some("proj-a"), None, None).unwrap(),
+        DeleteRepoProjectCheck::Proceed("proj-a")
+    );
+    assert_eq!(
+        evaluate_delete_repo_project("r", Some("proj-a"), None, Some("proj-a")).unwrap(),
+        DeleteRepoProjectCheck::Proceed("proj-a")
+    );
+    assert_eq!(
+        evaluate_delete_repo_project("r", Some("proj-b"), None, Some("proj-a")).unwrap(),
+        DeleteRepoProjectCheck::RepoGone
+    );
+
+    let ws_mut = build_workspace_delete_mutation(
+        "repo-del",
+        &[
+            ("alice@example.com".to_string(), "ws-1".to_string()),
+            ("bob@example.com".to_string(), "ws-2".to_string()),
+        ],
+    );
+    let expected_ws_keys = KeySet::builder()
+        .add_key(key!["repo-del", "alice@example.com", "ws-1"])
+        .add_key(key!["repo-del", "bob@example.com", "ws-2"])
+        .build();
+    assert_eq!(ws_mut, Mutation::delete("Workspaces", expected_ws_keys));
+
+    let op_ids = vec![vec![0x01; 16], vec![0x02; 16]];
+    let op_mut = build_binary_child_delete_mutation("Operations", "repo-del", &op_ids);
+    let expected_op_keys = KeySet::builder()
+        .add_key(key!["repo-del", op_ids[0].as_slice()])
+        .add_key(key!["repo-del", op_ids[1].as_slice()])
+        .build();
+    assert_eq!(op_mut, Mutation::delete("Operations", expected_op_keys));
+
+    let view_ids = vec![vec![0xaa; 16]];
+    let view_mut = build_binary_child_delete_mutation("Views", "repo-del", &view_ids);
+    let expected_view_keys = KeySet::builder()
+        .add_key(key!["repo-del", view_ids[0].as_slice()])
+        .build();
+    assert_eq!(view_mut, Mutation::delete("Views", expected_view_keys));
 }

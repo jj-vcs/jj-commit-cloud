@@ -88,25 +88,33 @@ enum SpoolState {
 /// `max_l2_object_bytes` and always deleting uncommitted temp files on error or drop.
 pub struct BlobSpooler {
     inner: Arc<CacheInner>,
+    start_epoch: u64,
     state: SpoolState,
 }
 
 impl BlobSpooler {
     pub(super) fn for_read(inner: Arc<CacheInner>) -> Self {
+        let start_epoch = inner.purge_epoch.load(Ordering::Acquire);
         let state = if inner.max_l2_object_bytes == 0 {
             SpoolState::Disabled
         } else {
             SpoolState::InMemory(Vec::new())
         };
-        Self { inner, state }
+        Self {
+            inner,
+            start_epoch,
+            state,
+        }
     }
 
     pub(super) fn for_write(inner: Arc<CacheInner>, declared_total_size: Option<u64>) -> Self {
+        let start_epoch = inner.purge_epoch.load(Ordering::Acquire);
         if inner.max_l2_object_bytes == 0
             || declared_total_size.is_some_and(|total| total > inner.max_l2_object_bytes)
         {
             return Self {
                 inner,
+                start_epoch,
                 state: SpoolState::Disabled,
             };
         }
@@ -117,6 +125,7 @@ impl BlobSpooler {
         });
         Self {
             inner,
+            start_epoch,
             state: SpoolState::PendingDisk { incremental_sha1 },
         }
     }
@@ -277,6 +286,7 @@ impl BlobSpooler {
             self.discard().await;
             return false;
         }
+        let start_epoch = self.start_epoch;
         let state = std::mem::replace(&mut self.state, SpoolState::Disabled);
         match state {
             SpoolState::Disabled => false,
@@ -284,8 +294,13 @@ impl BlobSpooler {
                 let inner = Arc::clone(&self.inner);
                 let payload = Bytes::from(buf);
                 tokio::task::spawn_blocking(move || {
-                    let inserted =
-                        inner.insert_verified(&scope, ObjectKind::File, &file_id, &payload);
+                    let inserted = inner.insert_verified_with_epoch(
+                        &scope,
+                        ObjectKind::File,
+                        &file_id,
+                        &payload,
+                        Some(start_epoch),
+                    );
                     if inserted && is_write_through {
                         inner.write_through_objects.fetch_add(1, Ordering::Relaxed);
                     }
@@ -297,8 +312,13 @@ impl BlobSpooler {
             SpoolState::PendingDisk { .. } => {
                 let inner = Arc::clone(&self.inner);
                 tokio::task::spawn_blocking(move || {
-                    let inserted =
-                        inner.insert_verified(&scope, ObjectKind::File, &file_id, &Bytes::new());
+                    let inserted = inner.insert_verified_with_epoch(
+                        &scope,
+                        ObjectKind::File,
+                        &file_id,
+                        &Bytes::new(),
+                        Some(start_epoch),
+                    );
                     if inserted && is_write_through {
                         inner.write_through_objects.fetch_add(1, Ordering::Relaxed);
                     }
@@ -331,6 +351,7 @@ impl BlobSpooler {
                         bytes_written,
                         incremental_sha1,
                         is_write_through,
+                        Some(start_epoch),
                     )
                 })
                 .await
@@ -380,6 +401,7 @@ fn commit_staged_disk_file(
     bytes_written: u64,
     incremental_sha1: Option<(u64, Sha1)>,
     is_write_through: bool,
+    expected_epoch: Option<u64>,
 ) -> bool {
     let l1_key = CacheInner::l1_key(scope, ObjectKind::File, file_id);
     let wants_l1 = bytes_written <= MAX_L1_OBJECT_BYTES as u64 && {
@@ -468,6 +490,17 @@ fn commit_staged_disk_file(
         }
     }
 
+    let scope_guard = inner
+        .scope_io_lock
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    if inner.is_pending_purge(&scope.namespace_hex)
+        || expected_epoch.is_some_and(|e| inner.purge_epoch.load(Ordering::Acquire) != e)
+    {
+        drop(std_file);
+        return false;
+    }
+
     let l2_written = match std_file.sync_all() {
         Ok(()) => {
             drop(std_file);
@@ -526,7 +559,7 @@ fn commit_staged_disk_file(
     if !l2_written && !l1_inserted {
         return false;
     }
-    inner.authorize_scope(scope, ObjectKind::File, file_id);
+    inner.authorize_scope_locked(scope, ObjectKind::File, file_id, &scope_guard);
     if is_write_through {
         inner.write_through_objects.fetch_add(1, Ordering::Relaxed);
     }

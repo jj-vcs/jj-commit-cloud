@@ -423,12 +423,13 @@ impl BlobStore for ReplicatedBlobStore {
         offset: u64,
         length: Option<u64>,
     ) -> StoreResult<Option<Bytes>> {
-        if let Some(cached) = self
-            .inner
-            .cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(blob_id)
+        if self.inner.config.cache_capacity_bytes > 0
+            && let Some(cached) = self
+                .inner
+                .cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(blob_id)
         {
             self.inner.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
             return slice_blob_range(&cached, offset, length).map(Some);
@@ -443,6 +444,12 @@ impl BlobStore for ReplicatedBlobStore {
                     .await
             }
             None => {
+                if self.inner.config.cache_capacity_bytes > 0 {
+                    self.inner
+                        .stats
+                        .cache_misses
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 self.inner
                     .local
                     .get_blob_range(blob_id, offset, length)
@@ -515,19 +522,9 @@ impl BlobStore for ReplicatedBlobStore {
             return slice_blob_range(&full, offset, Some(expected_len)).map(Some);
         }
 
-        // Ranged reads of larger blobs read only the requested bytes, from the local store
-        // first and then from peers.
-        if let Some(cached) = self
-            .inner
-            .cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&record.blob_id)
-        {
-            validate_full_blob_size(&record.blob_id, &cached, record.content_size)?;
-            self.inner.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
-            return slice_blob_range(&cached, offset, Some(expected_len)).map(Some);
-        }
+        // Ranged reads of blobs larger than `SMALL_BLOB_MAX_BYTES` are never inserted into the
+        // in-memory small-blob cache; bypass the cache lock and miss counter and fetch only the
+        // requested range from the local store first and then from peers.
 
         // Probe +1 byte whenever reading through EOF so oversized large blobs are caught by
         // `get_file_range` and direct `get_blob_range_with_record` callers (for unbounded,

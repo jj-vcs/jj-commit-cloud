@@ -25,7 +25,7 @@
 use cc_common::workspace::WorkspaceState;
 
 use super::CompositeStore;
-use crate::store::{StoreError, StoreResult};
+use crate::store::{StoreError, StoreResult, verify_optional_repo_project};
 
 impl CompositeStore {
     pub async fn get_workspace(
@@ -41,6 +41,32 @@ impl CompositeStore {
             .await
     }
 
+    /// Reads a workspace together with its verified owning `project_id`, failing with
+    /// [`StoreError::RepoNotFound`] or [`StoreError::FailedPrecondition`] if `repo_id` is
+    /// deleted or re-bound to a different project while reading.
+    pub async fn get_workspace_with_project(
+        &self,
+        repo_id: &str,
+        user: &str,
+        workspace_name: &str,
+    ) -> StoreResult<(String, Option<WorkspaceState>)> {
+        let project_id = self
+            .resolve_repo_project(repo_id, "reading workspaces")
+            .await?;
+        let ws = self
+            .metadata
+            .get_workspace(repo_id, user, workspace_name)
+            .await?;
+        let actual = self.metadata.get_repo_project_id(repo_id).await?;
+        verify_optional_repo_project(
+            repo_id,
+            actual.as_deref(),
+            Some(&project_id),
+            "reading workspaces",
+        )?;
+        Ok((project_id, ws))
+    }
+
     pub async fn put_workspace(&self, workspace: &WorkspaceState) -> StoreResult<()> {
         self.put_workspace_cas(workspace, None).await
     }
@@ -50,23 +76,21 @@ impl CompositeStore {
         workspace: &WorkspaceState,
         expected_operation_id: Option<&[u8]>,
     ) -> StoreResult<()> {
-        if workspace.repo_id.trim().is_empty() || workspace.workspace_name.trim().is_empty() {
-            return Err(StoreError::InvalidArgument(
-                "workspace repo_id and workspace_name must be non-empty".to_string(),
-            ));
-        }
-        if let Some(exp) = expected_operation_id
-            && !exp.is_empty()
-            && exp.len() != cc_common::OPERATION_ID_LENGTH
-        {
-            return Err(StoreError::InvalidArgument(format!(
-                "expected_operation_id must be 0 or {} bytes (got {} bytes)",
-                cc_common::OPERATION_ID_LENGTH,
-                exp.len()
-            )));
-        }
-        self.ensure_repo_registered(&workspace.repo_id, "updating workspaces")
+        validate_workspace_cas_inputs(workspace, expected_operation_id)?;
+        let project_id = self
+            .resolve_repo_project(&workspace.repo_id, "updating workspaces")
             .await?;
+        self.put_workspace_cas_for_project(&project_id, workspace, expected_operation_id)
+            .await
+    }
+
+    pub async fn put_workspace_cas_for_project(
+        &self,
+        expected_project_id: &str,
+        workspace: &WorkspaceState,
+        expected_operation_id: Option<&[u8]>,
+    ) -> StoreResult<()> {
+        validate_workspace_cas_inputs(workspace, expected_operation_id)?;
         let mut normalized = workspace.clone();
         if normalized.operation_id.is_empty() {
             normalized.operation_id = cc_common::ROOT_OPERATION_ID_BYTES.to_vec();
@@ -80,7 +104,12 @@ impl CompositeStore {
             normalized.tree_id = first.clone();
         }
         self.metadata
-            .put_workspace_cas(&normalized, expected_operation_id)
+            .put_workspace_cas_for_project(
+                expected_project_id,
+                &normalized,
+                expected_operation_id,
+                self.config.validate_dependencies,
+            )
             .await
     }
 
@@ -122,6 +151,28 @@ impl CompositeStore {
             .delete_workspace(repo_id, user, workspace_name)
             .await
     }
+}
+
+fn validate_workspace_cas_inputs(
+    workspace: &WorkspaceState,
+    expected_operation_id: Option<&[u8]>,
+) -> StoreResult<()> {
+    if workspace.repo_id.trim().is_empty() || workspace.workspace_name.trim().is_empty() {
+        return Err(StoreError::InvalidArgument(
+            "workspace repo_id and workspace_name must be non-empty".to_string(),
+        ));
+    }
+    if let Some(exp) = expected_operation_id
+        && !exp.is_empty()
+        && exp.len() != cc_common::OPERATION_ID_LENGTH
+    {
+        return Err(StoreError::InvalidArgument(format!(
+            "expected_operation_id must be 0 or {} bytes (got {} bytes)",
+            cc_common::OPERATION_ID_LENGTH,
+            exp.len()
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn check_workspace_cas_precondition(

@@ -28,7 +28,7 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
 use super::SqliteMetadataStore;
 use super::ops::{decode_hex_id_list_json, encode_hex_id_list_json};
-use crate::store::{StoreError, StoreResult};
+use crate::store::{StoreError, StoreResult, verify_optional_repo_project};
 
 type SqliteWorkspaceTuple = (
     String,
@@ -120,91 +120,64 @@ where
 }
 
 impl SqliteMetadataStore {
-    pub(super) async fn get_workspace_impl(
-        &self,
-        repo_id: &str,
-        user: &str,
-        workspace_name: &str,
-    ) -> StoreResult<Option<WorkspaceState>> {
-        let repo_id = repo_id.to_string();
-        let user = user.to_string();
-        let workspace_name = workspace_name.to_string();
-        self.with_read_conn(move |conn| {
-            let row = conn
-                .query_row(
-                    "SELECT commit_id, operation_id, tree_id, tree_ids_json, conflict_labels_json, sparse_patterns_json
-                     FROM workspaces
-                     WHERE repo_id = ?1 AND user_email = ?2 AND workspace_name = ?3",
-                    params![repo_id, user, workspace_name],
-                    |r| {
-                        Ok((
-                            r.get::<_, Vec<u8>>(0)?,
-                            r.get::<_, Vec<u8>>(1)?,
-                            r.get::<_, Vec<u8>>(2)?,
-                            r.get::<_, String>(3)?,
-                            r.get::<_, String>(4)?,
-                            r.get::<_, String>(5)?,
-                        ))
-                    },
-                )
-                .optional()
-                .map_err(|e| StoreError::Backend(format!("SQLite get_workspace failed: {e}")))?;
-
-            row.map(
-                |(
-                    commit_id,
-                    operation_id,
-                    tree_id,
-                    tree_ids_json,
-                    conflict_labels_json,
-                    sparse_json,
-                )| {
-                    let mut tree_ids = decode_hex_id_list_json(&tree_ids_json, "tree_ids_json")?;
-                    if tree_ids.is_empty() && !tree_id.is_empty() {
-                        tree_ids.push(tree_id.clone());
-                    }
-                    let conflict_labels: Vec<String> = serde_json::from_str(&conflict_labels_json)
-                        .map_err(|e| {
-                            StoreError::Corruption(format!("invalid conflict_labels_json: {e}"))
-                        })?;
-                    let sparse_patterns: Vec<String> =
-                        serde_json::from_str(&sparse_json).map_err(|e| {
-                            StoreError::Corruption(format!("invalid sparse_patterns_json: {e}"))
-                        })?;
-                    #[allow(deprecated)]
-                    Ok(WorkspaceState {
-                        repo_id,
-                        user,
-                        workspace_name,
-                        commit_id,
-                        operation_id,
-                        tree_id,
-                        sparse_patterns,
-                        tree_ids,
-                        conflict_labels,
-                        sparse_patterns_set: true,
-                    })
-                },
-            )
-            .transpose()
-        })
-        .await
-    }
-
     #[allow(deprecated)]
-    pub(super) async fn put_workspace_cas_impl(
+    async fn put_workspace_cas_inner(
         &self,
+        expected_project_id: Option<&str>,
         workspace: &WorkspaceState,
         expected_operation_id: Option<&[u8]>,
+        require_operation_exists: bool,
     ) -> StoreResult<()> {
+        let expected_project_id = expected_project_id.map(ToOwned::to_owned);
         let ws = workspace.clone();
         let expected_op = expected_operation_id.map(|b| b.to_vec());
+        let required_op_id = (require_operation_exists
+            && !ws.operation_id.is_empty()
+            && ws.operation_id.as_slice() != cc_common::ROOT_OPERATION_ID_BYTES)
+            .then(|| ws.operation_id.clone());
         self.with_write_conn(move |conn| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|e| {
                     StoreError::Backend(format!("SQLite begin put_workspace_cas failed: {e}"))
                 })?;
+            let actual_project: Option<String> = tx
+                .query_row(
+                    "SELECT project_id FROM repositories WHERE repo_id = ?1",
+                    params![ws.repo_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| {
+                    StoreError::Backend(format!("SQLite put_workspace_cas repo lookup failed: {e}"))
+                })?;
+            verify_optional_repo_project(
+                &ws.repo_id,
+                actual_project.as_deref(),
+                expected_project_id.as_deref(),
+                "updating workspace",
+            )?;
+            if let Some(op_id) = &required_op_id {
+                let op_exists: Option<i64> = tx
+                    .query_row(
+                        "SELECT 1 FROM operations WHERE repo_id = ?1 AND op_id = ?2",
+                        params![ws.repo_id, op_id],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(|e| {
+                        StoreError::Backend(format!(
+                            "SQLite check workspace operation failed: {e}"
+                        ))
+                    })?;
+                if op_exists.is_none() {
+                    return Err(StoreError::MissingDependency {
+                        parent_kind: "workspace",
+                        missing_kind: "operation",
+                        id_hex: hex::encode(op_id),
+                    });
+                }
+            }
             if expected_op.is_some() {
                 let row = tx
                     .query_row(
@@ -302,6 +275,102 @@ impl SqliteMetadataStore {
             tx.commit()
                 .map_err(|e| StoreError::Backend(format!("SQLite commit put_workspace failed: {e}")))
         })
+        .await
+    }
+
+    pub(super) async fn get_workspace_impl(
+        &self,
+        repo_id: &str,
+        user: &str,
+        workspace_name: &str,
+    ) -> StoreResult<Option<WorkspaceState>> {
+        let repo_id = repo_id.to_string();
+        let user = user.to_string();
+        let workspace_name = workspace_name.to_string();
+        self.with_read_conn(move |conn| {
+            let row = conn
+                .query_row(
+                    "SELECT commit_id, operation_id, tree_id, tree_ids_json, conflict_labels_json, sparse_patterns_json
+                     FROM workspaces
+                     WHERE repo_id = ?1 AND user_email = ?2 AND workspace_name = ?3",
+                    params![repo_id, user, workspace_name],
+                    |r| {
+                        Ok((
+                            r.get::<_, Vec<u8>>(0)?,
+                            r.get::<_, Vec<u8>>(1)?,
+                            r.get::<_, Vec<u8>>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, String>(4)?,
+                            r.get::<_, String>(5)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|e| StoreError::Backend(format!("SQLite get_workspace failed: {e}")))?;
+
+            row.map(
+                |(
+                    commit_id,
+                    operation_id,
+                    tree_id,
+                    tree_ids_json,
+                    conflict_labels_json,
+                    sparse_json,
+                )| {
+                    let mut tree_ids = decode_hex_id_list_json(&tree_ids_json, "tree_ids_json")?;
+                    if tree_ids.is_empty() && !tree_id.is_empty() {
+                        tree_ids.push(tree_id.clone());
+                    }
+                    let conflict_labels: Vec<String> = serde_json::from_str(&conflict_labels_json)
+                        .map_err(|e| {
+                            StoreError::Corruption(format!("invalid conflict_labels_json: {e}"))
+                        })?;
+                    let sparse_patterns: Vec<String> =
+                        serde_json::from_str(&sparse_json).map_err(|e| {
+                            StoreError::Corruption(format!("invalid sparse_patterns_json: {e}"))
+                        })?;
+                    #[allow(deprecated)]
+                    Ok(WorkspaceState {
+                        repo_id,
+                        user,
+                        workspace_name,
+                        commit_id,
+                        operation_id,
+                        tree_id,
+                        sparse_patterns,
+                        tree_ids,
+                        conflict_labels,
+                        sparse_patterns_set: true,
+                    })
+                },
+            )
+            .transpose()
+        })
+        .await
+    }
+
+    pub(super) async fn put_workspace_cas_impl(
+        &self,
+        workspace: &WorkspaceState,
+        expected_operation_id: Option<&[u8]>,
+    ) -> StoreResult<()> {
+        self.put_workspace_cas_inner(None, workspace, expected_operation_id, false)
+            .await
+    }
+
+    pub(super) async fn put_workspace_cas_for_project_impl(
+        &self,
+        expected_project_id: &str,
+        workspace: &WorkspaceState,
+        expected_operation_id: Option<&[u8]>,
+        require_operation_exists: bool,
+    ) -> StoreResult<()> {
+        self.put_workspace_cas_inner(
+            Some(expected_project_id),
+            workspace,
+            expected_operation_id,
+            require_operation_exists,
+        )
         .await
     }
 

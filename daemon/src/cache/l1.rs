@@ -48,13 +48,36 @@ pub(super) const L1_ENTRY_OVERHEAD_BYTES: usize = 64;
 
 pub(super) const MAX_AUTHORIZED_CACHE_ENTRIES: usize = 65_536;
 
-/// `(partition_hex, kind, id)`: the scope for scoped kinds (`Commit`, `View`, `Operation`),
-/// the upstream otherwise (`Tree`, `File`, `Symlink`).
-pub(super) type L1Key = (String, ObjectKind, Vec<u8>);
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) enum L1Partition {
+    Shared {
+        upstream_hex: String,
+    },
+    Scoped {
+        namespace_hex: String,
+        scope_hex: String,
+    },
+}
+
+impl L1Partition {
+    fn key_bytes(&self) -> usize {
+        match self {
+            Self::Shared { upstream_hex } => upstream_hex.len(),
+            Self::Scoped {
+                namespace_hex,
+                scope_hex,
+            } => namespace_hex.len().saturating_add(scope_hex.len()),
+        }
+    }
+}
+
+/// `(partition, kind, id)`: scoped by `(namespace_hex, scope_hex)` for scoped kinds
+/// (`Commit`, `View`, `Operation`), or by `upstream_hex` otherwise (`Tree`, `File`, `Symlink`).
+pub(super) type L1Key = (L1Partition, ObjectKind, Vec<u8>);
 
 pub(super) fn l1_key_overhead(key: &L1Key) -> usize {
     key.0
-        .len()
+        .key_bytes()
         .saturating_add(key.2.len())
         .saturating_add(L1_ENTRY_OVERHEAD_BYTES)
 }
@@ -111,9 +134,28 @@ impl ByteBoundedLru {
         }
         true
     }
+
+    pub(super) fn evict_namespace(&mut self, namespace_hex: &str) {
+        let doomed: Vec<L1Key> = self
+            .map
+            .iter()
+            .filter_map(|(k, _)| match &k.0 {
+                L1Partition::Scoped {
+                    namespace_hex: ns, ..
+                } if ns == namespace_hex => Some(k.clone()),
+                _ => None,
+            })
+            .collect();
+        for key in doomed {
+            if let Some(val) = self.map.pop(&key) {
+                let weight = l1_entry_weight(&key, &val);
+                self.current_bytes = self.current_bytes.saturating_sub(weight);
+            }
+        }
+    }
 }
 
-pub(super) type InflightKey = (String, ObjectKind, Vec<u8>);
+pub(super) type InflightKey = (u64, String, ObjectKind, Vec<u8>);
 
 #[derive(Clone)]
 pub(super) enum FlightOutcome {
@@ -172,29 +214,84 @@ pub(super) enum Flight<'a> {
     Waiter(watch::Receiver<Option<FlightOutcome>>),
 }
 
-pub(super) type AuthKey = (String, ObjectKind, Vec<u8>);
+/// `(namespace_hex, scope_hex, kind, id_bytes)` authorization key.
+pub(super) type AuthKey = (String, String, ObjectKind, Vec<u8>);
 
 impl CacheInner {
     pub(super) fn l1_key(scope: &CacheScope, kind: ObjectKind, id_bytes: &[u8]) -> L1Key {
         if kind.is_scoped() {
-            (scope.scope_hex.clone(), kind, id_bytes.to_vec())
+            (
+                L1Partition::Scoped {
+                    namespace_hex: scope.namespace_hex.clone(),
+                    scope_hex: scope.scope_hex.clone(),
+                },
+                kind,
+                id_bytes.to_vec(),
+            )
         } else {
-            (scope.upstream_hex.clone(), kind, id_bytes.to_vec())
+            (
+                L1Partition::Shared {
+                    upstream_hex: scope.upstream_hex.clone(),
+                },
+                kind,
+                id_bytes.to_vec(),
+            )
+        }
+    }
+
+    pub(super) fn evict_namespace_memory(&self, namespace_hex: &str) {
+        self.l1
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .evict_namespace(namespace_hex);
+        let mut auth = self.authorized.lock().unwrap_or_else(|e| e.into_inner());
+        let doomed: Vec<AuthKey> = auth
+            .iter()
+            .filter(|(k, _)| k.0 == namespace_hex)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in doomed {
+            auth.pop(&key);
         }
     }
 
     pub(super) fn authorize_scope(&self, scope: &CacheScope, kind: ObjectKind, id_bytes: &[u8]) {
-        if !is_valid_object_id(id_bytes) || kind.is_scoped() {
+        if !is_valid_object_id(id_bytes)
+            || kind.is_scoped()
+            || self.is_pending_purge(&scope.namespace_hex)
+        {
             return;
         }
-        let key = (scope.scope_hex.clone(), kind, id_bytes.to_vec());
+        let guard = self.scope_io_lock.read().unwrap_or_else(|e| e.into_inner());
+        self.authorize_scope_locked(scope, kind, id_bytes, &guard);
+    }
+
+    pub(super) fn authorize_scope_locked(
+        &self,
+        scope: &CacheScope,
+        kind: ObjectKind,
+        id_bytes: &[u8],
+        _guard: &std::sync::RwLockReadGuard<'_, ()>,
+    ) {
+        if !is_valid_object_id(id_bytes)
+            || kind.is_scoped()
+            || self.is_pending_purge(&scope.namespace_hex)
+        {
+            return;
+        }
+        let key = (
+            scope.namespace_hex.clone(),
+            scope.scope_hex.clone(),
+            kind,
+            id_bytes.to_vec(),
+        );
         let is_new = self
             .authorized
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .put(key, ())
             .is_none();
-        let marker = self.scoped_path(&scope.scope_hex, kind, id_bytes);
+        let marker = self.scoped_path(scope, kind, id_bytes);
         if is_new
             && !is_regular_file(&marker)
             && let Some(parent) = marker.parent()
@@ -210,13 +307,18 @@ impl CacheInner {
         kind: ObjectKind,
         id_bytes: &[u8],
     ) -> bool {
-        if !is_valid_object_id(id_bytes) {
+        if !is_valid_object_id(id_bytes) || self.is_pending_purge(&scope.namespace_hex) {
             return false;
         }
         if kind.is_scoped() {
             return true;
         }
-        let key = (scope.scope_hex.clone(), kind, id_bytes.to_vec());
+        let key = (
+            scope.namespace_hex.clone(),
+            scope.scope_hex.clone(),
+            kind,
+            id_bytes.to_vec(),
+        );
         self.authorized
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -230,13 +332,38 @@ impl CacheInner {
         kind: ObjectKind,
         id_bytes: &[u8],
     ) -> bool {
-        if !is_valid_object_id(id_bytes) {
+        if !is_valid_object_id(id_bytes) || self.is_pending_purge(&scope.namespace_hex) {
             return false;
         }
         if kind.is_scoped() {
             return true;
         }
-        let key = (scope.scope_hex.clone(), kind, id_bytes.to_vec());
+        if self.is_authorized_in_memory(scope, kind, id_bytes) {
+            return true;
+        }
+        let guard = self.scope_io_lock.read().unwrap_or_else(|e| e.into_inner());
+        self.is_authorized_locked(scope, kind, id_bytes, &guard)
+    }
+
+    pub(super) fn is_authorized_locked(
+        &self,
+        scope: &CacheScope,
+        kind: ObjectKind,
+        id_bytes: &[u8],
+        _guard: &std::sync::RwLockReadGuard<'_, ()>,
+    ) -> bool {
+        if !is_valid_object_id(id_bytes) || self.is_pending_purge(&scope.namespace_hex) {
+            return false;
+        }
+        if kind.is_scoped() {
+            return true;
+        }
+        let key = (
+            scope.namespace_hex.clone(),
+            scope.scope_hex.clone(),
+            kind,
+            id_bytes.to_vec(),
+        );
         if self
             .authorized
             .lock()
@@ -246,7 +373,7 @@ impl CacheInner {
         {
             return true;
         }
-        let marker = self.scoped_path(&scope.scope_hex, kind, id_bytes);
+        let marker = self.scoped_path(scope, kind, id_bytes);
         if is_regular_file(&marker) {
             self.authorized
                 .lock()
@@ -263,11 +390,13 @@ impl CacheInner {
         kind: ObjectKind,
         id_bytes: &[u8],
         payload: &Bytes,
+        expected_epoch: Option<u64>,
     ) -> bool {
         if !is_valid_object_id(id_bytes) {
             return false;
         }
-        let inserted = self.insert_verified(scope, kind, id_bytes, payload);
+        let inserted =
+            self.insert_verified_with_epoch(scope, kind, id_bytes, payload, expected_epoch);
         if inserted {
             self.write_through_objects.fetch_add(1, Ordering::Relaxed);
         }
@@ -275,20 +404,27 @@ impl CacheInner {
     }
 
     /// Validates `payload`, persists to L2 and/or L1, and authorizes `scope` only if at least
-    /// one cache tier retained the object. Returns `false` if validation fails or neither tier
-    /// stored the payload.
-    pub(super) fn insert_verified(
+    /// one cache tier retained the object. Returns `false` if validation fails, `purge_epoch`
+    /// advanced past `expected_epoch`, or neither tier stored the payload.
+    pub(super) fn insert_verified_with_epoch(
         &self,
         scope: &CacheScope,
         kind: ObjectKind,
         id_bytes: &[u8],
         payload: &Bytes,
+        expected_epoch: Option<u64>,
     ) -> bool {
         if !is_valid_object_id(id_bytes) {
             return false;
         }
         if !l2_payload_is_valid(kind, id_bytes, payload) {
             tracing::warn!("not caching invalid {kind:?} {}", hex::encode(id_bytes));
+            return false;
+        }
+        let guard = self.scope_io_lock.read().unwrap_or_else(|e| e.into_inner());
+        if self.is_pending_purge(&scope.namespace_hex)
+            || expected_epoch.is_some_and(|e| self.purge_epoch.load(Ordering::Acquire) != e)
+        {
             return false;
         }
         let dst = self.object_path(scope, kind, id_bytes);
@@ -313,7 +449,7 @@ impl CacheInner {
         if !l2_written && !l1_inserted {
             return false;
         }
-        self.authorize_scope(scope, kind, id_bytes);
+        self.authorize_scope_locked(scope, kind, id_bytes, &guard);
         true
     }
 
@@ -342,7 +478,14 @@ impl CacheInner {
         kind: ObjectKind,
         id_bytes: &[u8],
     ) -> Option<Bytes> {
-        if !is_valid_object_id(id_bytes) || !self.is_authorized(scope, kind, id_bytes) {
+        if !is_valid_object_id(id_bytes) {
+            return None;
+        }
+        if let Some(hit) = self.lookup_l1_if_authorized_in_memory(scope, kind, id_bytes) {
+            return Some(hit);
+        }
+        let guard = self.scope_io_lock.read().unwrap_or_else(|e| e.into_inner());
+        if !self.is_authorized_locked(scope, kind, id_bytes, &guard) {
             return None;
         }
         let key = Self::l1_key(scope, kind, id_bytes);
@@ -385,6 +528,9 @@ impl CacheInner {
         }
         if !l2_payload_is_valid(kind, id_bytes, &bytes) {
             discard_invalid_l2_entry(&path);
+            return None;
+        }
+        if self.is_pending_purge(&scope.namespace_hex) {
             return None;
         }
         self.l2_hits.fetch_add(1, Ordering::Relaxed);

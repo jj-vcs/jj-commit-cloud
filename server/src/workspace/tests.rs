@@ -1242,3 +1242,694 @@ async fn test_conflict_labels_legacy_normalization_and_view_commit_derivation() 
         .unwrap();
     assert_eq!(explicit_resp.commit_id, derived_commit);
 }
+
+#[tokio::test]
+async fn test_update_workspace_rejects_delete_and_reregister_between_op_lookup_and_commit() {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use async_trait::async_trait;
+    use cc_common::backend::{Commit, TreeEntry};
+    use cc_common::op_store::{Operation, View};
+
+    use crate::store::{
+        BlobRecord, CommitId, MemoryMetadataStore, MetadataStore, OpId, StoreResult,
+    };
+
+    struct SwapAfterOpLookupStore {
+        inner: Arc<MemoryMetadataStore>,
+        swap_on_op: AtomicBool,
+        swap_on_view: AtomicBool,
+        swap_on_workspace: AtomicBool,
+        swap_on_put_workspace: AtomicBool,
+        repo_id: String,
+        old_project_id: String,
+        new_project_id: String,
+    }
+
+    impl SwapAfterOpLookupStore {
+        async fn maybe_swap(&self, flag: &AtomicBool) -> StoreResult<()> {
+            if flag.swap(false, Ordering::SeqCst) {
+                let deleted = self
+                    .inner
+                    .delete_repository(&self.repo_id, Some(&self.old_project_id))
+                    .await?;
+                assert!(deleted);
+                self.inner
+                    .register_repo_in_project(&self.repo_id, &self.new_project_id, None)
+                    .await?;
+            }
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl MetadataStore for SwapAfterOpLookupStore {
+        fn backend_name(&self) -> &'static str {
+            self.inner.backend_name()
+        }
+        async fn register_project(&self, project_id: &str, name: Option<&str>) -> StoreResult<()> {
+            self.inner.register_project(project_id, name).await
+        }
+        async fn is_project_registered(&self, project_id: &str) -> StoreResult<bool> {
+            self.inner.is_project_registered(project_id).await
+        }
+        async fn get_repo_project_id(&self, repo_id: &str) -> StoreResult<Option<String>> {
+            self.inner.get_repo_project_id(repo_id).await
+        }
+        async fn register_repo_in_project(
+            &self,
+            repo_id: &str,
+            project_id: &str,
+            name: Option<&str>,
+        ) -> StoreResult<String> {
+            self.inner
+                .register_repo_in_project(repo_id, project_id, name)
+                .await
+        }
+        async fn delete_repository(
+            &self,
+            repo_id: &str,
+            expected_project_id: Option<&str>,
+        ) -> StoreResult<bool> {
+            self.inner
+                .delete_repository(repo_id, expected_project_id)
+                .await
+        }
+        async fn get_commit(
+            &self,
+            project_id: &str,
+            commit_id: &[u8],
+        ) -> StoreResult<Option<Commit>> {
+            self.inner.get_commit(project_id, commit_id).await
+        }
+        async fn get_commit_generation(
+            &self,
+            project_id: &str,
+            commit_id: &[u8],
+        ) -> StoreResult<Option<u64>> {
+            self.inner
+                .get_commit_generation(project_id, commit_id)
+                .await
+        }
+        async fn put_commit(
+            &self,
+            project_id: &str,
+            commit_id: &[u8],
+            commit: &Commit,
+            generation: u64,
+        ) -> StoreResult<()> {
+            self.inner
+                .put_commit(project_id, commit_id, commit, generation)
+                .await
+        }
+        async fn list_commit_ids(
+            &self,
+            project_id: &str,
+            after_commit_id: Option<&[u8]>,
+            limit: usize,
+        ) -> StoreResult<Vec<CommitId>> {
+            self.inner
+                .list_commit_ids(project_id, after_commit_id, limit)
+                .await
+        }
+        async fn current_commit_watermark(&self, project_id: &str) -> StoreResult<Vec<u8>> {
+            self.inner.current_commit_watermark(project_id).await
+        }
+        async fn list_commit_ids_since(
+            &self,
+            project_id: &str,
+            since_token: &[u8],
+            limit: usize,
+        ) -> StoreResult<(Vec<CommitId>, Vec<u8>, bool)> {
+            self.inner
+                .list_commit_ids_since(project_id, since_token, limit)
+                .await
+        }
+        async fn resolve_commit_id_prefix(
+            &self,
+            project_id: &str,
+            min_id: &[u8],
+            max_id: &[u8],
+        ) -> StoreResult<Vec<CommitId>> {
+            self.inner
+                .resolve_commit_id_prefix(project_id, min_id, max_id)
+                .await
+        }
+        async fn resolve_change_id_prefix(
+            &self,
+            project_id: &str,
+            min_id: &[u8],
+            max_id: &[u8],
+            limit: usize,
+        ) -> StoreResult<Vec<(Vec<u8>, Vec<CommitId>)>> {
+            self.inner
+                .resolve_change_id_prefix(project_id, min_id, max_id, limit)
+                .await
+        }
+        async fn get_tree(
+            &self,
+            project_id: &str,
+            tree_id: &[u8],
+        ) -> StoreResult<Option<Vec<TreeEntry>>> {
+            self.inner.get_tree(project_id, tree_id).await
+        }
+        async fn put_tree(
+            &self,
+            project_id: &str,
+            tree_id: &[u8],
+            entries: &[TreeEntry],
+        ) -> StoreResult<()> {
+            self.inner.put_tree(project_id, tree_id, entries).await
+        }
+        async fn find_existing_trees(
+            &self,
+            project_id: &str,
+            tree_ids: &[Vec<u8>],
+        ) -> StoreResult<HashSet<Vec<u8>>> {
+            self.inner.find_existing_trees(project_id, tree_ids).await
+        }
+        async fn get_symlink(
+            &self,
+            project_id: &str,
+            symlink_id: &[u8],
+        ) -> StoreResult<Option<String>> {
+            self.inner.get_symlink(project_id, symlink_id).await
+        }
+        async fn put_symlink(
+            &self,
+            project_id: &str,
+            symlink_id: &[u8],
+            target: &str,
+        ) -> StoreResult<()> {
+            self.inner.put_symlink(project_id, symlink_id, target).await
+        }
+        async fn find_existing_symlinks(
+            &self,
+            project_id: &str,
+            symlink_ids: &[Vec<u8>],
+        ) -> StoreResult<HashSet<Vec<u8>>> {
+            self.inner
+                .find_existing_symlinks(project_id, symlink_ids)
+                .await
+        }
+        async fn get_blob_record(
+            &self,
+            project_id: &str,
+            blob_id: &[u8],
+        ) -> StoreResult<Option<BlobRecord>> {
+            self.inner.get_blob_record(project_id, blob_id).await
+        }
+        async fn get_blob_sizes_batch(
+            &self,
+            project_id: &str,
+            blob_ids: &[Vec<u8>],
+        ) -> StoreResult<HashMap<Vec<u8>, u64>> {
+            self.inner.get_blob_sizes_batch(project_id, blob_ids).await
+        }
+        async fn get_global_blob_record(&self, blob_id: &[u8]) -> StoreResult<Option<BlobRecord>> {
+            self.inner.get_global_blob_record(blob_id).await
+        }
+        async fn put_blob_record(&self, project_id: &str, record: &BlobRecord) -> StoreResult<()> {
+            self.inner.put_blob_record(project_id, record).await
+        }
+        async fn add_blob_replica_location(
+            &self,
+            blob_id: &[u8],
+            location: &str,
+        ) -> StoreResult<()> {
+            self.inner
+                .add_blob_replica_location(blob_id, location)
+                .await
+        }
+        async fn get_operation(
+            &self,
+            repo_id: &str,
+            op_id: &[u8],
+        ) -> StoreResult<Option<Operation>> {
+            let res = self.inner.get_operation(repo_id, op_id).await?;
+            if res.is_some() {
+                self.maybe_swap(&self.swap_on_op).await?;
+            }
+            Ok(res)
+        }
+        async fn put_operation(
+            &self,
+            repo_id: &str,
+            op_id: &[u8],
+            op: &Operation,
+        ) -> StoreResult<()> {
+            self.inner.put_operation(repo_id, op_id, op).await
+        }
+        async fn put_operation_for_project(
+            &self,
+            repo_id: &str,
+            expected_project_id: &str,
+            op_id: &[u8],
+            op: &Operation,
+            require_dependencies_exist: bool,
+        ) -> StoreResult<()> {
+            self.inner
+                .put_operation_for_project(
+                    repo_id,
+                    expected_project_id,
+                    op_id,
+                    op,
+                    require_dependencies_exist,
+                )
+                .await
+        }
+        async fn resolve_operation_id_prefix(
+            &self,
+            repo_id: &str,
+            min_id: &[u8],
+            max_id: &[u8],
+        ) -> StoreResult<Vec<OpId>> {
+            self.inner
+                .resolve_operation_id_prefix(repo_id, min_id, max_id)
+                .await
+        }
+        async fn get_view(&self, repo_id: &str, view_id: &[u8]) -> StoreResult<Option<View>> {
+            let res = self.inner.get_view(repo_id, view_id).await?;
+            if res.is_some() {
+                self.maybe_swap(&self.swap_on_view).await?;
+            }
+            Ok(res)
+        }
+        async fn put_view(&self, repo_id: &str, view_id: &[u8], view: &View) -> StoreResult<()> {
+            self.inner.put_view(repo_id, view_id, view).await
+        }
+        async fn put_view_for_project(
+            &self,
+            repo_id: &str,
+            expected_project_id: &str,
+            view_id: &[u8],
+            view: &View,
+        ) -> StoreResult<()> {
+            self.inner
+                .put_view_for_project(repo_id, expected_project_id, view_id, view)
+                .await
+        }
+        async fn get_op_heads(&self, repo_id: &str) -> StoreResult<Option<Vec<OpId>>> {
+            self.inner.get_op_heads(repo_id).await
+        }
+        async fn update_op_heads(
+            &self,
+            repo_id: &str,
+            old_ids: &[Vec<u8>],
+            new_id: &[u8],
+        ) -> StoreResult<Vec<OpId>> {
+            self.inner.update_op_heads(repo_id, old_ids, new_id).await
+        }
+        async fn update_op_heads_for_project(
+            &self,
+            repo_id: &str,
+            expected_project_id: &str,
+            old_head_ids: &[Vec<u8>],
+            new_head_id: &[u8],
+            require_op_exists: bool,
+        ) -> StoreResult<Vec<OpId>> {
+            self.inner
+                .update_op_heads_for_project(
+                    repo_id,
+                    expected_project_id,
+                    old_head_ids,
+                    new_head_id,
+                    require_op_exists,
+                )
+                .await
+        }
+        async fn publish_operation_atomic(
+            &self,
+            repo_id: &str,
+            view_id: &[u8],
+            view: &View,
+            op_id: &[u8],
+            op: &Operation,
+            old_ids: &[Vec<u8>],
+        ) -> StoreResult<Vec<OpId>> {
+            self.inner
+                .publish_operation_atomic(repo_id, view_id, view, op_id, op, old_ids)
+                .await
+        }
+        #[allow(clippy::too_many_arguments)]
+        async fn publish_operation_for_project(
+            &self,
+            repo_id: &str,
+            expected_project_id: &str,
+            view_id: &[u8],
+            view: &View,
+            op_id: &[u8],
+            op: &Operation,
+            old_op_head_ids: &[Vec<u8>],
+            require_dependencies_exist: bool,
+        ) -> StoreResult<Vec<OpId>> {
+            self.inner
+                .publish_operation_for_project(
+                    repo_id,
+                    expected_project_id,
+                    view_id,
+                    view,
+                    op_id,
+                    op,
+                    old_op_head_ids,
+                    require_dependencies_exist,
+                )
+                .await
+        }
+        async fn compare_and_swap_op_heads(
+            &self,
+            repo_id: &str,
+            expected_old_ids: &[Vec<u8>],
+            new_id: &[u8],
+        ) -> StoreResult<()> {
+            self.inner
+                .compare_and_swap_op_heads(repo_id, expected_old_ids, new_id)
+                .await
+        }
+        async fn update_op_heads_cas_for_project(
+            &self,
+            repo_id: &str,
+            expected_project_id: &str,
+            expected_exact_heads: &[Vec<u8>],
+            new_head_id: &[u8],
+            require_op_exists: bool,
+        ) -> StoreResult<()> {
+            self.inner
+                .update_op_heads_cas_for_project(
+                    repo_id,
+                    expected_project_id,
+                    expected_exact_heads,
+                    new_head_id,
+                    require_op_exists,
+                )
+                .await
+        }
+        async fn get_workspace(
+            &self,
+            repo_id: &str,
+            user: &str,
+            workspace_name: &str,
+        ) -> StoreResult<Option<WorkspaceState>> {
+            let res = self
+                .inner
+                .get_workspace(repo_id, user, workspace_name)
+                .await?;
+            if res.is_some() {
+                self.maybe_swap(&self.swap_on_workspace).await?;
+            }
+            Ok(res)
+        }
+        async fn put_workspace_cas(
+            &self,
+            workspace: &WorkspaceState,
+            expected_operation_id: Option<&[u8]>,
+        ) -> StoreResult<()> {
+            self.inner
+                .put_workspace_cas(workspace, expected_operation_id)
+                .await
+        }
+        async fn put_workspace_cas_for_project(
+            &self,
+            expected_project_id: &str,
+            workspace: &WorkspaceState,
+            expected_operation_id: Option<&[u8]>,
+            require_operation_exists: bool,
+        ) -> StoreResult<()> {
+            self.maybe_swap(&self.swap_on_put_workspace).await?;
+            self.inner
+                .put_workspace_cas_for_project(
+                    expected_project_id,
+                    workspace,
+                    expected_operation_id,
+                    require_operation_exists,
+                )
+                .await
+        }
+        async fn list_workspaces(&self, repo_id: &str) -> StoreResult<Vec<WorkspaceState>> {
+            self.inner.list_workspaces(repo_id).await
+        }
+        async fn delete_workspace(
+            &self,
+            repo_id: &str,
+            user: &str,
+            workspace_name: &str,
+        ) -> StoreResult<bool> {
+            self.inner
+                .delete_workspace(repo_id, user, workspace_name)
+                .await
+        }
+    }
+
+    // Delete + re-register under `proj-b` right after `get_operation` (before commit),
+    // and right after `get_view` (while deriving commit_id).
+    for swap_on_view in [false, true] {
+        let inner = Arc::new(MemoryMetadataStore::new());
+        let hooked = Arc::new(SwapAfterOpLookupStore {
+            inner: Arc::clone(&inner),
+            swap_on_op: AtomicBool::new(false),
+            swap_on_view: AtomicBool::new(false),
+            swap_on_workspace: AtomicBool::new(false),
+            swap_on_put_workspace: AtomicBool::new(false),
+            repo_id: "repo-race".to_string(),
+            old_project_id: "proj-a".to_string(),
+            new_project_id: "proj-b".to_string(),
+        });
+        let store = Arc::new(CompositeStore::new(
+            hooked.clone(),
+            Arc::new(MemoryBlobStore::new()),
+        ));
+
+        store.register_project("proj-a", None).await.unwrap();
+        store.register_project("proj-b", None).await.unwrap();
+        store
+            .register_repo_in_project("repo-race", Some("proj-a"), None)
+            .await
+            .unwrap();
+
+        // Place the same content-addressed commit in both projects so commit validation alone
+        // cannot mask a late `resolve_repo_project` call.
+        let commit_id = vec![0xab; cc_common::COMMIT_ID_LENGTH];
+        let commit = Commit {
+            commit_id: commit_id.clone(),
+            change_id: vec![0xcd; cc_common::CHANGE_ID_LENGTH],
+            parent_commit_ids: vec![cc_common::ROOT_COMMIT_ID_BYTES.to_vec()],
+            root_tree_id: vec![cc_common::EMPTY_TREE_ID_BYTES.to_vec()],
+            description: "shared commit".to_string(),
+            ..Default::default()
+        };
+        store
+            .put_commit("proj-a", &commit_id, &commit)
+            .await
+            .unwrap();
+        store
+            .put_commit("proj-b", &commit_id, &commit)
+            .await
+            .unwrap();
+
+        let op_id = vec![0x77; cc_common::OPERATION_ID_LENGTH];
+        let view_id = if swap_on_view {
+            let vid = vec![0x66; cc_common::VIEW_ID_LENGTH];
+            let mut wc_commit_ids = HashMap::new();
+            wc_commit_ids.insert("ws-race".to_string(), commit_id.clone());
+            store
+                .put_view(
+                    "repo-race",
+                    &vid,
+                    &View {
+                        head_ids: vec![commit_id.clone()],
+                        wc_commit_ids,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            vid
+        } else {
+            cc_common::ROOT_VIEW_ID_BYTES.to_vec()
+        };
+        store
+            .put_operation(
+                "repo-race",
+                &op_id,
+                &Operation {
+                    view_id,
+                    parents: vec![cc_common::ROOT_OPERATION_ID_BYTES.to_vec()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        if swap_on_view {
+            hooked.swap_on_view.store(true, Ordering::SeqCst);
+        } else {
+            hooked.swap_on_op.store(true, Ordering::SeqCst);
+        }
+
+        let svc = CommitCloudWorkspaceService::new(store.clone());
+        let mut ws = base_ws("ws-race");
+        ws.repo_id = "repo-race".to_string();
+        ws.operation_id = op_id;
+        ws.commit_id = if swap_on_view { Vec::new() } else { commit_id };
+
+        let err = svc
+            .update_workspace(Request::new(UpdateWorkspaceRequest {
+                workspace: Some(ws),
+                expected_operation_id: None,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::FailedPrecondition,
+            "swap_on_view={swap_on_view}: expected FAILED_PRECONDITION, got {err:?}"
+        );
+        assert!(
+            inner
+                .get_workspace("repo-race", "alice", "ws-race")
+                .await
+                .unwrap()
+                .is_none(),
+            "swap_on_view={swap_on_view}: stale workspace must not be written into proj-b"
+        );
+    }
+
+    // `check_working_copy_changes` detects a concurrent delete + cross-project
+    // re-bind between reading `WorkspaceState` and resolving the commit, returning
+    // `FAILED_PRECONDITION` instead of looking up `proj-a`'s commit in `proj-b`.
+    {
+        let inner = Arc::new(MemoryMetadataStore::new());
+        let hooked = Arc::new(SwapAfterOpLookupStore {
+            inner,
+            swap_on_op: AtomicBool::new(false),
+            swap_on_view: AtomicBool::new(false),
+            swap_on_workspace: AtomicBool::new(false),
+            swap_on_put_workspace: AtomicBool::new(false),
+            repo_id: "repo-check-race".to_string(),
+            old_project_id: "proj-a".to_string(),
+            new_project_id: "proj-b".to_string(),
+        });
+        let store = Arc::new(CompositeStore::new(
+            hooked.clone(),
+            Arc::new(MemoryBlobStore::new()),
+        ));
+        store.register_project("proj-a", None).await.unwrap();
+        store.register_project("proj-b", None).await.unwrap();
+        store
+            .register_repo_in_project("repo-check-race", Some("proj-a"), None)
+            .await
+            .unwrap();
+
+        let commit_id = vec![0xab; cc_common::COMMIT_ID_LENGTH];
+        let commit = Commit {
+            commit_id: commit_id.clone(),
+            change_id: vec![0xcd; cc_common::CHANGE_ID_LENGTH],
+            parent_commit_ids: vec![cc_common::ROOT_COMMIT_ID_BYTES.to_vec()],
+            root_tree_id: vec![cc_common::EMPTY_TREE_ID_BYTES.to_vec()],
+            description: "proj-a commit".to_string(),
+            ..Default::default()
+        };
+        store
+            .put_commit("proj-a", &commit_id, &commit)
+            .await
+            .unwrap();
+        let mut ws = base_ws("ws-check");
+        ws.repo_id = "repo-check-race".to_string();
+        ws.commit_id = commit_id;
+        store.put_workspace(&ws).await.unwrap();
+
+        hooked.swap_on_workspace.store(true, Ordering::SeqCst);
+        let svc = CommitCloudWorkspaceService::new(store);
+        let err = svc
+            .check_working_copy_changes(Request::new(CheckWorkingCopyChangesRequest {
+                repo_id: "repo-check-race".to_string(),
+                user: "alice".to_string(),
+                workspace_name: "ws-check".to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::FailedPrecondition,
+            "check_working_copy_changes must reject cross-project re-bind, got {err:?}"
+        );
+    }
+
+    // Same-project delete + re-register (`proj-a -> proj-a`) right before
+    // `put_workspace_cas_for_project` commits must reject the deleted `operation_id`
+    // atomically with `FAILED_PRECONDITION` and leave no dangling workspace row.
+    {
+        let inner = Arc::new(MemoryMetadataStore::new());
+        let hooked = Arc::new(SwapAfterOpLookupStore {
+            inner: Arc::clone(&inner),
+            swap_on_op: AtomicBool::new(false),
+            swap_on_view: AtomicBool::new(false),
+            swap_on_workspace: AtomicBool::new(false),
+            swap_on_put_workspace: AtomicBool::new(false),
+            repo_id: "repo-same-proj".to_string(),
+            old_project_id: "proj-a".to_string(),
+            new_project_id: "proj-a".to_string(),
+        });
+        let store = Arc::new(CompositeStore::new(
+            hooked.clone(),
+            Arc::new(MemoryBlobStore::new()),
+        ));
+        store.register_project("proj-a", None).await.unwrap();
+        store
+            .register_repo_in_project("repo-same-proj", Some("proj-a"), None)
+            .await
+            .unwrap();
+        let view_id = vec![0x61; cc_common::VIEW_ID_LENGTH];
+        let op_id = vec![0x71; cc_common::OPERATION_ID_LENGTH];
+        store
+            .put_view(
+                "repo-same-proj",
+                &view_id,
+                &View {
+                    head_ids: vec![cc_common::ROOT_COMMIT_ID_BYTES.to_vec()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .put_operation(
+                "repo-same-proj",
+                &op_id,
+                &Operation {
+                    view_id,
+                    parents: vec![cc_common::ROOT_OPERATION_ID_BYTES.to_vec()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        hooked.swap_on_put_workspace.store(true, Ordering::SeqCst);
+        let svc = CommitCloudWorkspaceService::new(store);
+        let mut ws = base_ws("ws-same-proj");
+        ws.repo_id = "repo-same-proj".to_string();
+        ws.operation_id = op_id;
+        let err = svc
+            .update_workspace(Request::new(UpdateWorkspaceRequest {
+                workspace: Some(ws),
+                expected_operation_id: None,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::FailedPrecondition,
+            "same-project recreate race before put_workspace must return FAILED_PRECONDITION, got {err:?}"
+        );
+        assert!(
+            inner
+                .get_workspace("repo-same-proj", "alice", "ws-same-proj")
+                .await
+                .unwrap()
+                .is_none(),
+            "dangling workspace referencing deleted operation must not be persisted"
+        );
+    }
+}

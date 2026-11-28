@@ -666,6 +666,12 @@ async fn write_file_stream_streams_directly_to_upstream_and_spools_to_l2_without
         ) -> Result<Response<RegisterRepositoryResponse>, Status> {
             unused()
         }
+        async fn delete_repository(
+            &self,
+            _: Request<DeleteRepositoryRequest>,
+        ) -> Result<Response<DeleteRepositoryResponse>, Status> {
+            unused()
+        }
         async fn read_commit(
             &self,
             _: Request<ReadCommitRequest>,

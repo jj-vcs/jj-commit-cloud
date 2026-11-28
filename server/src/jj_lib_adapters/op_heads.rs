@@ -32,6 +32,7 @@ use crate::store::{CompositeStore, StoreError};
 pub struct ServerOpHeadsStore {
     store: Arc<CompositeStore>,
     repo_id: String,
+    pinned_project_id: Option<String>,
     expected_heads: Option<Vec<Vec<u8>>>,
 }
 
@@ -39,6 +40,7 @@ impl Debug for ServerOpHeadsStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ServerOpHeadsStore")
             .field("repo_id", &self.repo_id)
+            .field("pinned_project_id", &self.pinned_project_id)
             .field("pinned_heads", &self.expected_heads.as_ref().map(Vec::len))
             .finish()
     }
@@ -52,6 +54,20 @@ impl ServerOpHeadsStore {
         Self {
             store,
             repo_id,
+            pinned_project_id: None,
+            expected_heads: None,
+        }
+    }
+
+    pub fn with_project_id(
+        store: Arc<CompositeStore>,
+        repo_id: String,
+        project_id: String,
+    ) -> Self {
+        Self {
+            store,
+            repo_id,
+            pinned_project_id: Some(project_id),
             expected_heads: None,
         }
     }
@@ -67,6 +83,24 @@ impl ServerOpHeadsStore {
         Self {
             store,
             repo_id,
+            pinned_project_id: None,
+            expected_heads: Some(expected_heads),
+        }
+    }
+
+    /// Creates an op-heads store pinned to both `project_id` and `expected_heads`:
+    /// `update_op_heads()` atomically swaps the full expected head set via
+    /// [`CompositeStore::compare_and_swap_op_heads_for_project`].
+    pub fn with_expected_heads_for_project(
+        store: Arc<CompositeStore>,
+        repo_id: String,
+        project_id: String,
+        expected_heads: Vec<Vec<u8>>,
+    ) -> Self {
+        Self {
+            store,
+            repo_id,
+            pinned_project_id: Some(project_id),
             expected_heads: Some(expected_heads),
         }
     }
@@ -85,16 +119,43 @@ impl OpHeadsStore for ServerOpHeadsStore {
     ) -> Result<(), OpHeadsStoreError> {
         let target_id = new_id.clone();
 
-        let res = if let Some(expected) = &self.expected_heads {
-            self.store
-                .compare_and_swap_op_heads(&self.repo_id, expected, new_id.as_bytes())
-                .await
-        } else {
-            let old_vec: Vec<Vec<u8>> = old_ids.iter().map(|id| id.as_bytes().to_vec()).collect();
-            self.store
-                .update_op_heads(&self.repo_id, &old_vec, new_id.as_bytes())
-                .await
-                .map(|_| ())
+        let res = match (&self.expected_heads, &self.pinned_project_id) {
+            (Some(expected), Some(project_id)) => {
+                self.store
+                    .compare_and_swap_op_heads_for_project(
+                        &self.repo_id,
+                        project_id,
+                        expected,
+                        new_id.as_bytes(),
+                    )
+                    .await
+            }
+            (Some(expected), None) => {
+                self.store
+                    .compare_and_swap_op_heads(&self.repo_id, expected, new_id.as_bytes())
+                    .await
+            }
+            (None, Some(project_id)) => {
+                let old_vec: Vec<Vec<u8>> =
+                    old_ids.iter().map(|id| id.as_bytes().to_vec()).collect();
+                self.store
+                    .update_op_heads_for_project(
+                        &self.repo_id,
+                        project_id,
+                        &old_vec,
+                        new_id.as_bytes(),
+                    )
+                    .await
+                    .map(|_| ())
+            }
+            (None, None) => {
+                let old_vec: Vec<Vec<u8>> =
+                    old_ids.iter().map(|id| id.as_bytes().to_vec()).collect();
+                self.store
+                    .update_op_heads(&self.repo_id, &old_vec, new_id.as_bytes())
+                    .await
+                    .map(|_| ())
+            }
         };
         res.map_err(|e| OpHeadsStoreError::Write {
             new_op_id: target_id,
@@ -103,9 +164,14 @@ impl OpHeadsStore for ServerOpHeadsStore {
     }
 
     async fn get_op_heads(&self) -> Result<Vec<OperationId>, OpHeadsStoreError> {
-        let heads = match &self.expected_heads {
-            Some(expected) => expected.clone(),
-            None => self
+        let heads = match (&self.expected_heads, &self.pinned_project_id) {
+            (Some(expected), _) => expected.clone(),
+            (None, Some(project_id)) => self
+                .store
+                .get_op_heads_for_project(&self.repo_id, project_id)
+                .await
+                .map_err(|e| OpHeadsStoreError::Read(e.into()))?,
+            (None, None) => self
                 .store
                 .get_op_heads(&self.repo_id)
                 .await

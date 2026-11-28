@@ -17,8 +17,8 @@
 //!
 //! # Authority and Crash-Safety Ordering
 //! Shared `Tree`, `Symlink`, and `File` payloads (`objects/<upstream_hex>/...`) and scoped
-//! `Commit`, `View`, and `Operation` files (`scopes/<scope_hex>/...`) validate before
-//! caching, write to a process-unique temp file (`0600` on Unix), call `sync_all`, and
+//! `Commit`, `View`, and `Operation` files (`scopes/<namespace_hex>/<scope_hex>/...`) validate
+//! before caching, write to a process-unique temp file (`0600` on Unix), call `sync_all`, and
 //! link or rename into place. Authorization markers (`0600` under `0700` dirs) are created
 //! only after L1 or L2 succeeds. Reads discard empty, torn, or invalid L2 entries.
 //!
@@ -26,8 +26,9 @@
 //! `Commit`, `View`, and `Operation` objects are scope-partitioned (`Commit` payloads carry
 //! unhashed `predecessors` and `external_ids` and are cached only from authoritative reads).
 //! Concurrent misses within a [`CacheScope`] coalesce via [`SingleflightGuard`] over a `watch`
-//! channel; callers with distinct credentials never coalesce or share authorization. Async
-//! helpers offload blocking disk I/O onto `tokio::task::spawn_blocking`.
+//! channel; callers with distinct credentials never coalesce or share authorization. Locks
+//! follow `scope_io_lock -> l1 -> authorized`, and `purge_namespace` bumps `purge_epoch` under
+//! `scope_io_lock.write()`. Async helpers offload blocking disk I/O onto `spawn_blocking`.
 //!
 //! # Cross-Process and RPC Boundaries
 //! File blobs up to [`MAX_L1_OBJECT_BYTES`] (`4 MiB`) stay in L1 RAM as zero-copy [`Bytes`]
@@ -58,10 +59,11 @@ mod spool;
 #[cfg(test)]
 mod tests;
 
+pub use eviction::PendingPurgeGuard;
 pub(crate) use l1::clone_status;
 pub use spool::BlobSpooler;
 
-use eviction::cleanup_stale_staging_files;
+use eviction::{cleanup_stale_staging_files, prune_legacy_flat_scope_dirs};
 use l1::{
     AuthKey, ByteBoundedLru, Flight, FlightOutcome, InflightKey, InflightMap,
     MAX_AUTHORIZED_CACHE_ENTRIES, SingleflightGuard,
@@ -109,8 +111,8 @@ impl ObjectKind {
         }
     }
 
-    /// Returns `true` for kinds stored under `scopes/<scope_hex>/...` and keyed by `scope_hex`
-    /// in L1 rather than shared across scopes under `objects/<upstream_hex>/...`.
+    /// Returns `true` for kinds stored under `scopes/<namespace_hex>/<scope_hex>/...` and keyed
+    /// by scope in L1 rather than shared across scopes under `objects/<upstream_hex>/...`.
     ///
     /// `Commit` payloads include unhashed per-project metadata (`predecessors` and
     /// `external_ids`), while `View` and `Operation` are repository-scoped.
@@ -152,12 +154,33 @@ impl From<std::io::Error> for CacheRangeError {
     }
 }
 
+fn normalize_cache_upstream_url(upstream_url: &str) -> String {
+    crate::upstream::normalize_origin(upstream_url).unwrap_or_else(|_| {
+        upstream_url
+            .trim()
+            .trim_end_matches('/')
+            .to_ascii_lowercase()
+    })
+}
+
+fn namespace_scope_hex(normalized_url: &str, namespace_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update((normalized_url.len() as u64).to_be_bytes());
+    hasher.update(normalized_url.as_bytes());
+    hasher.update((namespace_id.len() as u64).to_be_bytes());
+    hasher.update(namespace_id.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
 /// Logical `(upstream_url, namespace_id, caller_auth_fingerprint)` isolation boundary
 /// for cached lookups.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheScope {
     upstream_url: String,
     namespace_id: String,
+    /// Partition for `(upstream_url, namespace_id)` independent of caller credentials, so
+    /// purging a deleted repository clears all credential variants on disk and in memory.
+    namespace_hex: String,
     scope_hex: String,
     /// Partition of the shared CAS for `upstream_url`, so bytes cached for one server are
     /// never served to scopes of another server.
@@ -174,16 +197,10 @@ impl CacheScope {
         namespace_id: impl AsRef<str>,
         auth_header: Option<&str>,
     ) -> Self {
-        let normalized_url = crate::upstream::normalize_origin(upstream_url.as_ref())
-            .unwrap_or_else(|_| {
-                upstream_url
-                    .as_ref()
-                    .trim()
-                    .trim_end_matches('/')
-                    .to_ascii_lowercase()
-            });
+        let normalized_url = normalize_cache_upstream_url(upstream_url.as_ref());
         let namespace = namespace_id.as_ref().to_string();
         let auth_fingerprint = fingerprint_auth_header(auth_header);
+        let namespace_hex = namespace_scope_hex(&normalized_url, &namespace);
 
         let mut scope_hasher = Sha256::new();
         scope_hasher.update((normalized_url.len() as u64).to_be_bytes());
@@ -196,6 +213,7 @@ impl CacheScope {
         Self {
             upstream_url: normalized_url,
             namespace_id: namespace,
+            namespace_hex,
             scope_hex,
             upstream_hex,
         }
@@ -207,6 +225,15 @@ impl CacheScope {
 
     pub fn namespace_id(&self) -> &str {
         &self.namespace_id
+    }
+
+    pub fn namespace_hex(&self) -> &str {
+        &self.namespace_hex
+    }
+
+    pub fn namespace_hex_for(upstream_url: &str, namespace_id: &str) -> String {
+        let normalized_url = normalize_cache_upstream_url(upstream_url);
+        namespace_scope_hex(&normalized_url, namespace_id)
     }
 
     pub fn scope_hex(&self) -> &str {
@@ -242,6 +269,14 @@ impl CacheStatsSnapshot {
 struct CacheInner {
     cache_dir: PathBuf,
     max_l2_object_bytes: u64,
+    // Lock order: `scope_io_lock` -> `l1` -> `authorized` -> `pending_purges` (`inflight` is
+    // never nested with these, and `pending_purges` is strictly a leaf lock).
+    // `purge_namespace` acquires `scope_io_lock.write()` and bumps `purge_epoch` so L2 promotions,
+    // disk writes, and in-flight RPC write-backs cannot resurrect purged namespace state or race
+    // with `remove_dir_all`.
+    scope_io_lock: std::sync::RwLock<()>,
+    purge_epoch: AtomicU64,
+    pending_purges: Mutex<HashMap<String, usize>>,
     l1: Mutex<ByteBoundedLru>,
     authorized: Mutex<LruCache<AuthKey, ()>>,
     inflight: InflightMap,
@@ -304,12 +339,16 @@ impl TwoTierCache {
         let staging_dir = cache_dir.join("staging");
         ensure_private_dir_within(&cache_dir, &objects_dir)?;
         ensure_private_dir_within(&cache_dir, &scopes_dir)?;
+        prune_legacy_flat_scope_dirs(&scopes_dir);
         ensure_private_dir_within(&cache_dir, &staging_dir)?;
         cleanup_stale_staging_files(&staging_dir);
         Ok(Self {
             inner: Arc::new(CacheInner {
                 cache_dir,
                 max_l2_object_bytes,
+                scope_io_lock: std::sync::RwLock::new(()),
+                purge_epoch: AtomicU64::new(0),
+                pending_purges: Mutex::new(HashMap::new()),
                 l1: Mutex::new(ByteBoundedLru::new(memory_cache_bytes)),
                 authorized: Mutex::new(LruCache::new(
                     NonZeroUsize::new(MAX_AUTHORIZED_CACHE_ENTRIES).unwrap(),
@@ -326,6 +365,14 @@ impl TwoTierCache {
                 last_activity_elapsed_ms: AtomicU64::new(0),
             }),
         })
+    }
+
+    pub fn purge_epoch(&self) -> u64 {
+        self.inner.purge_epoch.load(Ordering::Acquire)
+    }
+
+    pub fn is_pending_purge_hex(&self, namespace_hex: &str) -> bool {
+        self.inner.is_pending_purge(namespace_hex)
     }
 
     pub fn cache_dir(&self) -> &Path {
@@ -450,7 +497,7 @@ impl TwoTierCache {
         payload: Bytes,
     ) {
         self.inner
-            .put_write_through_inner(scope, kind, id_bytes, &payload);
+            .put_write_through_inner(scope, kind, id_bytes, &payload, None);
     }
 
     /// Async wrapper around [`Self::put_write_through`] that runs blocking disk I/O inside a
@@ -462,13 +509,27 @@ impl TwoTierCache {
         id_bytes: Vec<u8>,
         payload: Bytes,
     ) -> bool {
+        self.put_write_through_if_epoch_async(scope, kind, id_bytes, payload, None)
+            .await
+    }
+
+    /// Like [`Self::put_write_through_async`], skipping all cache writes if `purge_epoch`
+    /// advanced since `expected_epoch`.
+    pub async fn put_write_through_if_epoch_async(
+        &self,
+        scope: CacheScope,
+        kind: ObjectKind,
+        id_bytes: Vec<u8>,
+        payload: Bytes,
+        expected_epoch: Option<u64>,
+    ) -> bool {
         self.touch_activity();
         if !is_valid_object_id(&id_bytes) {
             return false;
         }
         let inner = Arc::clone(&self.inner);
         match tokio::task::spawn_blocking(move || {
-            inner.put_write_through_inner(&scope, kind, &id_bytes, &payload)
+            inner.put_write_through_inner(&scope, kind, &id_bytes, &payload, expected_epoch)
         })
         .await
         {
@@ -554,10 +615,11 @@ impl TwoTierCache {
             return Ok(hit);
         }
 
-        let inflight_key = (scope.scope_hex.clone(), kind, id_bytes.to_vec());
-        let guard = loop {
+        let (guard, epoch) = loop {
+            let epoch = self.purge_epoch();
+            let inflight_key = (epoch, scope.scope_hex.clone(), kind, id_bytes.to_vec());
             let mut waiter = match self.join_flight(&inflight_key) {
-                Flight::Leader(guard) => break guard,
+                Flight::Leader(guard) => break (guard, epoch),
                 Flight::Waiter(receiver) => receiver,
             };
             self.inner
@@ -599,7 +661,13 @@ impl TwoTierCache {
         let id_vec = id_bytes.to_vec();
         let payload_cloned = fetched.clone();
         if let Err(err) = tokio::task::spawn_blocking(move || {
-            inner.insert_verified(&scope_cloned, kind, &id_vec, &payload_cloned);
+            inner.insert_verified_with_epoch(
+                &scope_cloned,
+                kind,
+                &id_vec,
+                &payload_cloned,
+                Some(epoch),
+            );
         })
         .await
         {
@@ -611,6 +679,13 @@ impl TwoTierCache {
 }
 
 impl CacheInner {
+    pub(super) fn is_pending_purge(&self, namespace_hex: &str) -> bool {
+        self.pending_purges
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(namespace_hex)
+    }
+
     fn elapsed_ms(&self) -> u64 {
         u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
     }

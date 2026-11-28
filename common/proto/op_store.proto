@@ -40,8 +40,9 @@ package commit_cloud.op_store;
 // - `FAILED_PRECONDITION`: `WriteView`, `WriteOperation`, or `PublishOperation`
 //   references an unpersisted non-root `commit_id`, `WriteOperation` or
 //   `PublishOperation` references an unpersisted `view_id` or parent
-//   `operation_id`, or `UpdateOpHeads` references an unpersisted
-//   `new_op_head_id`.
+//   `operation_id`, `UpdateOpHeads` references an unpersisted `new_op_head_id`,
+//   or `repo_id` was concurrently deleted and re-bound to a different
+//   `project_id` during the write or reconciliation attempt.
 // - `INVALID_ARGUMENT`: Malformed identifier, digest length, or hex prefix;
 //   empty `view.head_ids`, absent `RefTarget` (except tracked remote
 //   bookmarks), or malformed bookmark key; parentless non-root `Operation`,

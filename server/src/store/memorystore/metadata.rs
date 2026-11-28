@@ -32,11 +32,8 @@ use cc_common::backend::*;
 use cc_common::op_store::*;
 use cc_common::workspace::WorkspaceState;
 
-use super::{CommitId, MemoryMetadataStore, OpId, RepoMeta, StoredCommit, StoredOperation};
-use crate::store::{
-    BlobRecord, MetadataStore, StoreError, StoreResult, apply_op_heads_mutation,
-    op_heads_sets_equal,
-};
+use super::{CommitId, MemoryMetadataStore, OpId, RepoMeta, StoredCommit};
+use crate::store::{BlobRecord, MetadataStore, StoreError, StoreResult};
 
 #[async_trait]
 impl MetadataStore for MemoryMetadataStore {
@@ -98,6 +95,7 @@ impl MetadataStore for MemoryMetadataStore {
     ) -> StoreResult<String> {
         let mut projects = self.projects.lock().unwrap();
         let mut repos = self.repos.lock().unwrap();
+        let mut op_heads = self.op_heads.lock().unwrap();
 
         if let Some(existing_meta) = repos.get(repo_id)
             && existing_meta.project_id != project_id
@@ -133,7 +131,42 @@ impl MetadataStore for MemoryMetadataStore {
                 name: effective_name,
             },
         );
+        op_heads
+            .entry(repo_id.to_string())
+            .or_insert_with(|| vec![cc_common::ROOT_OPERATION_ID_BYTES.to_vec()]);
         Ok(project_id.to_string())
+    }
+
+    async fn delete_repository(
+        &self,
+        repo_id: &str,
+        expected_project_id: Option<&str>,
+    ) -> StoreResult<bool> {
+        // Acquire `repos` first, then child repo-scoped maps (`views`, `ops`, `op_heads`,
+        // `workspaces`) in lock-order so concurrent registrations or head updates cannot
+        // deadlock or resurrect child rows across deletion.
+        let mut repos = self.repos.lock().unwrap();
+        let Some(meta) = repos.get(repo_id) else {
+            return Ok(false);
+        };
+        if let Some(expected) = expected_project_id
+            && meta.project_id != expected
+        {
+            return Err(StoreError::FailedPrecondition(format!(
+                "repository '{repo_id}' belongs to project '{}', not '{expected}'",
+                meta.project_id
+            )));
+        }
+        let mut views = self.views.lock().unwrap();
+        let mut ops = self.ops.lock().unwrap();
+        let mut op_heads = self.op_heads.lock().unwrap();
+        let mut workspaces = self.workspaces.lock().unwrap();
+        repos.remove(repo_id);
+        views.remove(repo_id);
+        ops.remove(repo_id);
+        op_heads.remove(repo_id);
+        workspaces.remove(repo_id);
+        Ok(true)
     }
 
     async fn get_commit(&self, project_id: &str, commit_id: &[u8]) -> StoreResult<Option<Commit>> {
@@ -527,15 +560,24 @@ impl MetadataStore for MemoryMetadataStore {
     }
 
     async fn put_operation(&self, repo_id: &str, op_id: &[u8], op: &Operation) -> StoreResult<()> {
-        let mut ops = self.ops.lock().unwrap();
-        ops.entry(repo_id.to_string())
-            .or_default()
-            .entry(op_id.to_vec())
-            .or_insert_with(|| StoredOperation {
-                op: op.clone(),
-                published: false,
-            });
-        Ok(())
+        self.put_operation_inner(repo_id, None, op_id, op, false)
+    }
+
+    async fn put_operation_for_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+        op_id: &[u8],
+        op: &Operation,
+        require_dependencies_exist: bool,
+    ) -> StoreResult<()> {
+        self.put_operation_inner(
+            repo_id,
+            Some(expected_project_id),
+            op_id,
+            op,
+            require_dependencies_exist,
+        )
     }
 
     async fn resolve_operation_id_prefix(
@@ -566,13 +608,17 @@ impl MetadataStore for MemoryMetadataStore {
     }
 
     async fn put_view(&self, repo_id: &str, view_id: &[u8], view: &View) -> StoreResult<()> {
-        let mut views = self.views.lock().unwrap();
-        views
-            .entry(repo_id.to_string())
-            .or_default()
-            .entry(view_id.to_vec())
-            .or_insert_with(|| view.clone());
-        Ok(())
+        self.put_view_inner(repo_id, None, view_id, view)
+    }
+
+    async fn put_view_for_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+        view_id: &[u8],
+        view: &View,
+    ) -> StoreResult<()> {
+        self.put_view_inner(repo_id, Some(expected_project_id), view_id, view)
     }
 
     async fn get_op_heads(&self, repo_id: &str) -> StoreResult<Option<Vec<OpId>>> {
@@ -586,23 +632,24 @@ impl MetadataStore for MemoryMetadataStore {
         old_ids: &[Vec<u8>],
         new_id: &[u8],
     ) -> StoreResult<Vec<OpId>> {
-        let mut ops = self.ops.lock().unwrap();
-        let mut op_heads = self.op_heads.lock().unwrap();
-        let current_heads = op_heads
-            .entry(repo_id.to_string())
-            .or_insert_with(|| vec![cc_common::ROOT_OPERATION_ID_BYTES.to_vec()]);
-        let already_published = ops
-            .get(repo_id)
-            .and_then(|m| m.get(new_id))
-            .is_some_and(|stored| stored.published);
-        if already_published && !current_heads.iter().any(|h| h.as_slice() == new_id) {
-            return Ok(current_heads.clone());
-        }
-        apply_op_heads_mutation(current_heads, old_ids, new_id);
-        if let Some(stored) = ops.get_mut(repo_id).and_then(|m| m.get_mut(new_id)) {
-            stored.published = true;
-        }
-        Ok(current_heads.clone())
+        self.update_op_heads_inner(repo_id, None, old_ids, new_id, false)
+    }
+
+    async fn update_op_heads_for_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+        old_head_ids: &[Vec<u8>],
+        new_head_id: &[u8],
+        require_op_exists: bool,
+    ) -> StoreResult<Vec<OpId>> {
+        self.update_op_heads_inner(
+            repo_id,
+            Some(expected_project_id),
+            old_head_ids,
+            new_head_id,
+            require_op_exists,
+        )
     }
 
     async fn publish_operation_atomic(
@@ -614,32 +661,31 @@ impl MetadataStore for MemoryMetadataStore {
         op: &Operation,
         old_ids: &[Vec<u8>],
     ) -> StoreResult<Vec<OpId>> {
-        {
-            let mut views = self.views.lock().unwrap();
-            views
-                .entry(repo_id.to_string())
-                .or_default()
-                .entry(view_id.to_vec())
-                .or_insert_with(|| view.clone());
-        }
-        let mut ops = self.ops.lock().unwrap();
-        let mut op_heads = self.op_heads.lock().unwrap();
-        let current_heads = op_heads
-            .entry(repo_id.to_string())
-            .or_insert_with(|| vec![cc_common::ROOT_OPERATION_ID_BYTES.to_vec()]);
-        let repo_ops = ops.entry(repo_id.to_string()).or_default();
-        if repo_ops.get(op_id).is_some_and(|stored| stored.published) {
-            return Ok(current_heads.clone());
-        }
-        repo_ops
-            .entry(op_id.to_vec())
-            .and_modify(|stored| stored.published = true)
-            .or_insert_with(|| StoredOperation {
-                op: op.clone(),
-                published: true,
-            });
-        apply_op_heads_mutation(current_heads, old_ids, op_id);
-        Ok(current_heads.clone())
+        self.publish_operation_inner(repo_id, None, view_id, view, op_id, op, old_ids, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_operation_for_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+        view_id: &[u8],
+        view: &View,
+        op_id: &[u8],
+        op: &Operation,
+        old_op_head_ids: &[Vec<u8>],
+        require_dependencies_exist: bool,
+    ) -> StoreResult<Vec<OpId>> {
+        self.publish_operation_inner(
+            repo_id,
+            Some(expected_project_id),
+            view_id,
+            view,
+            op_id,
+            op,
+            old_op_head_ids,
+            require_dependencies_exist,
+        )
     }
 
     async fn compare_and_swap_op_heads(
@@ -648,21 +694,24 @@ impl MetadataStore for MemoryMetadataStore {
         expected_old_ids: &[Vec<u8>],
         new_id: &[u8],
     ) -> StoreResult<()> {
-        let mut ops = self.ops.lock().unwrap();
-        let mut op_heads = self.op_heads.lock().unwrap();
-        let current_heads = op_heads
-            .entry(repo_id.to_string())
-            .or_insert_with(|| vec![cc_common::ROOT_OPERATION_ID_BYTES.to_vec()]);
-        if !op_heads_sets_equal(current_heads, expected_old_ids) {
-            return Err(StoreError::CasConflict(format!(
-                "op heads changed concurrently in repo '{repo_id}'"
-            )));
-        }
-        *current_heads = vec![new_id.to_vec()];
-        if let Some(stored) = ops.get_mut(repo_id).and_then(|m| m.get_mut(new_id)) {
-            stored.published = true;
-        }
-        Ok(())
+        self.compare_and_swap_op_heads_inner(repo_id, None, expected_old_ids, new_id, false)
+    }
+
+    async fn update_op_heads_cas_for_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+        expected_exact_heads: &[Vec<u8>],
+        new_head_id: &[u8],
+        require_op_exists: bool,
+    ) -> StoreResult<()> {
+        self.compare_and_swap_op_heads_inner(
+            repo_id,
+            Some(expected_project_id),
+            expected_exact_heads,
+            new_head_id,
+            require_op_exists,
+        )
     }
 
     async fn get_workspace(
@@ -683,18 +732,22 @@ impl MetadataStore for MemoryMetadataStore {
         workspace: &WorkspaceState,
         expected_operation_id: Option<&[u8]>,
     ) -> StoreResult<()> {
-        let mut workspaces = self.workspaces.lock().unwrap();
-        let repo_map = workspaces.entry(workspace.repo_id.clone()).or_default();
-        let key = (workspace.user.clone(), workspace.workspace_name.clone());
-        if crate::store::check_workspace_cas_precondition(
-            repo_map.get(&key),
+        self.put_workspace_cas_inner(None, workspace, expected_operation_id, false)
+    }
+
+    async fn put_workspace_cas_for_project(
+        &self,
+        expected_project_id: &str,
+        workspace: &WorkspaceState,
+        expected_operation_id: Option<&[u8]>,
+        require_operation_exists: bool,
+    ) -> StoreResult<()> {
+        self.put_workspace_cas_inner(
+            Some(expected_project_id),
             workspace,
             expected_operation_id,
-        )? {
-            return Ok(());
-        }
-        repo_map.insert(key, workspace.clone());
-        Ok(())
+            require_operation_exists,
+        )
     }
 
     async fn list_workspaces(&self, repo_id: &str) -> StoreResult<Vec<WorkspaceState>> {

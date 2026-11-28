@@ -39,7 +39,8 @@ use cc_common::op_store::*;
 
 use crate::backend::{validate_digest_len, validate_identifier};
 use crate::hash_utils::{hash_operation, hash_view};
-use crate::reconcile_op_heads::reconcile_repo_op_heads_proto;
+use crate::metrics::ServerMetrics;
+use crate::reconcile_op_heads::reconcile_repo_op_heads_proto_with_metrics;
 use crate::store::{CompositeStore, IdPrefixResolution};
 
 fn validate_ref_target(
@@ -167,11 +168,16 @@ fn validate_operation(op: &Operation) -> Result<(), tonic::Status> {
 #[derive(Clone)]
 pub struct CommitCloudOpStoreService {
     store: Arc<CompositeStore>,
+    metrics: ServerMetrics,
 }
 
 impl CommitCloudOpStoreService {
     pub fn new(store: Arc<CompositeStore>) -> Self {
-        Self { store }
+        Self::with_metrics(store, ServerMetrics::new())
+    }
+
+    pub fn with_metrics(store: Arc<CompositeStore>, metrics: ServerMetrics) -> Self {
+        Self { store, metrics }
     }
 }
 
@@ -391,7 +397,12 @@ impl OpStoreService for CommitCloudOpStoreService {
         let req = request.into_inner();
         validate_identifier(&req.repo_id, "repo_id")?;
         info!("Reconcile op heads for repo: {}", req.repo_id);
-        let response = reconcile_repo_op_heads_proto(self.store.clone(), &req.repo_id).await?;
+        let response = reconcile_repo_op_heads_proto_with_metrics(
+            self.store.clone(),
+            &req.repo_id,
+            Some(&self.metrics),
+        )
+        .await?;
         Ok(tonic::Response::new(response))
     }
 

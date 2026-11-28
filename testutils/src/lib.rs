@@ -26,11 +26,16 @@ pub struct ServerGuard {
     child: Child,
     url: String,
     daemons: DaemonSandbox,
+    metrics_addr: Option<std::net::SocketAddr>,
 }
 
 impl ServerGuard {
     pub fn url(&self) -> &str {
         &self.url
+    }
+
+    pub fn metrics_addr(&self) -> Option<std::net::SocketAddr> {
+        self.metrics_addr
     }
 
     /// A `jj` command whose auto-started daemons live in this server's
@@ -149,6 +154,11 @@ fn find_jj_cmd() -> assert_cmd::Command {
     assert_cmd::Command::cargo_bin("jj").expect("The jj CLI binary should have compiled")
 }
 
+fn extract_metrics_address(line: &str) -> Option<std::net::SocketAddr> {
+    let marker = "jj-cc-server metrics server bound to ";
+    let idx = line.find(marker)?;
+    line[idx + marker.len()..].trim().parse().ok()
+}
 pub fn daemon_binary_path() -> PathBuf {
     PathBuf::from(env!("JJ_CC_DAEMON_BIN"))
 }
@@ -190,6 +200,7 @@ pub const SANITIZED_SERVER_ENV_VARS: &[&str] = &[
     "JJ_CC_SERVER_AUTH_TOKEN",
     "JJ_CC_SERVER_AUTH_TOKEN_FILE",
     "JJ_CC_ALLOW_UNAUTHENTICATED",
+    "METRICS_LISTEN",
 ];
 
 pub async fn spawn_server_with_env(env_vars: &[(&str, &str)], extra_args: &[&str]) -> ServerGuard {
@@ -245,11 +256,15 @@ pub async fn spawn_server_with_env(env_vars: &[(&str, &str)], extra_args: &[&str
     let timeout = tokio::time::sleep(Duration::from_secs(10));
     tokio::pin!(timeout);
 
+    let mut metrics_addr = None;
     let server_addr = loop {
         tokio::select! {
             line_result = reader.next_line() => {
                 match line_result {
                     Ok(Some(line)) => {
+                        if let Some(bound) = extract_metrics_address(&line) {
+                            metrics_addr = Some(bound);
+                        }
                         if let Some(addr) = extract_listening_address(&line) {
                             break addr;
                         }
@@ -297,6 +312,7 @@ pub async fn spawn_server_with_env(env_vars: &[(&str, &str)], extra_args: &[&str
         child,
         url,
         daemons: DaemonSandbox::new(),
+        metrics_addr,
     }
 }
 

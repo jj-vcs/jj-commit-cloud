@@ -44,6 +44,7 @@ use cc_common::workspace::*;
 use tonic::{Request, Response, Status};
 use tracing::info;
 
+use crate::metrics::ServerMetrics;
 use crate::store::CompositeStore;
 
 const DEFAULT_LIST_WORKSPACES_PAGE_SIZE: usize = 500;
@@ -147,11 +148,16 @@ fn decode_workspace_cursor(token: &str) -> Result<(String, String), Status> {
 #[derive(Clone)]
 pub struct CommitCloudWorkspaceService {
     store: Arc<CompositeStore>,
+    metrics: ServerMetrics,
 }
 
 impl CommitCloudWorkspaceService {
     pub fn new(store: Arc<CompositeStore>) -> Self {
-        Self { store }
+        Self::with_metrics(store, ServerMetrics::new())
+    }
+
+    pub fn with_metrics(store: Arc<CompositeStore>, metrics: ServerMetrics) -> Self {
+        Self { store, metrics }
     }
 }
 
@@ -308,37 +314,63 @@ impl WorkspaceService for CommitCloudWorkspaceService {
             )));
         }
 
+        // Pin `project_id` before validating operation/view state so a concurrent delete and
+        // re-register under a different project is rejected atomically at commit time.
+        let project_id = self
+            .store
+            .resolve_repo_project(&ws.repo_id, "updating workspace")
+            .await?;
+
         let mut derived_from_view: Option<Vec<u8>> = None;
         if !ws.operation_id.is_empty()
             && ws.operation_id.as_slice() != cc_common::ROOT_OPERATION_ID_BYTES
         {
-            let op = self
+            let op = match self
                 .store
-                .get_operation(&ws.repo_id, &ws.operation_id)
+                .get_operation_for_project(&ws.repo_id, &project_id, &ws.operation_id)
                 .await?
-                .ok_or_else(|| {
-                    Status::failed_precondition(format!(
+            {
+                Some(op) => op,
+                None => {
+                    self.store
+                        .verify_repo_project(&ws.repo_id, &project_id, "updating workspace")
+                        .await?;
+                    return Err(Status::failed_precondition(format!(
                         "workspace operation {} does not exist in repo '{}'; publish operation before updating workspace",
                         hex::encode(&ws.operation_id),
                         ws.repo_id
-                    ))
-                })?;
+                    )));
+                }
+            };
             if op.view_id.as_slice() != cc_common::ROOT_VIEW_ID_BYTES {
                 if ws.commit_id.is_empty() {
-                    let view = self
+                    let view = match self
                         .store
-                        .get_view(&ws.repo_id, &op.view_id)
+                        .get_view_for_project(&ws.repo_id, &project_id, &op.view_id)
                         .await?
-                        .ok_or_else(|| {
-                            Status::failed_precondition(format!(
+                    {
+                        Some(view) => view,
+                        None => {
+                            self.store
+                                .verify_repo_project(&ws.repo_id, &project_id, "updating workspace")
+                                .await?;
+                            return Err(Status::failed_precondition(format!(
                                 "view {} referenced by workspace operation {} does not exist in repo '{}'",
                                 hex::encode(&op.view_id),
                                 hex::encode(&ws.operation_id),
                                 ws.repo_id
-                            ))
-                        })?;
+                            )));
+                        }
+                    };
                     derived_from_view = view.wc_commit_ids.get(&ws.workspace_name).cloned();
-                } else if !self.store.has_view(&ws.repo_id, &op.view_id).await? {
+                } else if !self
+                    .store
+                    .has_view_for_project(&ws.repo_id, &project_id, &op.view_id)
+                    .await?
+                {
+                    self.store
+                        .verify_repo_project(&ws.repo_id, &project_id, "updating workspace")
+                        .await?;
                     return Err(Status::failed_precondition(format!(
                         "view {} referenced by workspace operation {} does not exist in repo '{}'",
                         hex::encode(&op.view_id),
@@ -372,10 +404,6 @@ impl WorkspaceService for CommitCloudWorkspaceService {
             )));
         }
 
-        let project_id = self
-            .store
-            .resolve_repo_project(&ws.repo_id, "updating workspace")
-            .await?;
         if ws.commit_id.as_slice() != cc_common::ROOT_COMMIT_ID_BYTES
             && !self.store.has_commit(&project_id, &ws.commit_id).await?
         {
@@ -416,8 +444,10 @@ impl WorkspaceService for CommitCloudWorkspaceService {
             ws.workspace_name, ws.user, ws.repo_id
         );
         self.store
-            .put_workspace_cas(&ws, expected_operation_id.as_deref())
+            .put_workspace_cas_for_project(&project_id, &ws, expected_operation_id.as_deref())
             .await?;
+        self.metrics
+            .record_workspace_upsert(&ws.repo_id, &ws.user, &ws.workspace_name);
         Ok(Response::new(UpdateWorkspaceResponse {
             success: true,
             workspace: Some(ws),
@@ -474,16 +504,16 @@ impl WorkspaceService for CommitCloudWorkspaceService {
         validate_repo_id(&req.repo_id)?;
         validate_key_segment(&req.user, "user", true)?;
         validate_key_segment(&req.workspace_name, "workspace_name", false)?;
-        let ws = self
+        let (project_id, ws) = self
             .store
-            .get_workspace(&req.repo_id, &req.user, &req.workspace_name)
-            .await?
-            .ok_or_else(|| {
-                Status::not_found(format!(
-                    "workspace '{}' for user '{}' not found in repo '{}'",
-                    req.workspace_name, req.user, req.repo_id
-                ))
-            })?;
+            .get_workspace_with_project(&req.repo_id, &req.user, &req.workspace_name)
+            .await?;
+        let ws = ws.ok_or_else(|| {
+            Status::not_found(format!(
+                "workspace '{}' for user '{}' not found in repo '{}'",
+                req.workspace_name, req.user, req.repo_id
+            ))
+        })?;
 
         let current_tree_ids = if !ws.tree_ids.is_empty() {
             ws.tree_ids
@@ -498,10 +528,6 @@ impl WorkspaceService for CommitCloudWorkspaceService {
         {
             vec![cc_common::EMPTY_TREE_ID_BYTES.to_vec()]
         } else {
-            let project_id = self
-                .store
-                .resolve_repo_project(&req.repo_id, "checking working copy changes")
-                .await?;
             let commit = self.store.get_commit(&project_id, &ws.commit_id).await?;
             if commit.root_tree_id.is_empty() {
                 vec![cc_common::EMPTY_TREE_ID_BYTES.to_vec()]
@@ -545,6 +571,8 @@ impl WorkspaceService for CommitCloudWorkspaceService {
             .store
             .delete_workspace(&req.repo_id, &req.user, &req.workspace_name)
             .await?;
+        self.metrics
+            .record_workspace_deleted(&req.repo_id, &req.user, &req.workspace_name);
         Ok(Response::new(DeleteWorkspaceResponse { existed }))
     }
 }

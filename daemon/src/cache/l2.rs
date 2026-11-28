@@ -58,10 +58,11 @@ impl TwoTierCache {
         max_bytes: u64,
     ) -> Result<Option<mpsc::Receiver<Result<Vec<u8>, std::io::Error>>>, CacheRangeError> {
         self.touch_activity();
-        if !is_valid_object_id(file_id) {
+        if !is_valid_object_id(file_id) || self.inner.is_pending_purge(&scope.namespace_hex) {
             return Ok(None);
         }
 
+        let start_epoch = self.purge_epoch();
         let key = CacheInner::l1_key(scope, ObjectKind::File, file_id);
         let in_memory_authorized =
             self.inner
@@ -91,7 +92,10 @@ impl TwoTierCache {
             })
             .await
             .map_err(|err| CacheRangeError::Io(std::io::Error::other(err)))?;
-            if !authorized {
+            if !authorized
+                || self.inner.is_pending_purge(&scope.namespace_hex)
+                || self.purge_epoch() != start_epoch
+            {
                 return Ok(None);
             }
             if let Some(hit) = self
@@ -154,6 +158,11 @@ impl TwoTierCache {
         let (mut file, path, total_len) = match l2_read {
             L2FileRead::Miss => return Ok(None),
             L2FileRead::Small(bytes) => {
+                if self.inner.is_pending_purge(&scope.namespace_hex)
+                    || self.purge_epoch() != start_epoch
+                {
+                    return Ok(None);
+                }
                 self.inner.l2_hits.fetch_add(1, Ordering::Relaxed);
                 let actual_len = bytes.len() as u64;
                 self.inner
@@ -174,6 +183,11 @@ impl TwoTierCache {
                 path,
                 total_len,
             } => {
+                if self.inner.is_pending_purge(&scope.namespace_hex)
+                    || self.purge_epoch() != start_epoch
+                {
+                    return Ok(None);
+                }
                 self.inner.l2_hits.fetch_add(1, Ordering::Relaxed);
                 (tokio::fs::File::from_std(file), path, total_len)
             }
@@ -240,7 +254,7 @@ impl CacheInner {
         id_bytes: &[u8],
     ) -> PathBuf {
         if kind.is_scoped() {
-            self.scoped_path(&scope.scope_hex, kind, id_bytes)
+            self.scoped_path(scope, kind, id_bytes)
         } else {
             self.shared_object_path(scope, kind, id_bytes)
         }
@@ -264,14 +278,15 @@ impl CacheInner {
 
     pub(super) fn scoped_path(
         &self,
-        scope_hex: &str,
+        scope: &CacheScope,
         kind: ObjectKind,
         id_bytes: &[u8],
     ) -> PathBuf {
         let (p1, p2, hex_id) = sharded_hex_parts(id_bytes);
         self.cache_dir
             .join("scopes")
-            .join(scope_hex)
+            .join(&scope.namespace_hex)
+            .join(&scope.scope_hex)
             .join(kind.dir_name())
             .join(p1)
             .join(p2)

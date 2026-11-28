@@ -26,10 +26,10 @@
 //!
 //! # Concurrency and Merge Invariants
 //! Content-addressed writes (`Commit`, `Tree`, `Symlink`, `Blob`, `View`, `Operation`) are
-//! immutable and idempotent. `MetadataStore::update_op_heads` and
-//! `MetadataStore::publish_operation_atomic` execute atomically per `repo_id`, removing
-//! superseded `old_ids` while retaining concurrent sibling operation heads so clients and
-//! `ReconcileOpHeads` can merge divergent operations without locks.
+//! immutable and idempotent. `CompositeStore` resolves `repo_id -> project_id` live from
+//! `MetadataStore` and passes the validated `project_id` into atomic `*_for_project` writes
+//! so delete + re-register across replicas never leaks data or persists cross-project refs.
+//! `update_op_heads` and `publish_operation_atomic` retain concurrent sibling heads lock-free.
 //!
 //! # Cross-Process and RPC Boundaries
 //! Errors propagate as typed [`StoreError`] variants that convert deterministically into
@@ -62,8 +62,10 @@ mod tests;
 
 #[cfg(test)]
 use composite::BoundedNamespaceCache;
-pub(crate) use composite::check_workspace_cas_precondition;
 pub use composite::*;
+pub(crate) use composite::{
+    check_workspace_cas_precondition, collect_non_root_op_parents, verify_optional_repo_project,
+};
 pub use error::{StoreError, StoreResult};
 pub use gcsblob::{GcsBlobStore, GcsConnectConfig, IMMUTABLE_CACHE_CONTROL};
 pub use localblob::LocalFsBlobStore;
@@ -120,6 +122,11 @@ pub trait MetadataStore: Send + Sync {
         project_id: &str,
         name: Option<&str>,
     ) -> StoreResult<String>;
+    async fn delete_repository(
+        &self,
+        repo_id: &str,
+        expected_project_id: Option<&str>,
+    ) -> StoreResult<bool>;
 
     async fn is_repo_registered(&self, repo_id: &str) -> StoreResult<bool> {
         Ok(self.get_repo_project_id(repo_id).await?.is_some())
@@ -296,6 +303,19 @@ pub trait MetadataStore: Send + Sync {
 
     async fn get_operation(&self, repo_id: &str, op_id: &[u8]) -> StoreResult<Option<Operation>>;
     async fn put_operation(&self, repo_id: &str, op_id: &[u8], op: &Operation) -> StoreResult<()>;
+    /// Persists an operation atomically after verifying `repo_id` is still bound to
+    /// `expected_project_id` inside the same lock or transaction. When
+    /// `require_dependencies_exist` is true and `op_id` is not already stored, also verifies
+    /// inside the same lock or transaction that any non-root `op.view_id` exists in `Views`
+    /// and every non-root `parent_id` in `op.parents` exists in `Operations`.
+    async fn put_operation_for_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+        op_id: &[u8],
+        op: &Operation,
+        require_dependencies_exist: bool,
+    ) -> StoreResult<()>;
     async fn resolve_operation_id_prefix(
         &self,
         repo_id: &str,
@@ -308,6 +328,15 @@ pub trait MetadataStore: Send + Sync {
         Ok(self.get_view(repo_id, view_id).await?.is_some())
     }
     async fn put_view(&self, repo_id: &str, view_id: &[u8], view: &View) -> StoreResult<()>;
+    /// Persists a view atomically after verifying `repo_id` is still bound to
+    /// `expected_project_id` inside the same lock or transaction.
+    async fn put_view_for_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+        view_id: &[u8],
+        view: &View,
+    ) -> StoreResult<()>;
 
     async fn get_op_heads(&self, repo_id: &str) -> StoreResult<Option<Vec<OpId>>>;
     async fn update_op_heads(
@@ -315,6 +344,17 @@ pub trait MetadataStore: Send + Sync {
         repo_id: &str,
         old_ids: &[Vec<u8>],
         new_id: &[u8],
+    ) -> StoreResult<Vec<OpId>>;
+    /// Updates operation heads atomically after verifying `repo_id` is still bound to
+    /// `expected_project_id` (and, when `require_op_exists` is true, that `new_head_id` exists
+    /// in `Operations`) inside the same lock or transaction.
+    async fn update_op_heads_for_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+        old_head_ids: &[Vec<u8>],
+        new_head_id: &[u8],
+        require_op_exists: bool,
     ) -> StoreResult<Vec<OpId>>;
     async fn publish_operation_atomic(
         &self,
@@ -325,11 +365,39 @@ pub trait MetadataStore: Send + Sync {
         op: &Operation,
         old_ids: &[Vec<u8>],
     ) -> StoreResult<Vec<OpId>>;
+    /// Atomically persists `view`, `op`, and updated `OpHeads` after verifying `repo_id` is still
+    /// bound to `expected_project_id` inside the same lock or transaction. When
+    /// `require_dependencies_exist` is true and `op_id` is not already published, also verifies
+    /// inside the same transaction that every non-root `parent_id` in `op.parents` exists in
+    /// `Operations` and any external non-root `op.view_id != view_id` exists in `Views`.
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_operation_for_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+        view_id: &[u8],
+        view: &View,
+        op_id: &[u8],
+        op: &Operation,
+        old_op_head_ids: &[Vec<u8>],
+        require_dependencies_exist: bool,
+    ) -> StoreResult<Vec<OpId>>;
     async fn compare_and_swap_op_heads(
         &self,
         repo_id: &str,
         expected_old_ids: &[Vec<u8>],
         new_id: &[u8],
+    ) -> StoreResult<()>;
+    /// Atomically compares and swaps `OpHeads` after verifying `repo_id` is still bound to
+    /// `expected_project_id` (and, when `require_op_exists` is true, that `new_head_id` exists
+    /// in `Operations`) inside the same lock or transaction.
+    async fn update_op_heads_cas_for_project(
+        &self,
+        repo_id: &str,
+        expected_project_id: &str,
+        expected_exact_heads: &[Vec<u8>],
+        new_head_id: &[u8],
+        require_op_exists: bool,
     ) -> StoreResult<()>;
 
     async fn get_workspace(
@@ -345,6 +413,18 @@ pub trait MetadataStore: Send + Sync {
         &self,
         workspace: &WorkspaceState,
         expected_operation_id: Option<&[u8]>,
+    ) -> StoreResult<()>;
+    /// Atomically updates a workspace with optional CAS after verifying `workspace.repo_id` is
+    /// still bound to `expected_project_id` inside the same lock or transaction. When
+    /// `require_operation_exists` is true and `workspace.operation_id` is non-empty and
+    /// non-root, also verifies inside the same lock or transaction that `workspace.operation_id`
+    /// exists in `Operations`.
+    async fn put_workspace_cas_for_project(
+        &self,
+        expected_project_id: &str,
+        workspace: &WorkspaceState,
+        expected_operation_id: Option<&[u8]>,
+        require_operation_exists: bool,
     ) -> StoreResult<()>;
     async fn list_workspaces(&self, repo_id: &str) -> StoreResult<Vec<WorkspaceState>>;
     /// Returns up to `limit` workspaces strictly after `after` in `(user, workspace_name)` order,

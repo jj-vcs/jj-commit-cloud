@@ -282,6 +282,30 @@ impl ServerIndex {
         }
     }
 
+    pub fn with_project_id(
+        store: Arc<CompositeStore>,
+        repo_id: String,
+        project_id: String,
+    ) -> Self {
+        Self::with_project_id_and_budget(store, repo_id, project_id, IndexWalkBudget::default())
+    }
+
+    pub fn with_project_id_and_budget(
+        store: Arc<CompositeStore>,
+        repo_id: String,
+        project_id: String,
+        budget: IndexWalkBudget,
+    ) -> Self {
+        let pinned = OnceLock::new();
+        let _ = pinned.set(project_id);
+        Self {
+            store,
+            repo_id,
+            project_id: Arc::new(pinned),
+            budget,
+        }
+    }
+
     pub fn walk_budget(&self) -> &IndexWalkBudget {
         &self.budget
     }
@@ -291,7 +315,6 @@ impl ServerIndex {
             .record_walk_visit(walk_visits)
             .map_err(|e| IndexError::Other(Box::new(e)))
     }
-
     async fn resolve_project_id(&self) -> IndexResult<&str> {
         if let Some(pid) = self.project_id.get() {
             return Ok(pid.as_str());
@@ -747,6 +770,7 @@ pub struct ServerIndexStore {
     store: Arc<CompositeStore>,
     repo_id: String,
     budget: IndexWalkBudget,
+    pinned_project_id: Option<String>,
 }
 
 impl Debug for ServerIndexStore {
@@ -754,6 +778,7 @@ impl Debug for ServerIndexStore {
         f.debug_struct("ServerIndexStore")
             .field("repo_id", &self.repo_id)
             .field("limits", &self.budget.limits())
+            .field("pinned_project_id", &self.pinned_project_id)
             .finish()
     }
 }
@@ -772,6 +797,45 @@ impl ServerIndexStore {
             store,
             repo_id,
             budget,
+            pinned_project_id: None,
+        }
+    }
+
+    pub fn with_project_id(
+        store: Arc<CompositeStore>,
+        repo_id: String,
+        project_id: String,
+    ) -> Self {
+        Self::with_project_id_and_budget(store, repo_id, project_id, IndexWalkBudget::default())
+    }
+
+    pub fn with_project_id_and_budget(
+        store: Arc<CompositeStore>,
+        repo_id: String,
+        project_id: String,
+        budget: IndexWalkBudget,
+    ) -> Self {
+        Self {
+            store,
+            repo_id,
+            budget,
+            pinned_project_id: Some(project_id),
+        }
+    }
+
+    fn make_index(&self) -> ServerIndex {
+        match &self.pinned_project_id {
+            Some(project_id) => ServerIndex::with_project_id_and_budget(
+                self.store.clone(),
+                self.repo_id.clone(),
+                project_id.clone(),
+                self.budget.clone(),
+            ),
+            None => ServerIndex::with_budget(
+                self.store.clone(),
+                self.repo_id.clone(),
+                self.budget.clone(),
+            ),
         }
     }
 }
@@ -787,11 +851,7 @@ impl IndexStore for ServerIndexStore {
         _op: &JjOperation,
         _store: &Arc<JjStore>,
     ) -> IndexStoreResult<Box<dyn ReadonlyIndex>> {
-        Ok(Box::new(ServerIndex::with_budget(
-            self.store.clone(),
-            self.repo_id.clone(),
-            self.budget.clone(),
-        )))
+        Ok(Box::new(self.make_index()))
     }
 
     fn write_index(
@@ -800,10 +860,6 @@ impl IndexStore for ServerIndexStore {
         _op: &JjOperation,
     ) -> IndexStoreResult<Box<dyn ReadonlyIndex>> {
         let _ = index;
-        Ok(Box::new(ServerIndex::with_budget(
-            self.store.clone(),
-            self.repo_id.clone(),
-            self.budget.clone(),
-        )))
+        Ok(Box::new(self.make_index()))
     }
 }

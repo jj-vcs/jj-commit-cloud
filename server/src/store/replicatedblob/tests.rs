@@ -1368,3 +1368,170 @@ async fn partial_read_of_uncacheable_small_blob_uses_ranged_read_not_full_fetch(
         assert_eq!(local.full_read_calls.load(Ordering::SeqCst), 1);
     }
 }
+
+#[tokio::test]
+async fn large_blob_ranged_reads_and_zero_capacity_cache_do_not_inflate_cache_misses() {
+    let local = Arc::new(ScriptedBlobStore::new("gs://local"));
+    let metadata: Arc<dyn MetadataStore> = Arc::new(MemoryMetadataStore::new());
+    metadata.register_project("proj", None).await.unwrap();
+
+    let large_id = vec![0xf1; 20];
+    let large_len = SMALL_BLOB_MAX_BYTES as usize + 128 * 1024;
+    let large_payload = Bytes::from(vec![0x42; large_len]);
+    local.put_blob(&large_id, large_payload).await.unwrap();
+    let large_rec = BlobRecord {
+        blob_id: large_id,
+        content_size: large_len as u64,
+        inline_content: None,
+        primary_location: Some("gs://local".to_string()),
+        replicated_locations: vec!["gs://local".to_string()],
+    };
+    metadata.put_blob_record("proj", &large_rec).await.unwrap();
+
+    // Enabled cache: ranged and full reads of a >SMALL_BLOB_MAX_BYTES blob must not
+    // increment `cache_misses` because large blobs are never cached in RAM.
+    let repl = ReplicatedBlobStore::new(
+        local.clone(),
+        vec![],
+        metadata.clone(),
+        ReplicatedBlobStoreConfig {
+            cache_capacity_bytes: 2 * 1024 * 1024,
+            ..Default::default()
+        },
+    );
+    for chunk_idx in 0..4u64 {
+        let offset = chunk_idx * 256 * 1024;
+        let got = repl
+            .get_blob_range_with_record(&large_rec, offset, Some(64 * 1024))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.len(), 64 * 1024);
+    }
+    let full = repl
+        .get_blob_range_with_record(&large_rec, 0, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(full.len(), large_len);
+    assert_eq!(repl.stats().cache_hits.load(Ordering::Relaxed), 0);
+    assert_eq!(repl.stats().cache_misses.load(Ordering::Relaxed), 0);
+
+    // Disabled cache (`cache_capacity_bytes == 0`): even small blobs must not record
+    // cache misses.
+    let small_id = vec![0xf2; 20];
+    let small_payload = Bytes::from_static(b"small uncached blob");
+    local
+        .put_blob(&small_id, small_payload.clone())
+        .await
+        .unwrap();
+    let small_rec = BlobRecord {
+        blob_id: small_id,
+        content_size: small_payload.len() as u64,
+        inline_content: None,
+        primary_location: Some("gs://local".to_string()),
+        replicated_locations: vec!["gs://local".to_string()],
+    };
+    metadata.put_blob_record("proj", &small_rec).await.unwrap();
+
+    let no_cache_repl = ReplicatedBlobStore::new(
+        local,
+        vec![],
+        metadata,
+        ReplicatedBlobStoreConfig {
+            cache_capacity_bytes: 0,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        no_cache_repl
+            .get_blob_range_with_record(&small_rec, 0, None)
+            .await
+            .unwrap(),
+        Some(small_payload)
+    );
+    assert_eq!(no_cache_repl.stats().cache_hits.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        no_cache_repl.stats().cache_misses.load(Ordering::Relaxed),
+        0
+    );
+}
+
+#[tokio::test]
+async fn small_blob_exceeding_cache_capacity_does_not_inflate_cache_misses() {
+    let local = Arc::new(ScriptedBlobStore::new("gs://local"));
+    let metadata: Arc<dyn MetadataStore> = Arc::new(MemoryMetadataStore::new());
+    metadata.register_project("proj", None).await.unwrap();
+
+    let blob_id = vec![0xf3; 20];
+    let payload = Bytes::from(vec![0x5a; 256]);
+    local.put_blob(&blob_id, payload.clone()).await.unwrap();
+    let record = BlobRecord {
+        blob_id: blob_id.clone(),
+        content_size: payload.len() as u64,
+        inline_content: None,
+        primary_location: Some("gs://local".to_string()),
+        replicated_locations: vec!["gs://local".to_string()],
+    };
+    metadata.put_blob_record("proj", &record).await.unwrap();
+
+    // Test both a capacity smaller than payload bytes and a capacity equal to payload bytes
+    // (where key + LRU entry overhead still makes the blob uncacheable).
+    let exact_cost = entry_cost_bytes(&blob_id, &payload);
+    for capacity in [64usize, payload.len(), exact_cost.saturating_sub(1)] {
+        let repl = ReplicatedBlobStore::new(
+            local.clone(),
+            vec![],
+            metadata.clone(),
+            ReplicatedBlobStoreConfig {
+                cache_capacity_bytes: capacity,
+                ..Default::default()
+            },
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                repl.get_blob_range_with_record(&record, 0, None)
+                    .await
+                    .unwrap(),
+                Some(payload.clone())
+            );
+        }
+        assert_eq!(
+            repl.stats().cache_hits.load(Ordering::Relaxed),
+            0,
+            "capacity={capacity}"
+        );
+        assert_eq!(
+            repl.stats().cache_misses.load(Ordering::Relaxed),
+            0,
+            "uncacheable blob with capacity={capacity} must not increment cache_misses"
+        );
+    }
+
+    // At exact entry cost, the first read records 1 miss and the second records 1 hit.
+    let fitting = ReplicatedBlobStore::new(
+        local,
+        vec![],
+        metadata,
+        ReplicatedBlobStoreConfig {
+            cache_capacity_bytes: exact_cost,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        fitting
+            .get_blob_range_with_record(&record, 0, None)
+            .await
+            .unwrap(),
+        Some(payload.clone())
+    );
+    assert_eq!(
+        fitting
+            .get_blob_range_with_record(&record, 0, None)
+            .await
+            .unwrap(),
+        Some(payload)
+    );
+    assert_eq!(fitting.stats().cache_misses.load(Ordering::Relaxed), 1);
+    assert_eq!(fitting.stats().cache_hits.load(Ordering::Relaxed), 1);
+}

@@ -173,6 +173,13 @@ impl cc_common::backend::backend_service_server::BackendService for MockBackendS
         Err(Status::unimplemented("register_repository"))
     }
 
+    async fn delete_repository(
+        &self,
+        _request: Request<cc_common::backend::DeleteRepositoryRequest>,
+    ) -> Result<Response<cc_common::backend::DeleteRepositoryResponse>, Status> {
+        Err(Status::unimplemented("delete_repository"))
+    }
+
     async fn read_commit(
         &self,
         request: Request<ReadCommitRequest>,
@@ -455,6 +462,13 @@ impl cc_common::backend::backend_service_server::BackendService for ValidationMo
         _request: Request<RegisterRepositoryRequest>,
     ) -> Result<Response<cc_common::backend::RegisterRepositoryResponse>, Status> {
         Err(Status::unimplemented("register_repository"))
+    }
+
+    async fn delete_repository(
+        &self,
+        _request: Request<cc_common::backend::DeleteRepositoryRequest>,
+    ) -> Result<Response<cc_common::backend::DeleteRepositoryResponse>, Status> {
+        Err(Status::unimplemented("delete_repository"))
     }
 
     async fn read_commit(

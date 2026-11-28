@@ -22,14 +22,14 @@
 //! [`ServerOpHeadsStore::update_op_heads`] advances the operation head set.
 //!
 //! # Concurrency and Merge Invariants
-//! [`ServerOpHeadsStore::with_expected_heads`] pins a validated head snapshot and swaps
-//! it atomically via [`CompositeStore::compare_and_swap_op_heads`]; unpinned instances
-//! delegate to additive [`CompositeStore::update_op_heads`]. [`ServerIndex`] prunes
-//! `is_ancestor`, `heads`, and `common_ancestors` walks using commit generation numbers,
-//! enforces per-walk and aggregate visit budgets, caches immutable commit graph nodes in
-//! a bounded cross-reconcile cache, and surfaces missing or malformed rows as
-//! [`StoreError::Corruption`]. [`ServerOpStore`] validates persisted digests and caches
-//! immutable operations across reconciles.
+//! [`ServerOpHeadsStore::with_expected_heads_for_project`] pins a validated head snapshot
+//! and `project_id` and swaps it atomically via [`CompositeStore::compare_and_swap_op_heads_for_project`].
+//! [`ServerIndex`] prunes `is_ancestor`, `heads`, and `common_ancestors` walks using commit
+//! generation numbers, enforces per-walk and aggregate visit budgets, caches immutable
+//! `(project_id, commit_id)` graph nodes across reconciles, and surfaces missing or malformed
+//! rows as [`StoreError::Corruption`]. [`ServerOpStore`] validates persisted digests, pins
+//! writes to `project_id`, and caches operations scoped by `(store, repo_id, project_id, op_id)`
+//! with invalidation on repo delete.
 //!
 //! # Cross-Process and RPC Boundaries
 //! Executes in-process inside jj-cc-server with zero loopback gRPC serialization.
@@ -51,6 +51,7 @@ pub use index::{
 };
 pub use op_heads::{ServerOpHeadsStore, ServerOpHeadsStoreNoLock};
 pub use op_store::ServerOpStore;
+pub(crate) use op_store::invalidate_repo_operation_cache;
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
@@ -95,6 +96,14 @@ impl<K: Eq + Hash + Clone, V> BoundedCache<K, V> {
         }
         self.order.push_back(key.clone());
         self.map.insert(key, value);
+    }
+
+    fn retain<F>(&mut self, mut predicate: F)
+    where
+        F: FnMut(&K, &V) -> bool,
+    {
+        self.map.retain(|k, v| predicate(k, v));
+        self.order.retain(|k| self.map.contains_key(k));
     }
 }
 

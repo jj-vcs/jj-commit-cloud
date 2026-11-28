@@ -46,7 +46,7 @@ use tonic::Status;
 use tonic::metadata::MetadataMap;
 use tonic::transport::Channel;
 
-use crate::cache::{CacheScope, CacheStatsSnapshot, TwoTierCache};
+use crate::cache::{CacheScope, CacheStatsSnapshot, PendingPurgeGuard, TwoTierCache};
 use crate::upstream::{UpstreamPool, extract_auth_header};
 
 mod backend;
@@ -83,6 +83,9 @@ const MAX_IDENTIFIER_LEN: usize = 128;
 /// in the same process never collide on sibling temp paths.
 static STATS_TMP_SEQ: AtomicU64 = AtomicU64::new(1);
 
+/// Key for [`DaemonProxyInner::giant_trees`]: `(namespace_hex, scope_hex, tree_id)`.
+type GiantTreeKey = (String, String, Vec<u8>);
+
 #[derive(Clone)]
 pub struct DaemonProxy {
     inner: Arc<DaemonProxyInner>,
@@ -104,8 +107,9 @@ struct DaemonProxyInner {
     max_cached_tree_entries: usize,
     max_cached_tree_bytes: usize,
     /// Scope-isolated cache of trees observed to exceed full-tree cache limits so follow-up
-    /// paginated `ReadTree` calls forward straight to upstream.
-    giant_trees: Mutex<LruCache<(String, Vec<u8>), ()>>,
+    /// paginated `ReadTree` calls forward straight to upstream. Keyed by
+    /// `(namespace_hex, scope_hex, tree_id)` so namespace purges evict every caller variant.
+    giant_trees: Mutex<LruCache<GiantTreeKey, ()>>,
     /// Per-normalized-origin negative capability cache of servers that rejected `page_size > 0`
     /// `ReadTree` with `UNIMPLEMENTED`, avoiding two sequential RPCs per cold unpaginated tree.
     unpaginated_tree_origins: Mutex<LruCache<String, Instant>>,
@@ -351,7 +355,7 @@ impl DaemonProxy {
         ))
     }
 
-    fn is_giant_tree(&self, key: &(String, Vec<u8>)) -> bool {
+    fn is_giant_tree(&self, key: &GiantTreeKey) -> bool {
         self.inner
             .giant_trees
             .lock()
@@ -360,12 +364,58 @@ impl DaemonProxy {
             .is_some()
     }
 
-    fn record_giant_tree(&self, key: (String, Vec<u8>)) {
-        self.inner
+    fn record_giant_tree(&self, key: GiantTreeKey, expected_epoch: u64) {
+        let mut cache = self
+            .inner
             .giant_trees
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .put(key, ());
+            .unwrap_or_else(|e| e.into_inner());
+        if !self.inner.cache.is_pending_purge_hex(&key.0)
+            && self.inner.cache.purge_epoch() == expected_epoch
+        {
+            cache.put(key, ());
+        }
+    }
+
+    pub(super) fn purge_giant_trees_for_namespace(&self, upstream_url: &str, namespace_id: &str) {
+        let namespace_hex = CacheScope::namespace_hex_for(upstream_url, namespace_id);
+        let mut cache = self
+            .inner
+            .giant_trees
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let doomed: Vec<GiantTreeKey> = cache
+            .iter()
+            .filter(|(k, _)| k.0 == namespace_hex)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in doomed {
+            cache.pop(&key);
+        }
+    }
+
+    /// Purges L1/L2 namespace entries and authorization markers in `TwoTierCache` (advancing
+    /// `purge_epoch`), then removes all matching `giant_trees` negative-cache entries so an
+    /// in-flight `ReadTree` racing a delete or re-register cannot repopulate them.
+    pub(super) async fn purge_namespace_state(&self, upstream_url: &str, namespace_id: &str) {
+        self.inner
+            .cache
+            .purge_namespace(upstream_url, namespace_id)
+            .await;
+        self.purge_giant_trees_for_namespace(upstream_url, namespace_id);
+    }
+
+    pub(super) async fn purge_namespace_state_with_guard(
+        &self,
+        upstream_url: &str,
+        namespace_id: &str,
+        pending_guard: PendingPurgeGuard,
+    ) {
+        self.inner
+            .cache
+            .purge_namespace_with_guard(upstream_url, namespace_id, pending_guard)
+            .await;
+        self.purge_giant_trees_for_namespace(upstream_url, namespace_id);
     }
 
     fn is_unpaginated_tree_origin(&self, origin: &str) -> bool {

@@ -106,6 +106,12 @@ impl cc_common::backend::backend_service_server::BackendService for MockListComm
     {
         Err(tonic::Status::unimplemented("unused"))
     }
+    async fn delete_repository(
+        &self,
+        _: tonic::Request<cc_common::backend::DeleteRepositoryRequest>,
+    ) -> Result<tonic::Response<cc_common::backend::DeleteRepositoryResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("unused"))
+    }
     async fn read_commit(
         &self,
         _: tonic::Request<cc_common::backend::ReadCommitRequest>,
@@ -301,6 +307,13 @@ async fn test_list_project_commits_enforces_max_page_cap() {
         {
             Err(tonic::Status::unimplemented("unused"))
         }
+        async fn delete_repository(
+            &self,
+            _: tonic::Request<cc_common::backend::DeleteRepositoryRequest>,
+        ) -> Result<tonic::Response<cc_common::backend::DeleteRepositoryResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("unused"))
+        }
         async fn read_commit(
             &self,
             _: tonic::Request<cc_common::backend::ReadCommitRequest>,
@@ -464,6 +477,12 @@ impl cc_common::backend::backend_service_server::BackendService for DynamicListC
         _: tonic::Request<cc_common::backend::RegisterRepositoryRequest>,
     ) -> Result<tonic::Response<cc_common::backend::RegisterRepositoryResponse>, tonic::Status>
     {
+        Err(tonic::Status::unimplemented("unused"))
+    }
+    async fn delete_repository(
+        &self,
+        _: tonic::Request<cc_common::backend::DeleteRepositoryRequest>,
+    ) -> Result<tonic::Response<cc_common::backend::DeleteRepositoryResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("unused"))
     }
     async fn read_commit(

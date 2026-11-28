@@ -145,7 +145,11 @@ impl DaemonProxy {
             }));
         }
         let is_paginated = req.page_size > 0 || !req.page_token.is_empty();
-        let giant_key = (scope.scope_hex().to_string(), req.tree_id.clone());
+        let giant_key = (
+            scope.namespace_hex().to_string(),
+            scope.scope_hex().to_string(),
+            req.tree_id.clone(),
+        );
         if self.is_giant_tree(&giant_key) {
             self.inner.cache.record_miss();
             if is_paginated {
@@ -183,6 +187,7 @@ impl DaemonProxy {
                 .inner
                 .cache
                 .get_or_fetch(&scope, ObjectKind::Tree, &tree_id, || async move {
+                    let giant_epoch = cache_for_fetch.purge_epoch();
                     if proxy_for_fetch.is_giant_tree(&giant_key_for_fetch) {
                         tree_too_large_for_fetch.store(true, Ordering::Release);
                         return Err(Status::resource_exhausted(
@@ -304,7 +309,8 @@ impl DaemonProxy {
                         if all_entries.len().saturating_add(resp.entries.len())
                             > max_cached_tree_entries
                         {
-                            proxy_for_fetch.record_giant_tree(giant_key_for_fetch.clone());
+                            proxy_for_fetch
+                                .record_giant_tree(giant_key_for_fetch.clone(), giant_epoch);
                             tree_too_large_for_fetch.store(true, Ordering::Release);
                             return Err(Status::resource_exhausted(format!(
                                 "upstream ReadTree exceeded maximum of {max_cached_tree_entries} entries"
@@ -317,7 +323,8 @@ impl DaemonProxy {
                                 .saturating_add(entry_len);
                             encoded_bytes = encoded_bytes.saturating_add(field_len);
                             if encoded_bytes > max_cached_tree_bytes {
-                                proxy_for_fetch.record_giant_tree(giant_key_for_fetch.clone());
+                                proxy_for_fetch
+                                    .record_giant_tree(giant_key_for_fetch.clone(), giant_epoch);
                                 tree_too_large_for_fetch.store(true, Ordering::Release);
                                 return Err(Status::resource_exhausted(format!(
                                     "upstream ReadTree exceeded maximum serialized size of {max_cached_tree_bytes} bytes"
@@ -346,7 +353,7 @@ impl DaemonProxy {
                         next_page_token: String::new(),
                     };
                     if full.encoded_len() > max_cached_tree_bytes {
-                        proxy_for_fetch.record_giant_tree(giant_key_for_fetch);
+                        proxy_for_fetch.record_giant_tree(giant_key_for_fetch, giant_epoch);
                         tree_too_large_for_fetch.store(true, Ordering::Release);
                         return Err(Status::resource_exhausted(format!(
                             "upstream ReadTree exceeded maximum serialized size of {max_cached_tree_bytes} bytes"
@@ -402,6 +409,7 @@ impl DaemonProxy {
         let meta = request.metadata().clone();
         let req = request.into_inner();
         let scope = self.scope_for(&meta, &req.project_id)?;
+        let cache_epoch = self.inner.cache.purge_epoch();
         let entries_for_cache =
             (req.entries.len() <= self.inner.max_cached_tree_entries).then(|| req.entries.clone());
         let out = self.inner.upstream.prepare_outbound(&meta, req)?;
@@ -454,11 +462,12 @@ impl DaemonProxy {
                     if cached_tree.encoded_len() <= self.inner.max_cached_tree_bytes {
                         self.inner
                             .cache
-                            .put_write_through_async(
+                            .put_write_through_if_epoch_async(
                                 scope,
                                 ObjectKind::Tree,
                                 res.tree_id.clone(),
                                 Bytes::from(cached_tree.encode_to_vec()),
+                                Some(cache_epoch),
                             )
                             .await;
                     }

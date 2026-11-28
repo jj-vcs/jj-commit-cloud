@@ -49,6 +49,9 @@ pub enum StoreError {
     },
 
     #[error("{0}")]
+    FailedPrecondition(String),
+
+    #[error("{0}")]
     InvalidArgument(String),
 
     #[error("{0}")]
@@ -83,7 +86,7 @@ impl From<StoreError> for tonic::Status {
                 tonic::Status::already_exists(err.to_string())
             }
             StoreError::CasConflict(_) => tonic::Status::aborted(err.to_string()),
-            StoreError::MissingDependency { .. } => {
+            StoreError::MissingDependency { .. } | StoreError::FailedPrecondition(_) => {
                 tonic::Status::failed_precondition(err.to_string())
             }
             StoreError::InvalidArgument(_) => tonic::Status::invalid_argument(err.to_string()),
@@ -120,6 +123,10 @@ mod tests {
                 Code::Unauthenticated,
             ),
             (StoreError::CasConflict("x".into()), Code::Aborted),
+            (
+                StoreError::FailedPrecondition("x".into()),
+                Code::FailedPrecondition,
+            ),
             (StoreError::Backend("x".into()), Code::Internal),
         ];
         for (err, code) in cases {
