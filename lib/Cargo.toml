@@ -7,13 +7,26 @@ publish = false
 [dependencies]
 jj-lib = "0.47.1"
 async-trait = "0.1"
+bytes = "1"
 futures = "0.3"
-cc-common = { path = "../common" }
-tonic = { version = "0.12.3", features = ["tls", "tls-webpki-roots"] }
-tokio = { version = "1.39", features = ["rt", "rt-multi-thread", "net", "process", "time", "sync", "io-util"] }
-serde = { version = "1", features = ["derive"] }
-toml = "0.8"
 gix = "0.85.0"
-tower = "0.4"
-hyper-util = { version = "0.1", features = ["tokio"] }
+hex = "0.4"
+hyper-util = { version = "0.1.20", features = ["tokio"] }
+cc-common = { path = "../common" }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+tonic = { version = "0.12.3", features = ["tls-roots", "tls-webpki-roots"] }
+tonic-health = "0.12"
+tower = "0.4.13"
+tokio = { version = "1.39", features = ["rt", "rt-multi-thread", "net", "sync", "time", "io-util"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+sha1 = "0.10"
+tempfile = "3"

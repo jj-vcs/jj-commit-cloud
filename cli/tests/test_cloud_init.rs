@@ -19,14 +19,12 @@ async fn test_cc_init_creates_local_workspace() {
     let workspace = testutils::TestWorkspace::init().await;
     let repo_path = workspace.repo_path();
 
-    // Verify local Jujutsu metadata directory structure
     let jj_store_path = repo_path.join(".jj/repo/store");
     assert!(
         jj_store_path.exists(),
         "The .jj/repo/store directory should exist"
     );
 
-    // Verify backend type selection file
     let store_type = fs::read_to_string(jj_store_path.join("type"))
         .expect("The store type file should be readable");
     assert_eq!(store_type, "commit_cloud");
@@ -35,14 +33,12 @@ async fn test_cc_init_creates_local_workspace() {
         .expect("The index type file should be readable");
     assert_eq!(index_type, "commit_cloud");
 
-    // Verify local Commit Cloud configuration TOML
     let config_content = fs::read_to_string(jj_store_path.join("config.toml"))
         .expect("The config.toml file should be readable");
 
     let parsed_config: toml::Value =
         toml::from_str(&config_content).expect("The config.toml file should be valid TOML");
 
-    // Verify correct parameters are serialized
     let server_url = parsed_config
         .get("server_url")
         .and_then(|v| v.as_str())
@@ -54,7 +50,6 @@ async fn test_cc_init_creates_local_workspace() {
         .and_then(|v| v.as_str())
         .expect("The repo_id field should exist and be a string");
 
-    // Validate the repo_id string is a valid UUID
     uuid::Uuid::parse_str(repo_id_str).expect("The repo_id should be a valid UUID string");
 
     let project_id_str = parsed_config
@@ -74,12 +69,11 @@ async fn test_cc_init_registers_repository() {
         .expect("The config.toml file should be readable");
     let parsed_config: toml::Value =
         toml::from_str(&config_content).expect("The config.toml file should be valid TOML");
-    let project_id_str = parsed_config
-        .get("project_id")
+    let repo_id_str = parsed_config
+        .get("repo_id")
         .and_then(|v| v.as_str())
-        .expect("The project_id field should exist and be a string");
+        .expect("The repo_id field should exist and be a string");
 
-    // Verify that the project/repository was actually registered in the cloud server over gRPC
     let mut client = cc_common::backend::backend_service_client::BackendServiceClient::connect(
         workspace.server_url().to_string(),
     )
@@ -87,7 +81,7 @@ async fn test_cc_init_registers_repository() {
     .expect("gRPC connection to test server should have succeeded");
 
     let request = tonic::Request::new(cc_common::backend::ReadCommitRequest {
-        project_id: project_id_str.to_string(),
+        project_id: repo_id_str.to_string(),
         commit_id: vec![1u8; cc_common::COMMIT_ID_LENGTH], // Dummy commit ID
     });
 
@@ -95,7 +89,7 @@ async fn test_cc_init_registers_repository() {
     assert_eq!(
         err.message(),
         "commit should have been present in cloud database",
-        "Project was not registered in the cloud server!"
+        "Repository was not registered in the cloud server!"
     );
 }
 
@@ -104,33 +98,239 @@ async fn test_cc_init_fails_on_invalid_server_addr() {
     let daemons = testutils::DaemonSandbox::new();
     let mut cmd = daemons.jj_cmd();
 
-    cmd.args([
-        "cc",
-        "init",
-        "--server",
-        "http://invalid-server-domain-does-not-exist:9999",
-        "--project-id",
-        "test-project",
-        "--create",
-        "/invalid_path_dest_dir",
-    ]);
+    cmd.env("JJ_USER", "Test User")
+        .env("JJ_EMAIL", "test.user@example.com")
+        .args([
+            "cc",
+            "init",
+            "--server",
+            "http://invalid-server-domain-does-not-exist:9999",
+            "--create",
+            "/invalid_path_dest_dir",
+        ]);
 
     cmd.assert().failure();
 }
 
 #[tokio::test]
-async fn test_cc_init_fails_without_project_id() {
-    let daemons = testutils::DaemonSandbox::new();
-    let mut cmd = daemons.jj_cmd();
+async fn test_cc_init_rejects_colliding_workspace_name_on_attach_and_create() {
+    let ws_a = testutils::TestWorkspace::init().await;
+    let config_content =
+        fs::read_to_string(ws_a.repo_path().join(".jj/repo/store/config.toml")).unwrap();
+    let parsed_config: toml::Value = toml::from_str(&config_content).unwrap();
+    let repo_id = parsed_config["repo_id"].as_str().unwrap().to_string();
 
-    cmd.args([
-        "cc",
-        "init",
-        "--server",
-        "http://localhost:8080",
-        "--create",
-        ".",
-    ]);
+    fs::write(ws_a.repo_path().join("sentinel.txt"), "keep default\n").unwrap();
+    ws_a.jj_cmd()
+        .args(["describe", "-m", "default workspace commit"])
+        .assert()
+        .success();
+    let orig_commit = String::from_utf8(
+        ws_a.jj_cmd()
+            .args(["log", "--no-graph", "-r", "@", "-T", "commit_id"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
 
-    cmd.assert().failure();
+    let parent = tempfile::tempdir().unwrap();
+
+    // Attaching with a colliding `--workspace-name default` (default flag value) must fail
+    // without creating destination directories or clobbering the existing workspace.
+    let attach_dest = parent.path().join("attach-collide");
+    let attach_out = ws_a
+        .server()
+        .jj_cmd()
+        .env("JJ_USER", "Test User")
+        .env("JJ_EMAIL", "test.user@example.com")
+        .args([
+            "cc",
+            "init",
+            "--server",
+            ws_a.server_url(),
+            "--repo-id",
+            &repo_id,
+            attach_dest.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!attach_out.status.success());
+    let attach_stderr = String::from_utf8_lossy(&attach_out.stderr);
+    assert!(
+        attach_stderr.contains("already exists") && attach_stderr.contains("--workspace-name"),
+        "expected actionable collision error on attach, got: {attach_stderr}"
+    );
+    assert!(
+        !attach_dest.exists(),
+        "colliding attach init must not leave destination directory behind"
+    );
+
+    // Passing `--create --repo-id <existing>` with colliding `--workspace-name default`
+    // must also fail with the same collision error.
+    let create_dest = parent.path().join("create-collide");
+    let create_out = ws_a
+        .server()
+        .jj_cmd()
+        .env("JJ_USER", "Test User")
+        .env("JJ_EMAIL", "test.user@example.com")
+        .args([
+            "cc",
+            "init",
+            "--server",
+            ws_a.server_url(),
+            "--create",
+            "--repo-id",
+            &repo_id,
+            "--project-id",
+            "test-project",
+            "--workspace-name",
+            "default",
+            create_dest.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!create_out.status.success());
+    let create_stderr = String::from_utf8_lossy(&create_out.stderr);
+    assert!(
+        create_stderr.contains("already exists") && create_stderr.contains("--workspace-name"),
+        "expected actionable collision error on --create --repo-id, got: {create_stderr}"
+    );
+    assert!(
+        !create_dest.exists(),
+        "colliding --create --repo-id init must not leave destination directory behind"
+    );
+
+    // Existing `default` workspace remains intact in both the shared view and WorkspaceService.
+    let status_out = String::from_utf8(
+        ws_a.jj_cmd()
+            .args(["cc", "workspace", "status", "--workspace-name", "default"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        status_out.contains(&orig_commit),
+        "existing default workspace must stay intact: {status_out}"
+    );
+
+    // `--create --repo-id <brand-new>` treats remote NotFound as absent and succeeds.
+    let brand_new_dest = parent.path().join("brand-new-repo");
+    ws_a.server()
+        .jj_cmd()
+        .env("JJ_USER", "Test User")
+        .env("JJ_EMAIL", "test.user@example.com")
+        .args([
+            "cc",
+            "init",
+            "--server",
+            ws_a.server_url(),
+            "--create",
+            "--repo-id",
+            "explicit-new-repo-id",
+            "--project-id",
+            "test-project",
+            brand_new_dest.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // Attaching with a unique `--workspace-name` succeeds.
+    let unique_dest = parent.path().join("unique-ws");
+    ws_a.server()
+        .jj_cmd()
+        .env("JJ_USER", "Test User")
+        .env("JJ_EMAIL", "test.user@example.com")
+        .args([
+            "cc",
+            "init",
+            "--server",
+            ws_a.server_url(),
+            "--repo-id",
+            &repo_id,
+            "--workspace-name",
+            "unique-ws",
+            unique_dest.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+}
+
+#[tokio::test]
+async fn test_cc_init_rolls_back_workspace_on_index_commit_failure() {
+    let ws_a = testutils::TestWorkspace::init().await;
+    let config_content =
+        fs::read_to_string(ws_a.repo_path().join(".jj/repo/store/config.toml")).unwrap();
+    let parsed_config: toml::Value = toml::from_str(&config_content).unwrap();
+    let repo_id = parsed_config["repo_id"].as_str().unwrap().to_string();
+
+    let parent = tempfile::tempdir().unwrap();
+    let failed_dest = parent.path().join("failed-index-init");
+    let missing_commit_hex = "1111111111111111111111111111111111111111";
+
+    ws_a.server()
+        .jj_cmd()
+        .env("JJ_USER", "Test User")
+        .env("JJ_EMAIL", "test.user@example.com")
+        .args([
+            "cc",
+            "init",
+            "--server",
+            ws_a.server_url(),
+            "--repo-id",
+            &repo_id,
+            "--workspace-name",
+            "ws-failed-index",
+            "--index-commit",
+            missing_commit_hex,
+            failed_dest.to_str().unwrap(),
+        ])
+        .assert()
+        .failure();
+
+    assert!(
+        !failed_dest.exists(),
+        "failed --index-commit init must remove newly created destination directory"
+    );
+
+    // Rolled-back workspace must be absent from both the shared operation view and WorkspaceService.
+    let ws_list = String::from_utf8(
+        ws_a.jj_cmd()
+            .args(["workspace", "list"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        ws_list
+            .lines()
+            .any(|line| line.starts_with("default:") || line.starts_with("default ("))
+            && !ws_list.contains("ws-failed-index"),
+        "failed init workspace must be rolled back from shared view: {ws_list}"
+    );
+
+    let cc_ws_list = String::from_utf8(
+        ws_a.jj_cmd()
+            .args(["cc", "workspace", "list"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        cc_ws_list.contains("default (") && !cc_ws_list.contains("ws-failed-index"),
+        "failed init workspace must be deleted from WorkspaceService: {cc_ws_list}"
+    );
 }

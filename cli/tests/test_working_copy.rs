@@ -12,198 +12,545 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(deprecated)]
-
-use cc_common::workspace::GetWorkspaceRequest;
-use cc_common::workspace::workspace_service_client::WorkspaceServiceClient;
 use std::fs;
+use std::path::Path;
+
+use assert_cmd::Command;
+use cc_common::workspace::workspace_service_client::WorkspaceServiceClient;
+use cc_common::workspace::{
+    CheckWorkingCopyChangesRequest, DeleteWorkspaceRequest, GetWorkspaceRequest,
+    ListWorkspacesRequest, UpdateWorkspaceRequest, WorkspaceState,
+};
+use cc_lib::util::{CommitCloudConfig, connect_workspace_client, run_on_tokio};
+use predicates::prelude::*;
 use testutils::TestWorkspace;
 
-#[tokio::test]
-async fn test_cc_init_working_copy_type_returns_commit_cloud() {
-    let ws = TestWorkspace::init().await;
+fn configure_jj_cmd(mut cmd: Command, cwd: &Path, xdg: &Path) -> Command {
+    cmd.current_dir(cwd)
+        .env("XDG_CONFIG_HOME", xdg)
+        .env("JJ_USER", "Workspace Tester")
+        .env("JJ_EMAIL", "ws.tester@example.com");
+    cmd
+}
 
-    let working_copy_type_path = ws.repo_path().join(".jj/working_copy/type");
-    assert!(
-        working_copy_type_path.exists(),
-        "Working copy type file should exist at .jj/working_copy/type"
-    );
-
-    let working_copy_type = fs::read_to_string(&working_copy_type_path).unwrap();
-    assert_eq!(
-        working_copy_type.trim(),
-        "commit_cloud",
-        "Working copy type should be 'commit_cloud'"
-    );
+fn jj_cmd(server: &testutils::ServerGuard, cwd: &Path, xdg: &Path) -> Command {
+    configure_jj_cmd(server.jj_cmd(), cwd, xdg)
 }
 
 #[tokio::test]
-async fn test_cc_init_working_copy_type_local() {
-    let server = testutils::spawn_server().await;
-    let temp_dir = tempfile::tempdir().unwrap();
+async fn test_commit_cloud_working_copy_syncs_state_sparse_patterns_and_cli_commands() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let xdg = dir.path().join("xdg");
+    fs::create_dir_all(&xdg).unwrap();
+    let server = testutils::spawn_sqlite_server(&dir.path().join("wc.db")).await;
 
-    let mut cmd = server.jj_cmd();
-    cmd.env("JJ_USER", "Test User")
-        .env("JJ_EMAIL", "test.user@example.com")
+    let ws_main = dir.path().join("ws_main");
+    jj_cmd(&server, dir.path(), &xdg)
         .args([
             "cc",
             "init",
-            "--create",
             "--server",
             server.url(),
             "--project-id",
-            "test-project",
+            "proj-wc",
+            "--create",
+            ws_main.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // Default working copy type is `commit_cloud`.
+    let wc_type = fs::read_to_string(ws_main.join(".jj/working_copy/type")).unwrap();
+    assert_eq!(wc_type.trim(), "commit_cloud");
+
+    let cfg = CommitCloudConfig::load_from_store(&ws_main).unwrap();
+    let repo_id = cfg.repo_id.clone();
+    let server_url = cfg.server_url.clone();
+
+    // Edit files, configure sparse patterns, and describe the commit.
+    fs::create_dir_all(ws_main.join("src")).unwrap();
+    fs::write(ws_main.join("src/main.rs"), "fn main() {}\n").unwrap();
+    jj_cmd(&server, &ws_main, &xdg)
+        .args(["sparse", "set", "--clear", "--add", "src"])
+        .assert()
+        .success();
+    jj_cmd(&server, &ws_main, &xdg)
+        .args(["describe", "-m", "sparse wc commit"])
+        .assert()
+        .success();
+
+    let commit_hex = String::from_utf8(
+        jj_cmd(&server, &ws_main, &xdg)
+            .args(["log", "--no-graph", "-r", "@", "-T", "commit_id"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    let url_clone = server_url.clone();
+    let repo_clone = repo_id.clone();
+    let (ws_state, change_check) = run_on_tokio(async move {
+        let mut client = connect_workspace_client(url_clone).await?;
+        let ws = client
+            .get_workspace(GetWorkspaceRequest {
+                repo_id: repo_clone.clone(),
+                user: "ws.tester@example.com".to_string(),
+                workspace_name: "default".to_string(),
+            })
+            .await?
+            .into_inner()
+            .workspace
+            .expect("workspace state should exist on server");
+        let ch = client
+            .check_working_copy_changes(CheckWorkingCopyChangesRequest {
+                repo_id: repo_clone,
+                user: "ws.tester@example.com".to_string(),
+                workspace_name: "default".to_string(),
+            })
+            .await?
+            .into_inner();
+        Ok((ws, ch))
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(hex::encode(&ws_state.commit_id), commit_hex);
+    assert!(!ws_state.operation_id.is_empty());
+    assert!(!ws_state.tree_ids.is_empty());
+    assert!(ws_state.sparse_patterns.iter().any(|p| p == "src"));
+    assert!(!change_check.has_changes);
+
+    let ws_clone = dir.path().join("ws_clone");
+    jj_cmd(&server, dir.path(), &xdg)
+        .args([
+            "cc",
+            "clone",
+            "--server",
+            server.url(),
+            "--workspace-name",
+            "agent-sandbox",
+            &repo_id,
+            ws_clone.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    jj_cmd(&server, &ws_main, &xdg)
+        .args(["cc", "workspace", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("default (ws.tester@example.com)"))
+        .stdout(predicate::str::contains(
+            "agent-sandbox (ws.tester@example.com)",
+        ));
+
+    jj_cmd(&server, &ws_main, &xdg)
+        .args(["cc", "workspace", "status", "--workspace-name", "default"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(&commit_hex))
+        .stdout(predicate::str::contains("Sparse:    src"))
+        .stdout(predicate::str::contains("Modified:  false"));
+
+    // Omitting --workspace-name inside a non-default Commit Cloud workspace resolves its active name.
+    jj_cmd(&server, &ws_clone, &xdg)
+        .args(["cc", "workspace", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Workspace: agent-sandbox"))
+        .stdout(predicate::str::contains("Sparse:    (all)"));
+
+    jj_cmd(&server, &ws_main, &xdg)
+        .args(["cc", "workspace", "delete", "agent-sandbox"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Deleted cloud workspace 'agent-sandbox'",
+        ));
+}
+
+#[tokio::test]
+async fn test_cc_init_supports_explicit_local_working_copy_type() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let xdg = dir.path().join("xdg");
+    fs::create_dir_all(&xdg).unwrap();
+    let server = testutils::spawn_server().await;
+
+    let ws_local = dir.path().join("ws_local");
+    jj_cmd(&server, dir.path(), &xdg)
+        .args([
+            "cc",
+            "init",
+            "--server",
+            server.url(),
             "--working-copy-type",
             "local",
-            temp_dir.path().to_str().unwrap(),
-        ]);
-    cmd.assert().success();
-
-    let working_copy_type_path = temp_dir.path().join(".jj/working_copy/type");
-    assert!(working_copy_type_path.exists());
-    let working_copy_type = fs::read_to_string(&working_copy_type_path).unwrap();
-    assert_eq!(working_copy_type.trim(), "local");
-
-    // Verify commands like describe and log work cleanly with local working copy
-    let mut describe_cmd = server.jj_cmd();
-    describe_cmd
-        .current_dir(temp_dir.path())
-        .env("JJ_USER", "Test User")
-        .env("JJ_EMAIL", "test.user@example.com")
-        .args(["describe", "-m", "local working copy commit"])
+            "--create",
+            ws_local.to_str().unwrap(),
+        ])
         .assert()
         .success();
 
-    let mut log_cmd = server.jj_cmd();
-    let output = log_cmd
-        .current_dir(temp_dir.path())
-        .env("JJ_USER", "Test User")
-        .env("JJ_EMAIL", "test.user@example.com")
-        .args(["log"])
+    let wc_type = fs::read_to_string(ws_local.join(".jj/working_copy/type")).unwrap();
+    assert_eq!(wc_type.trim(), "local");
+
+    fs::write(ws_local.join("note.txt"), "local mode\n").unwrap();
+    jj_cmd(&server, &ws_local, &xdg)
+        .args(["describe", "-m", "local wc mode"])
         .assert()
         .success();
-    let stdout = String::from_utf8_lossy(&output.get_output().stdout);
-    assert!(stdout.contains("local working copy commit"));
 }
 
 #[tokio::test]
-async fn test_working_copy_syncs_state_to_server() {
-    let ws = TestWorkspace::init().await;
+async fn test_commit_cloud_working_copy_preserves_conflicted_merge_trees_in_workspace_service() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let xdg = dir.path().join("xdg");
+    fs::create_dir_all(&xdg).unwrap();
+    let server = testutils::spawn_sqlite_server(&dir.path().join("wc_conflict.db")).await;
 
-    let config_path = ws.repo_path().join(".jj/repo/store/config.toml");
-    let config_str = fs::read_to_string(&config_path).unwrap();
-    let config: toml::Value = toml::from_str(&config_str).unwrap();
-    let repo_id = config.get("repo_id").unwrap().as_str().unwrap().to_string();
-
-    let mut client = WorkspaceServiceClient::connect(ws.server_url().to_string())
-        .await
-        .expect("Failed to connect to WorkspaceService");
-
-    let user = "test.user@example.com".to_string();
-    let response = client
-        .get_workspace(GetWorkspaceRequest {
-            repo_id: repo_id.clone(),
-            user: user.clone(),
-            workspace_name: "default".to_string(),
-        })
-        .await
-        .expect("Failed to get workspace")
-        .into_inner();
-
-    let ws_state = response
-        .workspace
-        .expect("Workspace should be registered on server");
-    assert_eq!(ws_state.repo_id, repo_id);
-    assert_eq!(ws_state.user, user);
-    assert_eq!(ws_state.workspace_name, "default");
-    assert!(!ws_state.operation_id.is_empty());
-}
-
-#[tokio::test]
-async fn test_working_copy_snapshot_and_change_detection() {
-    let ws = TestWorkspace::init().await;
-
-    // Create a file in working directory and run describe to trigger a snapshot
-    let test_file = ws.repo_path().join("hello.txt");
-    fs::write(&test_file, "hello from commit cloud working copy").unwrap();
-
-    let mut cmd = ws.jj_cmd();
-    cmd.args(["describe", "-m", "add hello.txt"])
-        .assert()
-        .success();
-
-    let config_path = ws.repo_path().join(".jj/repo/store/config.toml");
-    let config_str = fs::read_to_string(&config_path).unwrap();
-    let config: toml::Value = toml::from_str(&config_str).unwrap();
-    let repo_id = config.get("repo_id").unwrap().as_str().unwrap().to_string();
-
-    let mut client = WorkspaceServiceClient::connect(ws.server_url().to_string())
-        .await
-        .expect("Failed to connect to WorkspaceService");
-
-    let user = "test.user@example.com".to_string();
-    let response = client
-        .get_workspace(GetWorkspaceRequest {
-            repo_id: repo_id.clone(),
-            user: user.clone(),
-            workspace_name: "default".to_string(),
-        })
-        .await
-        .expect("Failed to get workspace")
-        .into_inner();
-
-    let ws_state = response
-        .workspace
-        .expect("Workspace should exist on server");
-    assert!(
-        !ws_state.tree_id.is_empty(),
-        "Working tree ID should not be empty"
-    );
-    assert!(
-        !ws_state.commit_id.is_empty(),
-        "commit_id should not be empty"
-    );
-}
-
-#[tokio::test]
-async fn test_working_copy_fails_without_user_identity() {
-    let server = testutils::spawn_server().await;
-    let temp_dir = tempfile::tempdir().unwrap();
-
-    let mut cmd = server.jj_cmd();
-    // Intentionally pass an empty config without user.email or user.name, and clear env vars
-    cmd.env_remove("JJ_USER")
-        .env_remove("JJ_EMAIL")
-        .env_remove("USER")
+    let ws_dir = dir.path().join("ws_conflict");
+    jj_cmd(&server, dir.path(), &xdg)
         .args([
             "cc",
             "init",
-            "--create",
             "--server",
             server.url(),
             "--project-id",
-            "test-project",
-            "--config",
-            "user.email=''",
-            "--config",
-            "user.name=''",
-            temp_dir.path().to_str().unwrap(),
-        ]);
-    let output = cmd.assert().failure();
-    let stderr = String::from_utf8_lossy(&output.get_output().stderr);
-    assert!(
-        stderr.contains("user.email") || stderr.contains("User email"),
-        "stderr should mention missing user.email, got: {stderr}"
+            "proj-wc-conflict",
+            "--create",
+            ws_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // Base commit
+    fs::write(ws_dir.join("conflict.txt"), "base\n").unwrap();
+    jj_cmd(&server, &ws_dir, &xdg)
+        .args(["bookmark", "create", "base", "-r", "@"])
+        .assert()
+        .success();
+    jj_cmd(&server, &ws_dir, &xdg)
+        .args(["describe", "-m", "base"])
+        .assert()
+        .success();
+
+    // Left branch
+    jj_cmd(&server, &ws_dir, &xdg)
+        .args(["new", "base"])
+        .assert()
+        .success();
+    fs::write(ws_dir.join("conflict.txt"), "left side\n").unwrap();
+    jj_cmd(&server, &ws_dir, &xdg)
+        .args(["bookmark", "create", "left", "-r", "@"])
+        .assert()
+        .success();
+    jj_cmd(&server, &ws_dir, &xdg)
+        .args(["describe", "-m", "left"])
+        .assert()
+        .success();
+
+    // Right branch
+    jj_cmd(&server, &ws_dir, &xdg)
+        .args(["new", "base"])
+        .assert()
+        .success();
+    fs::write(ws_dir.join("conflict.txt"), "right side\n").unwrap();
+    jj_cmd(&server, &ws_dir, &xdg)
+        .args(["bookmark", "create", "right", "-r", "@"])
+        .assert()
+        .success();
+    jj_cmd(&server, &ws_dir, &xdg)
+        .args(["describe", "-m", "right"])
+        .assert()
+        .success();
+
+    // Conflicted merge checkout (`Merge<TreeId>` with 3 tree terms: `[left, base, right]`).
+    jj_cmd(&server, &ws_dir, &xdg)
+        .args(["new", "left", "right", "-m", "conflicted merge"])
+        .assert()
+        .success();
+
+    let cfg = CommitCloudConfig::load_from_store(&ws_dir).unwrap();
+    let (ws_state, change_check) = run_on_tokio(async move {
+        let mut client = connect_workspace_client(cfg.server_url).await?;
+        let ws = client
+            .get_workspace(GetWorkspaceRequest {
+                repo_id: cfg.repo_id.clone(),
+                user: "ws.tester@example.com".to_string(),
+                workspace_name: "default".to_string(),
+            })
+            .await?
+            .into_inner()
+            .workspace
+            .expect("workspace state should exist");
+        let ch = client
+            .check_working_copy_changes(CheckWorkingCopyChangesRequest {
+                repo_id: cfg.repo_id,
+                user: "ws.tester@example.com".to_string(),
+                workspace_name: "default".to_string(),
+            })
+            .await?
+            .into_inner();
+        Ok((ws, ch))
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        ws_state.tree_ids.len(),
+        3,
+        "conflicted checkout must persist all 3 Merge<TreeId> sides instead of EMPTY_TREE_ID"
     );
+    assert!(
+        !change_check.has_changes,
+        "fresh conflicted merge checkout must match its checked-out commit's Merge<TreeId>"
+    );
+    assert_eq!(change_check.current_tree_ids, change_check.commit_tree_ids);
+}
+
+#[tokio::test]
+async fn test_snapshot_only_command_keeps_workspace_commit_current() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let xdg = dir.path().join("xdg");
+    fs::create_dir_all(&xdg).unwrap();
+    let server = testutils::spawn_sqlite_server(&dir.path().join("wc_snapshot.db")).await;
+
+    let ws_dir = dir.path().join("ws_snapshot");
+    jj_cmd(&server, dir.path(), &xdg)
+        .args([
+            "cc",
+            "init",
+            "--server",
+            server.url(),
+            "--project-id",
+            "proj-wc-snapshot",
+            "--create",
+            ws_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    jj_cmd(&server, &ws_dir, &xdg)
+        .args(["describe", "-m", "checked out by describe"])
+        .assert()
+        .success();
+
+    // Snapshot-only commands (`jj st`, `jj diff`, `jj log`) rewrite `@` without a checkout.
+    for (idx, snapshot_cmd) in [
+        (1, &["st"][..]),
+        (2, &["diff"][..]),
+        (3, &["log", "-n", "1"][..]),
+    ] {
+        fs::write(ws_dir.join("edited.txt"), format!("edited step {idx}\n")).unwrap();
+        jj_cmd(&server, &ws_dir, &xdg)
+            .args(snapshot_cmd)
+            .assert()
+            .success();
+
+        let commit_hex = String::from_utf8(
+            jj_cmd(&server, &ws_dir, &xdg)
+                .args([
+                    "log",
+                    "--ignore-working-copy",
+                    "--no-graph",
+                    "-r",
+                    "@",
+                    "-T",
+                    "commit_id",
+                ])
+                .assert()
+                .success()
+                .get_output()
+                .stdout
+                .clone(),
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        let cfg = CommitCloudConfig::load_from_store(&ws_dir).unwrap();
+        let (ws_state, change_check) = run_on_tokio(async move {
+            let mut client = connect_workspace_client(cfg.server_url).await?;
+            let ws = client
+                .get_workspace(GetWorkspaceRequest {
+                    repo_id: cfg.repo_id.clone(),
+                    user: "ws.tester@example.com".to_string(),
+                    workspace_name: "default".to_string(),
+                })
+                .await?
+                .into_inner()
+                .workspace
+                .expect("workspace state should exist");
+            let ch = client
+                .check_working_copy_changes(CheckWorkingCopyChangesRequest {
+                    repo_id: cfg.repo_id,
+                    user: "ws.tester@example.com".to_string(),
+                    workspace_name: "default".to_string(),
+                })
+                .await?
+                .into_inner();
+            Ok((ws, ch))
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            hex::encode(&ws_state.commit_id),
+            commit_hex,
+            "record must follow snapshot from {snapshot_cmd:?}"
+        );
+        assert!(
+            !change_check.has_changes,
+            "snapshotted tree must match the recorded commit"
+        );
+
+        jj_cmd(&server, &ws_dir, &xdg)
+            .args(["cc", "workspace", "status", "--workspace-name", "default"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(format!("Commit:    {commit_hex}")))
+            .stdout(predicate::str::contains("Modified:  false"));
+    }
+}
+
+#[tokio::test]
+async fn test_workspace_status_surfaces_check_working_copy_changes_errors() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let xdg = dir.path().join("xdg");
+    fs::create_dir_all(&xdg).unwrap();
+    let server = testutils::spawn_server().await;
+
+    let ws_dir = dir.path().join("ws_err");
+    jj_cmd(&server, dir.path(), &xdg)
+        .args([
+            "cc",
+            "init",
+            "--server",
+            server.url(),
+            "--create",
+            ws_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let cfg = CommitCloudConfig::load_from_store(&ws_dir).unwrap();
+    #[allow(deprecated)]
+    run_on_tokio(async move {
+        let mut client = connect_workspace_client(cfg.server_url).await?;
+        let missing_op_err = client
+            .update_workspace(UpdateWorkspaceRequest {
+                workspace: Some(WorkspaceState {
+                    repo_id: cfg.repo_id.clone(),
+                    user: "ws.tester@example.com".to_string(),
+                    workspace_name: "missing-op".to_string(),
+                    commit_id: Vec::new(),
+                    operation_id: vec![0xab; 16],
+                    tree_id: cc_common::EMPTY_TREE_ID_BYTES.to_vec(),
+                    sparse_patterns: Vec::new(),
+                    tree_ids: vec![cc_common::EMPTY_TREE_ID_BYTES.to_vec()],
+                    conflict_labels: Vec::new(),
+                    sparse_patterns_set: true,
+                }),
+                expected_operation_id: None,
+            })
+            .await
+            .expect_err("non-existent operation_id must fail with FAILED_PRECONDITION");
+        assert_eq!(missing_op_err.code(), tonic::Code::FailedPrecondition);
+
+        let missing_commit_err = client
+            .update_workspace(UpdateWorkspaceRequest {
+                workspace: Some(WorkspaceState {
+                    repo_id: cfg.repo_id.clone(),
+                    user: "ws.tester@example.com".to_string(),
+                    workspace_name: "broken".to_string(),
+                    commit_id: vec![0xde; 20],
+                    operation_id: Vec::new(),
+                    tree_id: cc_common::EMPTY_TREE_ID_BYTES.to_vec(),
+                    sparse_patterns: Vec::new(),
+                    tree_ids: vec![cc_common::EMPTY_TREE_ID_BYTES.to_vec()],
+                    conflict_labels: Vec::new(),
+                    sparse_patterns_set: true,
+                }),
+                expected_operation_id: None,
+            })
+            .await
+            .expect_err("non-existent commit_id must fail with FAILED_PRECONDITION");
+        assert_eq!(missing_commit_err.code(), tonic::Code::FailedPrecondition);
+
+        // expected_operation_id CAS: create-only (`Some(vec![])`), exact retry idempotency,
+        // and stale `expected_operation_id` conflict (`Code::Aborted`).
+        let cas_ws = WorkspaceState {
+            repo_id: cfg.repo_id.clone(),
+            user: "ws.tester@example.com".to_string(),
+            workspace_name: "vfs-cas".to_string(),
+            commit_id: cc_common::ROOT_COMMIT_ID_BYTES.to_vec(),
+            operation_id: cc_common::ROOT_OPERATION_ID_BYTES.to_vec(),
+            tree_id: cc_common::EMPTY_TREE_ID_BYTES.to_vec(),
+            sparse_patterns: vec![String::new()],
+            tree_ids: vec![cc_common::EMPTY_TREE_ID_BYTES.to_vec()],
+            conflict_labels: Vec::new(),
+            sparse_patterns_set: true,
+        };
+        let created = client
+            .update_workspace(UpdateWorkspaceRequest {
+                workspace: Some(cas_ws.clone()),
+                expected_operation_id: Some(Vec::new()),
+            })
+            .await
+            .expect("create-only CAS on absent workspace should succeed")
+            .into_inner();
+        assert!(created.success);
+        assert_eq!(created.workspace.as_ref(), Some(&cas_ws));
+        client
+            .update_workspace(UpdateWorkspaceRequest {
+                workspace: Some(cas_ws.clone()),
+                expected_operation_id: Some(Vec::new()),
+            })
+            .await
+            .expect("exact retry of already-applied CAS workspace state should be idempotent");
+        let mut conflicting_ws = cas_ws;
+        conflicting_ws.sparse_patterns = Vec::new();
+        let cas_conflict = client
+            .update_workspace(UpdateWorkspaceRequest {
+                workspace: Some(conflicting_ws),
+                expected_operation_id: Some(Vec::new()),
+            })
+            .await
+            .expect_err("create-only CAS on existing workspace with different state must abort");
+        assert_eq!(cas_conflict.code(), tonic::Code::Aborted);
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    jj_cmd(&server, &ws_dir, &xdg)
+        .args(["cc", "workspace", "status", "--workspace-name", "broken"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Cloud workspace 'broken' is not registered",
+        ));
+
+    drop(server);
+    let offline_sandbox = testutils::DaemonSandbox::new();
+    configure_jj_cmd(offline_sandbox.jj_cmd(), &ws_dir, &xdg)
+        .args(["cc", "workspace", "status"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Failed to query cloud workspace status",
+        ));
 }
 
 #[tokio::test]
 #[ignore = "needs jjfsd from the jj-vfs repo and FUSE; run with JJFSD_BIN=/path/to/jjfsd cargo test -p cli --test test_working_copy test_vfs_commit_cloud_working_copy_succeeds -- --ignored"]
 async fn test_vfs_commit_cloud_working_copy_succeeds() {
-    // Initialize a real Commit Cloud repository with jj-cc-server
-    let ws = testutils::TestWorkspace::init().await;
+    let ws = TestWorkspace::init().await;
 
-    // Create files and make a commit
     let cloud_file = ws.repo_path().join("cloud_file.txt");
     fs::write(&cloud_file, "hello from commit cloud vfs\n").unwrap();
     let src_dir = ws.repo_path().join("src");
@@ -211,15 +558,13 @@ async fn test_vfs_commit_cloud_working_copy_succeeds() {
     let lib_file = src_dir.join("lib.rs");
     fs::write(&lib_file, "pub fn cloud_fn() {}\n").unwrap();
 
-    let mut describe_cmd = ws.jj_cmd();
-    describe_cmd
+    ws.jj_cmd()
         .args(["describe", "-m", "commit cloud vfs test"])
         .assert()
         .success();
 
-    // Retrieve the commit ID of @
-    let mut log_cmd = ws.jj_cmd();
-    let log_output = log_cmd
+    let log_output = ws
+        .jj_cmd()
         .args(["log", "-r", "@", "-T", "commit_id", "--no-graph"])
         .assert()
         .success();
@@ -228,14 +573,11 @@ async fn test_vfs_commit_cloud_working_copy_succeeds() {
         .to_string();
     assert!(!commit_hex.is_empty(), "commit_id should not be empty");
 
-    // Perform sparse set --clear to verify 0 source files exist on disk
-    let mut sparse_cmd = ws.jj_cmd();
-    sparse_cmd
+    ws.jj_cmd()
         .args(["sparse", "set", "--clear"])
         .assert()
         .success();
 
-    // Verify physical files are no longer on local disk
     assert!(
         !cloud_file.exists(),
         "cloud_file.txt should be removed from disk after sparse clear"
@@ -245,11 +587,8 @@ async fn test_vfs_commit_cloud_working_copy_succeeds() {
         "src/ directory should be removed from disk after sparse clear"
     );
 
-    // Mount the VFS using the shared testutils helper
     let vfs = ws.mount_vfs().await;
     let mountpoint = vfs.mountpoint();
-
-    // Verify browsing /commits/<commit_hex>/ and reading files through VFS
     let commit_dir = mountpoint.join("commits").join(&commit_hex);
 
     let vfs_file1 = commit_dir.join("cloud_file.txt");
@@ -270,7 +609,6 @@ async fn test_vfs_commit_cloud_working_copy_succeeds() {
         fs::read_to_string(&vfs_lib_file).expect("Failed to read src/lib.rs via VFS");
     assert_eq!(vfs_lib_content, "pub fn cloud_fn() {}\n");
 
-    // Verify directory listing on /commits/<commit_hex>
     let entries: Vec<String> = fs::read_dir(&commit_dir)
         .expect("Failed to read commit dir")
         .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
@@ -283,8 +621,6 @@ async fn test_vfs_commit_cloud_working_copy_succeeds() {
         entries.contains(&"src".to_string()),
         "Directory listing should contain src"
     );
-
-    // Verify again that the physical local disk has 0 source files!
     assert!(
         !cloud_file.exists(),
         "Physical disk should still have 0 files"
@@ -297,8 +633,6 @@ async fn test_vfs_commit_cloud_working_copy_succeeds() {
 
 #[tokio::test]
 async fn test_delete_workspace_succeeds() {
-    use cc_common::workspace::{DeleteWorkspaceRequest, ListWorkspacesRequest};
-
     let ws = TestWorkspace::init().await;
 
     let config_path = ws.repo_path().join(".jj/repo/store/config.toml");
@@ -312,7 +646,6 @@ async fn test_delete_workspace_succeeds() {
 
     let user = "test.user@example.com".to_string();
 
-    // Verify workspace exists
     let response = client
         .get_workspace(GetWorkspaceRequest {
             repo_id: repo_id.clone(),
@@ -324,7 +657,6 @@ async fn test_delete_workspace_succeeds() {
         .into_inner();
     assert!(response.workspace.is_some());
 
-    // Delete workspace
     let del_resp = client
         .delete_workspace(DeleteWorkspaceRequest {
             repo_id: repo_id.clone(),
@@ -336,7 +668,6 @@ async fn test_delete_workspace_succeeds() {
         .into_inner();
     assert!(del_resp.existed);
 
-    // Verify workspace is gone from database
     let response = client
         .get_workspace(GetWorkspaceRequest {
             repo_id: repo_id.clone(),
@@ -362,8 +693,6 @@ async fn test_delete_workspace_succeeds() {
 
 #[tokio::test]
 async fn test_delete_workspace_nonexistent_returns_false() {
-    use cc_common::workspace::DeleteWorkspaceRequest;
-
     let ws = TestWorkspace::init().await;
 
     let config_path = ws.repo_path().join(".jj/repo/store/config.toml");
@@ -375,7 +704,6 @@ async fn test_delete_workspace_nonexistent_returns_false() {
         .await
         .expect("Failed to connect to WorkspaceService");
 
-    // Attempt to delete a nonexistent workspace name
     let del_resp = client
         .delete_workspace(DeleteWorkspaceRequest {
             repo_id: repo_id.clone(),
@@ -390,7 +718,6 @@ async fn test_delete_workspace_nonexistent_returns_false() {
         "Deleting a nonexistent workspace should return existed = false"
     );
 
-    // Attempt to delete from a nonexistent repository
     let del_resp2 = client
         .delete_workspace(DeleteWorkspaceRequest {
             repo_id: "nonexistent_repo".to_string(),
@@ -408,11 +735,8 @@ async fn test_delete_workspace_nonexistent_returns_false() {
 
 #[tokio::test]
 async fn test_check_working_copy_changes_succeeds() {
-    use cc_common::workspace::CheckWorkingCopyChangesRequest;
-
     let ws = TestWorkspace::init().await;
 
-    // Create a commit so the commit exists in the store
     let test_file = ws.repo_path().join("file.txt");
     fs::write(&test_file, "content").unwrap();
     let mut cmd = ws.jj_cmd();
@@ -429,7 +753,6 @@ async fn test_check_working_copy_changes_succeeds() {
         .await
         .expect("Failed to connect to WorkspaceService");
 
-    // Query changes on a workspace after snapshot
     let response = client
         .check_working_copy_changes(CheckWorkingCopyChangesRequest {
             repo_id,
@@ -444,13 +767,14 @@ async fn test_check_working_copy_changes_succeeds() {
         !response.has_changes,
         "Workspace should have no un-snapshotted changes after describe"
     );
-    assert_eq!(response.current_tree_id, response.commit_tree_id);
+    #[allow(deprecated)]
+    {
+        assert_eq!(response.current_tree_id, response.commit_tree_id);
+    }
 }
 
 #[tokio::test]
 async fn test_check_working_copy_changes_nonexistent_workspace_fails() {
-    use cc_common::workspace::CheckWorkingCopyChangesRequest;
-
     let ws = TestWorkspace::init().await;
 
     let config_path = ws.repo_path().join(".jj/repo/store/config.toml");
@@ -462,7 +786,6 @@ async fn test_check_working_copy_changes_nonexistent_workspace_fails() {
         .await
         .expect("Failed to connect to WorkspaceService");
 
-    // Check changes for a nonexistent workspace
     let result = client
         .check_working_copy_changes(CheckWorkingCopyChangesRequest {
             repo_id,
@@ -483,7 +806,6 @@ async fn test_check_working_copy_changes_nonexistent_workspace_fails() {
 async fn test_workspace_forget_cli() {
     let ws = TestWorkspace::init().await;
 
-    // Verify workspace list shows default workspace
     let mut list_cmd = ws.jj_cmd();
     let output = list_cmd.args(["workspace", "list"]).assert().success();
     let stdout = String::from_utf8_lossy(&output.get_output().stdout);
@@ -492,14 +814,12 @@ async fn test_workspace_forget_cli() {
         "Workspace list should include default"
     );
 
-    // Forget the default workspace
     let mut forget_cmd = ws.jj_cmd();
     forget_cmd
         .args(["workspace", "forget", "default"])
         .assert()
         .success();
 
-    // Verify workspace list is now empty or default is removed
     let mut list_cmd2 = ws.jj_cmd();
     let output2 = list_cmd2.args(["workspace", "list"]).assert().success();
     let stdout2 = String::from_utf8_lossy(&output2.get_output().stdout);
@@ -513,7 +833,6 @@ async fn test_workspace_forget_cli() {
 async fn test_workspace_forget_nonexistent_cli_warning() {
     let ws = TestWorkspace::init().await;
 
-    // Attempt to forget a non-existent workspace name via CLI
     let mut cmd = ws.jj_cmd();
     let output = cmd
         .args(["workspace", "forget", "nonexistent_workspace"])
@@ -527,162 +846,8 @@ async fn test_workspace_forget_nonexistent_cli_warning() {
 }
 
 #[tokio::test]
-async fn test_working_copy_shared_project_sqlite_integration() {
-    use cc_common::workspace::CheckWorkingCopyChangesRequest;
-
-    let db_dir = tempfile::tempdir().unwrap();
-    let db_path = db_dir.path().join("commit_cloud.db");
-    let server = testutils::spawn_sqlite_server(&db_path).await;
-
-    let dir_client_1 = tempfile::tempdir().unwrap();
-    let dir_client_2 = tempfile::tempdir().unwrap();
-
-    // Initialize client_1 and client_2 sharing the same project_id on SQLite
-    let mut init_cmd_1 = server.jj_cmd();
-    init_cmd_1
-        .current_dir(dir_client_1.path())
-        .env("JJ_USER", "Client 1")
-        .env("JJ_EMAIL", "client_1@example.com")
-        .args([
-            "cc",
-            "init",
-            "--server",
-            server.url(),
-            "--project-id",
-            "shared-proj",
-            "--repo-id",
-            "repo-client-1",
-            "--create",
-            ".",
-        ])
-        .assert()
-        .success();
-
-    let mut init_cmd_2 = server.jj_cmd();
-    init_cmd_2
-        .current_dir(dir_client_2.path())
-        .env("JJ_USER", "Client 2")
-        .env("JJ_EMAIL", "client_2@example.com")
-        .args([
-            "cc",
-            "init",
-            "--server",
-            server.url(),
-            "--project-id",
-            "shared-proj",
-            "--repo-id",
-            "repo-client-2",
-            "--create",
-            ".",
-        ])
-        .assert()
-        .success();
-
-    // client_1 creates a file and snapshots a commit into the shared project CAS
-    let file_1 = dir_client_1.path().join("shared.txt");
-    fs::write(&file_1, "hello from client_1 in shared project").unwrap();
-
-    let mut describe_cmd_1 = server.jj_cmd();
-    describe_cmd_1
-        .current_dir(dir_client_1.path())
-        .env("JJ_USER", "Client 1")
-        .env("JJ_EMAIL", "client_1@example.com")
-        .args(["describe", "-m", "commit from client_1"])
-        .assert()
-        .success();
-
-    let mut log_cmd_1 = server.jj_cmd();
-    let log_output_1 = log_cmd_1
-        .current_dir(dir_client_1.path())
-        .env("JJ_USER", "Client 1")
-        .env("JJ_EMAIL", "client_1@example.com")
-        .args(["log", "-r", "@", "-T", "commit_id", "--no-graph"])
-        .assert()
-        .success();
-    let client_1_commit_id = String::from_utf8_lossy(&log_output_1.get_output().stdout)
-        .trim()
-        .to_string();
-
-    // client_2 checks out a new working copy commit on top of client_1's shared commit
-    let mut new_cmd_2 = server.jj_cmd();
-    new_cmd_2
-        .current_dir(dir_client_2.path())
-        .env("JJ_USER", "Client 2")
-        .env("JJ_EMAIL", "client_2@example.com")
-        .args([
-            "new",
-            &client_1_commit_id,
-            "-m",
-            "working copy on top of client_1",
-        ])
-        .assert()
-        .success();
-
-    // Verify client_2's working copy automatically materialized shared.txt on disk
-    let file_2 = dir_client_2.path().join("shared.txt");
-    assert!(
-        file_2.exists(),
-        "shared.txt from client_1 should materialize in client_2 working copy"
-    );
-    assert_eq!(
-        fs::read_to_string(&file_2).unwrap(),
-        "hello from client_1 in shared project"
-    );
-
-    // Verify WorkspaceService check_working_copy_changes resolves repo-client-2 -> shared-proj -> commits table
-    let mut client = WorkspaceServiceClient::connect(server.url().to_string())
-        .await
-        .expect("Failed to connect to WorkspaceService");
-
-    let change_resp = client
-        .check_working_copy_changes(CheckWorkingCopyChangesRequest {
-            repo_id: "repo-client-2".to_string(),
-            user: "client_2@example.com".to_string(),
-            workspace_name: "default".to_string(),
-        })
-        .await
-        .expect("check_working_copy_changes should succeed for shared project commit")
-        .into_inner();
-    assert!(!change_resp.has_changes);
-    assert_eq!(change_resp.current_tree_id, change_resp.commit_tree_id);
-
-    // Verify SQLite database tables (projects, repos, workspaces, commits) directly
-    let conn = rusqlite::Connection::open(&db_path).unwrap();
-    let project_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM projects WHERE project_id = 'shared-proj'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(project_count, 1);
-
-    let repo_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM repositories WHERE project_id = 'shared-proj'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(repo_count, 2);
-
-    let ws_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM workspaces WHERE repo_id IN ('repo-client-1', 'repo-client-2')",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(ws_count, 2);
-}
-
-#[tokio::test]
+#[allow(deprecated)]
 async fn test_workspace_cas_conflicts_sparse_pagination_and_preconditions() {
-    use cc_common::workspace::{
-        CheckWorkingCopyChangesRequest, ListWorkspacesRequest, UpdateWorkspaceRequest,
-        WorkspaceState,
-    };
-
     let ws = TestWorkspace::init_sqlite().await;
     let config_path = ws.repo_path().join(".jj/repo/store/config.toml");
     let config_str = fs::read_to_string(&config_path).unwrap();
@@ -878,12 +1043,8 @@ async fn test_workspace_cas_conflicts_sparse_pagination_and_preconditions() {
 }
 
 #[tokio::test]
+#[allow(deprecated)]
 async fn test_working_copy_sparse_after_snapshot_rename_and_unregistered_repo_not_found() {
-    use cc_common::workspace::{
-        CheckWorkingCopyChangesRequest, ListWorkspacesRequest, UpdateWorkspaceRequest,
-        WorkspaceState,
-    };
-
     let ws = TestWorkspace::init().await;
     let config_path = ws.repo_path().join(".jj/repo/store/config.toml");
     let config_str = fs::read_to_string(&config_path).unwrap();
@@ -975,6 +1136,12 @@ async fn test_working_copy_sparse_after_snapshot_rename_and_unregistered_repo_no
     );
     assert!(after_sparse.sparse_patterns.is_empty());
     assert!(after_sparse.sparse_patterns_set);
+    ws.jj_cmd()
+        .args(["cc", "workspace", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Sparse:    (none)"));
+
     let clean_check = client
         .check_working_copy_changes(CheckWorkingCopyChangesRequest {
             repo_id: repo_id.clone(),
@@ -1013,6 +1180,11 @@ async fn test_working_copy_sparse_after_snapshot_rename_and_unregistered_repo_no
         .into_inner()
         .workspace;
     assert!(new_ws.is_some(), "renamed workspace should be persisted");
+    ws.jj_cmd()
+        .args(["cc", "workspace", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Workspace: renamed-ws"));
 
     // Tree count ceiling (`> 1025`) is rejected with INVALID_ARGUMENT.
     let huge_trees = vec![cc_common::EMPTY_TREE_ID_BYTES.to_vec(); 1027];
@@ -1150,4 +1322,357 @@ async fn test_working_copy_real_conflicted_checkout_and_slash_workspace_name() {
         .expect("slash-named workspace should persist");
     assert_eq!(renamed_ws.tree_ids, ws_state.tree_ids);
     assert_eq!(renamed_ws.conflict_labels, ws_state.conflict_labels);
+}
+
+#[tokio::test]
+async fn test_cc_workspace_resolves_repo_dir_dot_and_deep_subdirectories() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let xdg = dir.path().join("xdg");
+    fs::create_dir_all(&xdg).unwrap();
+    let server = testutils::spawn_server().await;
+
+    let ws_dir = dir.path().join("ws_nested");
+    jj_cmd(&server, dir.path(), &xdg)
+        .args([
+            "cc",
+            "init",
+            "--server",
+            server.url(),
+            "--workspace-name",
+            "nested-ws",
+            "--create",
+            ws_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let nested_sub = ws_dir.join("a/b");
+    let deep_sub = ws_dir.join("d1/d2/d3/d4/d5/d6/d7");
+    fs::create_dir_all(&nested_sub).unwrap();
+    fs::create_dir_all(&deep_sub).unwrap();
+
+    // `--repo-dir .` from a nested subdirectory resolves against cwd() and finds the active
+    // non-default workspace name (`nested-ws`).
+    jj_cmd(&server, &nested_sub, &xdg)
+        .args(["cc", "workspace", "list", "--repo-dir", "."])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "nested-ws (ws.tester@example.com)",
+        ));
+
+    jj_cmd(&server, &nested_sub, &xdg)
+        .args(["cc", "workspace", "status", "--repo-dir", "."])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Workspace: nested-ws"));
+
+    // A deep (> 5 levels) subdirectory path works both via `--repo-dir .` and explicit path
+    // from outside the repository.
+    jj_cmd(&server, &deep_sub, &xdg)
+        .args(["cc", "workspace", "status", "--repo-dir", "."])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Workspace: nested-ws"));
+
+    jj_cmd(&server, dir.path(), &xdg)
+        .args([
+            "cc",
+            "workspace",
+            "list",
+            "--repo-dir",
+            deep_sub.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "nested-ws (ws.tester@example.com)",
+        ));
+
+    jj_cmd(&server, dir.path(), &xdg)
+        .args([
+            "cc",
+            "workspace",
+            "status",
+            "--repo-dir",
+            deep_sub.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Workspace: nested-ws"));
+}
+
+#[tokio::test]
+async fn test_cc_workspace_rejects_traversal_and_nonexistent_repo_dir() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let xdg = dir.path().join("xdg");
+    fs::create_dir_all(&xdg).unwrap();
+    let server = testutils::spawn_server().await;
+
+    let ws_dir = dir.path().join("ws_main");
+    jj_cmd(&server, dir.path(), &xdg)
+        .args([
+            "cc",
+            "init",
+            "--server",
+            server.url(),
+            "--create",
+            ws_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let sub_dir = ws_dir.join("sub");
+    let not_a_repo = dir.path().join("not_a_repo");
+    fs::create_dir_all(&sub_dir).unwrap();
+    fs::create_dir_all(&not_a_repo).unwrap();
+
+    // From `ws_main/sub`, `../../not_a_repo` escapes outside `ws_main` to an existing non-repo
+    // directory, and `../../does_not_exist` does not exist at all. Neither may lexically walk
+    // back into `ws_main` or affect the CWD workspace.
+    for (bad_dir, expected_err) in [
+        ("../../not_a_repo", "Failed to load Commit Cloud config"),
+        (
+            "../../does_not_exist",
+            "Failed to access repository directory",
+        ),
+    ] {
+        jj_cmd(&server, &sub_dir, &xdg)
+            .args(["cc", "workspace", "list", "--repo-dir", bad_dir])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(expected_err));
+
+        jj_cmd(&server, &sub_dir, &xdg)
+            .args(["cc", "workspace", "status", "--repo-dir", bad_dir])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(expected_err));
+
+        jj_cmd(&server, &sub_dir, &xdg)
+            .args([
+                "cc",
+                "workspace",
+                "delete",
+                "default",
+                "--repo-dir",
+                bad_dir,
+            ])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(expected_err));
+    }
+
+    // The CWD Commit Cloud workspace must remain registered and untouched.
+    jj_cmd(&server, &sub_dir, &xdg)
+        .args(["cc", "workspace", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("default (ws.tester@example.com)"));
+
+    jj_cmd(&server, &sub_dir, &xdg)
+        .args(["cc", "workspace", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Workspace: default"));
+}
+
+#[tokio::test]
+async fn test_working_copy_fails_without_user_identity() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let xdg = dir.path().join("xdg");
+    fs::create_dir_all(&xdg).unwrap();
+    let server = testutils::spawn_server().await;
+
+    // 1. Missing user.email with empty config and cleared env vars fails closed (no fallback).
+    let dest_missing = dir.path().join("ws_no_identity");
+    let mut cmd = server.jj_cmd();
+    cmd.env("XDG_CONFIG_HOME", &xdg)
+        .env_remove("JJ_USER")
+        .env_remove("JJ_EMAIL")
+        .env_remove("USER")
+        .args([
+            "cc",
+            "init",
+            "--create",
+            "--server",
+            server.url(),
+            "--project-id",
+            "test-project",
+            "--config",
+            "user.email=''",
+            "--config",
+            "user.name=''",
+            dest_missing.to_str().unwrap(),
+        ]);
+    let output = cmd.assert().failure();
+    let stderr = String::from_utf8_lossy(&output.get_output().stderr);
+    assert!(
+        stderr.contains("user.email") || stderr.contains("User email"),
+        "stderr should mention missing user.email, got: {stderr}"
+    );
+    assert!(
+        !dest_missing.exists(),
+        "failed init without user.email must not leave destination behind"
+    );
+
+    // 2. Explicit `--config user.email=''` must override `JJ_EMAIL` instead of reading env directly.
+    let dest_override = dir.path().join("ws_env_override");
+    let mut override_cmd = server.jj_cmd();
+    override_cmd
+        .env("XDG_CONFIG_HOME", &xdg)
+        .env("JJ_EMAIL", "env.bypass@example.com")
+        .args([
+            "cc",
+            "init",
+            "--create",
+            "--server",
+            server.url(),
+            "--project-id",
+            "test-project",
+            "--config",
+            "user.email=''",
+            dest_override.to_str().unwrap(),
+        ]);
+    let override_out = override_cmd.assert().failure();
+    let override_stderr = String::from_utf8_lossy(&override_out.get_output().stderr);
+    assert!(
+        override_stderr.contains("user.email") || override_stderr.contains("User email"),
+        "explicit empty user.email config must fail closed even when JJ_EMAIL is set, got: {override_stderr}"
+    );
+    assert!(!dest_override.exists());
+
+    // 3. Loading an existing commit_cloud working copy with `--config user.email=''` also fails closed.
+    let ws_valid = dir.path().join("ws_valid");
+    jj_cmd(&server, dir.path(), &xdg)
+        .args([
+            "cc",
+            "init",
+            "--create",
+            "--server",
+            server.url(),
+            "--project-id",
+            "test-project",
+            ws_valid.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let load_out = jj_cmd(&server, &ws_valid, &xdg)
+        .args(["--config", "user.email=''", "status"])
+        .assert()
+        .failure();
+    let load_stderr = String::from_utf8_lossy(&load_out.get_output().stderr);
+    assert!(
+        load_stderr.contains("user.email") || load_stderr.contains("User email"),
+        "loading commit_cloud working copy without user.email must fail closed, got: {load_stderr}"
+    );
+}
+
+#[tokio::test]
+async fn test_cc_workspace_status_reads_non_default_name_without_user_email() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let xdg_configured = dir.path().join("xdg_configured");
+    let xdg_empty = dir.path().join("xdg_empty");
+    fs::create_dir_all(&xdg_configured).unwrap();
+    fs::create_dir_all(&xdg_empty).unwrap();
+    let server = testutils::spawn_sqlite_server(&dir.path().join("ws_no_email.db")).await;
+
+    let ws_main = dir.path().join("ws_main");
+    jj_cmd(&server, dir.path(), &xdg_configured)
+        .args([
+            "cc",
+            "init",
+            "--server",
+            server.url(),
+            "--project-id",
+            "proj-ws-status",
+            "--create",
+            ws_main.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let cfg = CommitCloudConfig::load_from_store(&ws_main).unwrap();
+    let ws_clone = dir.path().join("ws_clone");
+    jj_cmd(&server, dir.path(), &xdg_configured)
+        .args([
+            "cc",
+            "clone",
+            "--server",
+            server.url(),
+            "--workspace-name",
+            "ws-1234",
+            &cfg.repo_id,
+            ws_clone.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // Run `jj cc workspace status --user <email>` inside the non-default workspace with an empty
+    // XDG_CONFIG_HOME and no `JJ_EMAIL`/`user.email`: must resolve `ws-1234` from `.jj/working_copy`
+    // metadata rather than silently falling back to `"default"`.
+    let mut cmd = server.jj_cmd();
+    cmd.current_dir(&ws_clone)
+        .env("XDG_CONFIG_HOME", &xdg_empty)
+        .env_remove("JJ_USER")
+        .env_remove("JJ_EMAIL")
+        .env_remove("USER")
+        .args([
+            "cc",
+            "workspace",
+            "status",
+            "--user",
+            "ws.tester@example.com",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Workspace: ws-1234"))
+        .stdout(predicate::str::contains("User:      ws.tester@example.com"));
+
+    // Also verify `--repo-dir` from outside the workspace with explicit empty `user.email=''`.
+    let mut repo_dir_cmd = server.jj_cmd();
+    repo_dir_cmd
+        .current_dir(dir.path())
+        .env("XDG_CONFIG_HOME", &xdg_empty)
+        .env_remove("JJ_USER")
+        .env_remove("JJ_EMAIL")
+        .env_remove("USER")
+        .args([
+            "--config",
+            "user.email=''",
+            "cc",
+            "workspace",
+            "status",
+            "--user",
+            "ws.tester@example.com",
+            "--repo-dir",
+            ws_clone.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Workspace: ws-1234"));
+
+    // When local `.jj/working_copy/checkout` is missing, omitting `--workspace-name` must surface
+    // the metadata read error instead of silently querying `"default"`.
+    fs::remove_file(ws_clone.join(".jj/working_copy/checkout")).unwrap();
+    let mut broken_cmd = server.jj_cmd();
+    broken_cmd
+        .current_dir(&ws_clone)
+        .env("XDG_CONFIG_HOME", &xdg_empty)
+        .env_remove("JJ_USER")
+        .env_remove("JJ_EMAIL")
+        .env_remove("USER")
+        .args([
+            "cc",
+            "workspace",
+            "status",
+            "--user",
+            "ws.tester@example.com",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Failed to read local workspace metadata",
+        ));
 }

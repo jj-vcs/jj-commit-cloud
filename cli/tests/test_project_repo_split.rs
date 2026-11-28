@@ -13,229 +13,297 @@
 // limitations under the License.
 
 use std::fs;
-use tempfile::tempdir;
-use testutils::spawn_server;
+use std::path::Path;
 
-#[tokio::test]
-async fn test_multiple_repos_share_project_cas_with_isolated_oplog_and_undo() {
-    let server = spawn_server().await;
-    let server_url = server.url();
+use assert_cmd::Command;
 
-    let client_1_dir = tempdir().unwrap();
-    let client_2_dir = tempdir().unwrap();
-
-    // Initialize repo-client-1 and repo-client-2 under the same project ("shared-proj")
-    server
-        .jj_cmd()
-        .current_dir(client_1_dir.path())
-        .args([
-            "cc",
-            "init",
-            "--server",
-            server_url,
-            "--project-id",
-            "shared-proj",
-            "--repo-id",
-            "repo-client-1",
-            "--create",
-            ".",
-        ])
-        .assert()
-        .success();
-
-    server
-        .jj_cmd()
-        .current_dir(client_2_dir.path())
-        .args([
-            "cc",
-            "init",
-            "--server",
-            server_url,
-            "--project-id",
-            "shared-proj",
-            "--repo-id",
-            "repo-client-2",
-            "--create",
-            ".",
-        ])
-        .assert()
-        .success();
-
-    // Client 1 creates a file and describes commit
-    fs::write(
-        client_1_dir.path().join("client_1_secret.txt"),
-        "shared project content from client 1",
-    )
-    .unwrap();
-
-    server
-        .jj_cmd()
-        .current_dir(client_1_dir.path())
-        .args(["describe", "-m", "client 1 initial feature"])
-        .assert()
-        .success();
-
-    // Get client 1's commit ID
-    let output = server
-        .jj_cmd()
-        .current_dir(client_1_dir.path())
-        .args(["log", "-r", "@", "-T", "commit_id", "--no-graph"])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    let client_1_commit_id = String::from_utf8(output.stdout).unwrap().trim().to_string();
-    assert!(!client_1_commit_id.is_empty());
-
-    // Verify client 2's op log and view are isolated (client 2's default log does not show client 1's commit)
-    let client_2_log_output = server
-        .jj_cmd()
-        .current_dir(client_2_dir.path())
-        .args(["log", "-T", "description", "--no-graph"])
-        .output()
-        .unwrap();
-    let client_2_log_str = String::from_utf8(client_2_log_output.stdout).unwrap();
-    assert!(
-        !client_2_log_str.contains("client 1 initial feature"),
-        "Client 2's view should not automatically include client 1's unreferenced commit"
-    );
-
-    // Because they share project_id="shared-proj", CommitCloudIndexStore automatically indexes
-    // commits in the shared project CAS so client 2 can directly inspect and check out client 1's commit
-    let client_2_show = server
-        .jj_cmd()
-        .current_dir(client_2_dir.path())
-        .args(["show", &client_1_commit_id])
-        .output()
-        .unwrap();
-    assert!(
-        client_2_show.status.success(),
-        "Client 2 should be able to run jj show on client 1's commit directly. stderr: {}",
-        String::from_utf8_lossy(&client_2_show.stderr)
-    );
-    let client_2_show_stdout = String::from_utf8(client_2_show.stdout).unwrap();
-    assert!(client_2_show_stdout.contains("client 1 initial feature"));
-    assert!(client_2_show_stdout.contains("client_1_secret.txt"));
-
-    // Client 2 creates a new working copy commit on top of client 1's commit directly via CLI
-    server
-        .jj_cmd()
-        .current_dir(client_2_dir.path())
-        .args([
-            "new",
-            &client_1_commit_id,
-            "-m",
-            "client 2 building on client 1",
-        ])
-        .assert()
-        .success();
-
-    assert_eq!(
-        fs::read_to_string(client_2_dir.path().join("client_1_secret.txt")).unwrap(),
-        "shared project content from client 1"
-    );
-
-    // Verify `jj undo` in client 1's repo only affects client 1's operation log and does NOT affect client 2
-    server
-        .jj_cmd()
-        .current_dir(client_1_dir.path())
-        .args(["undo"])
-        .assert()
-        .success();
-
-    let client_1_desc_after_undo = server
-        .jj_cmd()
-        .current_dir(client_1_dir.path())
-        .args(["log", "-r", "@", "-T", "description", "--no-graph"])
-        .output()
-        .unwrap();
-    assert_eq!(
-        String::from_utf8(client_1_desc_after_undo.stdout)
-            .unwrap()
-            .trim(),
-        ""
-    );
-
-    // Client 2's working copy and op log remain completely intact after client 1's `jj undo`
-    let client_2_desc_after_client_1_undo = server
-        .jj_cmd()
-        .current_dir(client_2_dir.path())
-        .args(["log", "-r", "@", "-T", "description", "--no-graph"])
-        .output()
-        .unwrap();
-    assert_eq!(
-        String::from_utf8(client_2_desc_after_client_1_undo.stdout)
-            .unwrap()
-            .trim(),
-        "client 2 building on client 1"
-    );
+fn jj_cmd(server: &testutils::ServerGuard, repo_dir: &Path) -> Command {
+    let mut cmd = server.jj_cmd();
+    cmd.current_dir(repo_dir);
+    cmd.env("JJ_USER", "Test Agent");
+    cmd.env("JJ_EMAIL", "agent@example.com");
+    cmd
 }
 
 #[tokio::test]
-async fn test_cross_project_isolation_blocks_access_to_other_projects_commits() {
-    let server = spawn_server().await;
-    let server_url = server.url();
+async fn test_shared_project_deduplicates_commits_and_syncs_index_while_isolating_other_projects() {
+    let db_dir = tempfile::tempdir().expect("tempdir");
+    let server = testutils::spawn_sqlite_server(&db_dir.path().join("shared_proj.db")).await;
 
-    let client_1_dir = tempdir().unwrap();
-    let client_3_dir = tempdir().unwrap();
+    let agent_a_dir = db_dir.path().join("agent_a");
+    let agent_b_dir = db_dir.path().join("agent_b");
+    let other_proj_dir = db_dir.path().join("other_proj");
 
-    // Initialize client 1 in "project-alpha" and client 3 in "project-beta"
-    server
-        .jj_cmd()
-        .current_dir(client_1_dir.path())
+    // Agent A creates a repository in project `monorepo-alpha`.
+    jj_cmd(&server, db_dir.path())
         .args([
             "cc",
             "init",
             "--server",
-            server_url,
+            server.url(),
             "--project-id",
-            "project-alpha",
-            "--repo-id",
-            "repo-client-1",
+            "monorepo-alpha",
             "--create",
-            ".",
+            agent_a_dir.to_str().unwrap(),
         ])
         .assert()
         .success();
 
-    server
-        .jj_cmd()
-        .current_dir(client_3_dir.path())
+    // Agent B creates an independent repository (distinct OpLog) in the same `monorepo-alpha`
+    // project.
+    jj_cmd(&server, db_dir.path())
         .args([
             "cc",
             "init",
             "--server",
-            server_url,
+            server.url(),
             "--project-id",
-            "project-beta",
-            "--repo-id",
-            "repo-client-3",
+            "monorepo-alpha",
             "--create",
-            ".",
+            agent_b_dir.to_str().unwrap(),
         ])
         .assert()
         .success();
 
-    fs::write(client_1_dir.path().join("alpha.txt"), "alpha secret").unwrap();
-    server
-        .jj_cmd()
-        .current_dir(client_1_dir.path())
-        .args(["describe", "-m", "alpha commit"])
+    // A third workspace creates a repository in a separate `isolated-beta` project.
+    jj_cmd(&server, db_dir.path())
+        .args([
+            "cc",
+            "init",
+            "--server",
+            server.url(),
+            "--project-id",
+            "isolated-beta",
+            "--create",
+            other_proj_dir.to_str().unwrap(),
+        ])
         .assert()
         .success();
 
-    let output = server
-        .jj_cmd()
-        .current_dir(client_1_dir.path())
-        .args(["log", "-r", "@", "-T", "commit_id", "--no-graph"])
-        .output()
-        .unwrap();
-    let alpha_commit_id = String::from_utf8(output.stdout).unwrap().trim().to_string();
+    // Agent A authors a commit with a file in `monorepo-alpha`.
+    fs::write(agent_a_dir.join("engine.rs"), "pub fn run() -> u32 { 7 }\n").unwrap();
+    jj_cmd(&server, &agent_a_dir)
+        .args(["describe", "-m", "agent-a feature"])
+        .assert()
+        .success();
 
-    // Client 3 (in project-beta) attempts to inspect client 1's commit via CLI -> must fail!
-    server
-        .jj_cmd()
-        .current_dir(client_3_dir.path())
-        .args(["show", &alpha_commit_id])
+    let commit_a_out = jj_cmd(&server, &agent_a_dir)
+        .args(["log", "--no-graph", "-r", "@", "-T", "commit_id"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let commit_a = String::from_utf8(commit_a_out).unwrap().trim().to_string();
+
+    // Agent B's default view (`jj log`) remains clean and independent (only its own working copy),
+    // yet `CommitCloudIndexStore` automatically indexes `commit_a` from the shared project pool so
+    // Agent B can inspect or branch directly off `commit_a` by commit ID.
+    let b_default_log = jj_cmd(&server, &agent_b_dir)
+        .args(["log", "--no-graph", "-T", "description"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert!(
+        !String::from_utf8_lossy(&b_default_log).contains("agent-a feature"),
+        "sibling repository OpLog/View must stay isolated until explicitly referenced"
+    );
+
+    jj_cmd(&server, &agent_b_dir)
+        .args(["new", &commit_a, "-m", "agent-b stacked on agent-a"])
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(agent_b_dir.join("engine.rs")).unwrap(),
+        "pub fn run() -> u32 { 7 }\n"
+    );
+
+    // Meanwhile, `isolated-beta` cannot resolve or read `commit_a` across the project boundary.
+    jj_cmd(&server, &other_proj_dir)
+        .args(["log", "-r", &commit_a])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("doesn't exist"));
+}
+
+#[tokio::test]
+async fn test_opt_out_project_sync_skips_sibling_commits_and_resolves_explicit_commit_ids() {
+    let db_dir = tempfile::tempdir().expect("tempdir");
+    let server = testutils::spawn_sqlite_server(&db_dir.path().join("opt_out_proj.db")).await;
+
+    let seed_dir = db_dir.path().join("seed_ws");
+    let actor_lazy_dir = db_dir.path().join("actor_lazy");
+    let actor_flag_dir = db_dir.path().join("actor_flag");
+
+    jj_cmd(&server, db_dir.path())
+        .args([
+            "cc",
+            "init",
+            "--server",
+            server.url(),
+            "--project-id",
+            "fleet-proj",
+            "--create",
+            seed_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // Seed workspace creates `base_cid` and an unrelated sibling commit `sibling_cid`.
+    fs::write(seed_dir.join("base.txt"), "fleet baseline\n").unwrap();
+    jj_cmd(&server, &seed_dir)
+        .args(["describe", "-m", "base commit"])
+        .assert()
+        .success();
+    let base_cid = String::from_utf8(
+        jj_cmd(&server, &seed_dir)
+            .args(["log", "--no-graph", "-r", "@", "-T", "commit_id"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+
+    jj_cmd(&server, &seed_dir)
+        .args(["new", "root()", "-m", "unrelated sibling"])
+        .assert()
+        .success();
+    let sibling_cid = String::from_utf8(
+        jj_cmd(&server, &seed_dir)
+            .args(["log", "--no-graph", "-r", "@", "-T", "commit_id"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    let sibling_prefix = &sibling_cid[..12];
+
+    // Actor 1 initializes with `JJ_CC_SYNC_PROJECT_COMMITS=0` (no `--index-commit`).
+    jj_cmd(&server, db_dir.path())
+        .env("JJ_CC_SYNC_PROJECT_COMMITS", "0")
+        .args([
+            "cc",
+            "init",
+            "--server",
+            server.url(),
+            "--project-id",
+            "fleet-proj",
+            "--create",
+            actor_lazy_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // Sibling commit is NOT synced eagerly into the index when project sync is disabled
+    // (12-hex prefix would resolve any indexed commit, even hidden ones).
+    jj_cmd(&server, &actor_lazy_dir)
+        .env("JJ_CC_SYNC_PROJECT_COMMITS", "0")
+        .args(["log", "-r", sibling_prefix])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("doesn't exist"));
+
+    // Yet `jj new <base_cid>` lazily fetches and indexes full 40-hex `base_cid` on demand.
+    jj_cmd(&server, &actor_lazy_dir)
+        .env("JJ_CC_SYNC_PROJECT_COMMITS", "0")
+        .args(["new", &base_cid, "-m", "actor work"])
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(actor_lazy_dir.join("base.txt")).unwrap(),
+        "fleet baseline\n"
+    );
+
+    // Actor 2 initializes with `commit-cloud.sync-project-commits=false` and explicit `--index-commit`.
+    jj_cmd(&server, db_dir.path())
+        .args([
+            "--config",
+            "commit-cloud.sync-project-commits=false",
+            "cc",
+            "init",
+            "--server",
+            server.url(),
+            "--project-id",
+            "fleet-proj",
+            "--create",
+            "--index-commit",
+            &sibling_cid,
+            actor_flag_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    jj_cmd(&server, &actor_flag_dir)
+        .args([
+            "--config",
+            "commit-cloud.sync-project-commits=false",
+            "log",
+            "--no-graph",
+            "-r",
+            sibling_prefix,
+            "-T",
+            "description",
+        ])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("unrelated sibling"));
+
+    // Failed `jj cc init` / `jj cc clone` cleans up partial `.jj` so retrying the same path works.
+    let retry_dir = db_dir.path().join("retry_ws");
+    jj_cmd(&server, db_dir.path())
+        .args([
+            "cc",
+            "clone",
+            "--server",
+            server.url(),
+            "nonexistent-repo-id",
+            retry_dir.to_str().unwrap(),
+        ])
         .assert()
         .failure();
+    assert!(
+        !retry_dir.exists(),
+        "failed clone must clean up newly created destination directory"
+    );
+
+    jj_cmd(&server, db_dir.path())
+        .args([
+            "cc",
+            "init",
+            "--server",
+            server.url(),
+            "--repo-id",
+            "nonexistent-repo-id",
+            retry_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .failure();
+    assert!(
+        !retry_dir.exists(),
+        "failed init must clean up newly created destination directory"
+    );
+
+    jj_cmd(&server, db_dir.path())
+        .args([
+            "cc",
+            "init",
+            "--server",
+            server.url(),
+            "--project-id",
+            "fleet-proj",
+            "--create",
+            retry_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
 }

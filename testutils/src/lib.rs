@@ -45,18 +45,15 @@ impl ServerGuard {
     }
 }
 
-/// Must match `cc_lib::client::DAEMON_SOCKET_DIR_ENV`.
+/// Legacy socket-dir override; also kept alongside `JJ_CC_DAEMON_DIR` for sandboxed tests.
 const DAEMON_SOCKET_DIR_ENV: &str = "JJ_CC_DAEMON_SOCKET_DIR";
 
-/// Confines the daemons that `jj` starts on its own to one test.
+/// Confines auto-started `jj-cc-daemon` processes and daemon config to one test.
 ///
-/// `cc-lib` starts a `jj-cc-daemon` when nothing listens on the daemon
-/// socket, detaches it, and never stops it. By default the socket is in
-/// `/tmp`, named after the server URL, so the daemon outlives the test and a
-/// later test whose server reuses the port can reach it. Commands from
-/// [`DaemonSandbox::jj_cmd`] put the socket in a fresh temporary directory
-/// instead, and dropping the sandbox stops every daemon whose socket is in
-/// it.
+/// Commands from [`DaemonSandbox::jj_cmd`] isolate daemon discovery (`JJ_CC_DAEMON_DIR`),
+/// L2 cache (`JJ_CC_CACHE_DIR`), and daemon enablement config (`JJ_CC_DAEMON_CONFIG`) inside a
+/// fresh temporary directory, and dropping the sandbox stops every daemon whose state or socket
+/// directory lives inside it.
 pub struct DaemonSandbox {
     dir: tempfile::TempDir,
 }
@@ -72,11 +69,13 @@ impl DaemonSandbox {
         self.dir.path()
     }
 
-    /// The `jj` binary, with auto-started daemons kept in this sandbox.
+    /// The `jj` binary, with auto-started daemons and daemon config kept in this sandbox.
     pub fn jj_cmd(&self) -> assert_cmd::Command {
         let mut cmd = find_jj_cmd();
         cmd.env(DAEMON_SOCKET_DIR_ENV, self.dir.path());
+        cmd.env("JJ_CC_DAEMON_DIR", self.dir.path().join("daemon"));
         cmd.env("JJ_CC_CACHE_DIR", self.dir.path().join("cache"));
+        cmd.env("JJ_CC_DAEMON_CONFIG", self.dir.path().join("daemon.toml"));
         cmd
     }
 }
@@ -156,10 +155,6 @@ pub fn daemon_binary_path() -> PathBuf {
 
 pub fn server_binary_path() -> PathBuf {
     PathBuf::from(env!("JJ_CC_SERVER_BIN"))
-}
-
-pub fn find_server_bin() -> PathBuf {
-    server_binary_path()
 }
 
 pub async fn spawn_server() -> ServerGuard {
@@ -899,57 +894,6 @@ pub async fn spawn_vfs_mount(workspace_path: &Path) -> VfsMountGuard {
     VfsMountGuard {
         child: Some(child),
         mount_dir,
-    }
-}
-
-pub struct DaemonGuard {
-    child: Option<Child>,
-    socket_path: PathBuf,
-    _temp_dir: tempfile::TempDir,
-}
-
-impl DaemonGuard {
-    pub fn socket_path(&self) -> &Path {
-        &self.socket_path
-    }
-}
-
-impl Drop for DaemonGuard {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.start_kill();
-        }
-        if self.socket_path.exists() {
-            let _ = std::fs::remove_file(&self.socket_path);
-        }
-    }
-}
-
-pub async fn spawn_daemon(server_url: &str) -> DaemonGuard {
-    let temp_dir = tempfile::tempdir().expect("Failed to create tempdir for daemon socket");
-    let socket_path = temp_dir.path().join("daemon.sock");
-    let cache_dir = temp_dir.path().join("cache");
-    let daemon_bin = daemon_binary_path();
-    let mut cmd = Command::new(daemon_bin);
-    cmd.arg("--server").arg(server_url);
-    cmd.arg("--socket").arg(&socket_path);
-    cmd.arg("--cache-dir").arg(&cache_dir);
-    let child = cmd.spawn().expect("Failed to spawn jj-cc-daemon");
-
-    let mut ready = false;
-    for _ in 0..100 {
-        if socket_path.exists() {
-            ready = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(ready, "Daemon socket did not become ready in time");
-
-    DaemonGuard {
-        child: Some(child),
-        socket_path,
-        _temp_dir: temp_dir,
     }
 }
 

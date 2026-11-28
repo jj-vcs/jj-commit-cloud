@@ -20,20 +20,22 @@
 use assert_cmd::Command;
 use std::path::Path;
 use tempfile::{NamedTempFile, tempdir};
-use testutils::{spawn_server, spawn_sqlite_server};
+use testutils::{ServerGuard, spawn_server, spawn_sqlite_server};
 
-fn jj(dir: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("jj").unwrap();
-    cmd.current_dir(dir);
+fn jj(server: &ServerGuard, dir: &Path) -> Command {
+    let mut cmd = server.jj_cmd();
+    cmd.current_dir(dir)
+        .env("JJ_USER", "Test User")
+        .env("JJ_EMAIL", "test.user@example.com");
     cmd
 }
 
-fn init_clone(server_url: &str, dir: &Path, workspace_name: &str, create: bool) {
+fn init_clone(server: &ServerGuard, dir: &Path, workspace_name: &str, create: bool) {
     let mut args = vec![
         "cc",
         "init",
         "--server",
-        server_url,
+        server.url(),
         "--project-id",
         "two-clones-project",
         "--repo-id",
@@ -47,7 +49,7 @@ fn init_clone(server_url: &str, dir: &Path, workspace_name: &str, create: bool) 
         args.push("--create");
     }
     args.push(".");
-    jj(dir).args(&args).assert().success();
+    jj(server, dir).args(&args).assert().success();
 }
 
 fn stdout(cmd: &mut Command) -> String {
@@ -60,20 +62,20 @@ fn stdout(cmd: &mut Command) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
-fn run_two_clones(server_url: &str) {
+fn run_two_clones(server: &ServerGuard) {
     let clone_a = tempdir().unwrap();
     let clone_b = tempdir().unwrap();
 
-    init_clone(server_url, clone_a.path(), "A", true);
+    init_clone(server, clone_a.path(), "A", true);
     std::fs::write(clone_a.path().join("hello.txt"), "hello from A\n").unwrap();
-    jj(clone_a.path())
+    jj(server, clone_a.path())
         .args(["describe", "-m", "commit from A"])
         .assert()
         .success();
 
-    init_clone(server_url, clone_b.path(), "B", false);
+    init_clone(server, clone_b.path(), "B", false);
 
-    let log = stdout(jj(clone_b.path()).args([
+    let log = stdout(jj(server, clone_b.path()).args([
         "log",
         "--no-graph",
         "-r",
@@ -83,7 +85,7 @@ fn run_two_clones(server_url: &str) {
     ]));
     assert!(log.contains("commit from A"), "clone B's jj log:\n{log}");
 
-    let op_log = stdout(jj(clone_b.path()).args([
+    let op_log = stdout(jj(server, clone_b.path()).args([
         "op",
         "log",
         "--no-graph",
@@ -91,19 +93,22 @@ fn run_two_clones(server_url: &str) {
         "description ++ \"\\n\"",
     ]));
     for expected in ["describe commit", "add workspace 'A'", "add workspace 'B'"] {
-        assert!(op_log.contains(expected), "clone B's jj op log lacks {expected:?}:\n{op_log}");
+        assert!(
+            op_log.contains(expected),
+            "clone B's jj op log lacks {expected:?}:\n{op_log}"
+        );
     }
 }
 
 #[tokio::test]
 async fn test_two_clones_share_one_repository_memory() {
     let server = spawn_server().await;
-    run_two_clones(server.url());
+    run_two_clones(&server);
 }
 
 #[tokio::test]
 async fn test_two_clones_share_one_repository_sqlite() {
     let db_file = NamedTempFile::new().unwrap();
     let server = spawn_sqlite_server(db_file.path()).await;
-    run_two_clones(server.url());
+    run_two_clones(&server);
 }

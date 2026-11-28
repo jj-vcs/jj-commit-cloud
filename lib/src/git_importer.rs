@@ -50,10 +50,10 @@ fn make_request<T>(payload: T) -> tonic::Request<T> {
     let mut req = tonic::Request::new(payload);
     if let Ok(token) = std::env::var("JJ_CC_AUTH_TOKEN") {
         let token = token.trim();
-        if !token.is_empty() {
-            if let Ok(val) = format!("Bearer {}", token).parse() {
-                req.metadata_mut().insert("authorization", val);
-            }
+        if !token.is_empty()
+            && let Ok(val) = format!("Bearer {}", token).parse()
+        {
+            req.metadata_mut().insert("authorization", val);
         }
     }
     req
@@ -117,12 +117,13 @@ impl GitImporter {
                 )
             })?;
 
-        // Ensure Jujutsu Root Commit exists on server in project CAS
-        // Validate repository and project exist before importing any Git objects.
+        // Validate target project exists before importing any Git objects.
         let _ = backend_client
-            .read_commit(make_request(cc_common::backend::ReadCommitRequest {
+            .list_commits(make_request(cc_common::backend::ListCommitsRequest {
                 project_id: project_id.clone(),
-                commit_id: ROOT_COMMIT_ID_BYTES.to_vec(),
+                page_token: Vec::new(),
+                page_size: 1,
+                since_token: Vec::new(),
             }))
             .await?;
 
@@ -162,15 +163,15 @@ impl GitImporter {
     /// Normalizes HEAD ref if it points to an invalid branch name (.invalid from templates)
     fn normalize_head_branch(dot_git: &Path) {
         let head_path = dot_git.join("HEAD");
-        if let Ok(head_str) = std::fs::read_to_string(&head_path) {
-            if head_str.contains(".invalid") {
-                let invalid_ref = dot_git.join("refs/heads/.invalid");
-                let main_ref = dot_git.join("refs/heads/main");
-                if invalid_ref.exists() && !main_ref.exists() {
-                    let _ = std::fs::rename(&invalid_ref, &main_ref);
-                }
-                let _ = std::fs::write(&head_path, "ref: refs/heads/main\n");
+        if let Ok(head_str) = std::fs::read_to_string(&head_path)
+            && head_str.contains(".invalid")
+        {
+            let invalid_ref = dot_git.join("refs/heads/.invalid");
+            let main_ref = dot_git.join("refs/heads/main");
+            if invalid_ref.exists() && !main_ref.exists() {
+                let _ = std::fs::rename(&invalid_ref, &main_ref);
             }
+            let _ = std::fs::write(&head_path, "ref: refs/heads/main\n");
         }
     }
 
@@ -247,22 +248,21 @@ impl GitImporter {
                 if !seen_trees.insert(tree_oid) {
                     continue;
                 }
-                if let Ok(tree_obj) = repo.find_object(tree_oid) {
-                    if let Ok(tree_ref) =
+                if let Ok(tree_obj) = repo.find_object(tree_oid)
+                    && let Ok(tree_ref) =
                         gix::objs::TreeRef::from_bytes(&tree_obj.data, repo.object_hash())
-                    {
-                        for entry in tree_ref.entries {
-                            if entry.mode.is_tree() {
-                                tree_stack.push(entry.oid.to_owned());
-                            } else if !entry.mode.is_link() && !entry.mode.is_commit() {
-                                if !blob_map.contains_key(&entry.oid.to_owned()) {
-                                    if let Ok(blob_obj) = repo.find_object(entry.oid) {
-                                        blobs_to_upload
-                                            .push((entry.oid.to_owned(), blob_obj.data.to_vec()));
-                                        blob_map.insert(entry.oid.to_owned(), Vec::new());
-                                    }
-                                }
-                            }
+                {
+                    for entry in tree_ref.entries {
+                        if entry.mode.is_tree() {
+                            tree_stack.push(entry.oid.to_owned());
+                        } else if !entry.mode.is_link()
+                            && !entry.mode.is_commit()
+                            && let std::collections::hash_map::Entry::Vacant(e) =
+                                blob_map.entry(entry.oid.to_owned())
+                            && let Ok(blob_obj) = repo.find_object(entry.oid)
+                        {
+                            blobs_to_upload.push((entry.oid.to_owned(), blob_obj.data.to_vec()));
+                            e.insert(Vec::new());
                         }
                     }
                 }
@@ -282,16 +282,13 @@ impl GitImporter {
                     let path = entry.path();
                     if path.is_dir() {
                         walk_refs(&path, out);
-                    } else if path.is_file() {
-                        if let Ok(content) = std::fs::read_to_string(&path) {
-                            if let Ok(oid) =
-                                gix::hash::ObjectId::from_hex(content.trim().as_bytes())
-                            {
-                                let bytes = oid.as_bytes().to_vec();
-                                if !out.contains(&bytes) {
-                                    out.push(bytes);
-                                }
-                            }
+                    } else if path.is_file()
+                        && let Ok(content) = std::fs::read_to_string(&path)
+                        && let Ok(oid) = gix::hash::ObjectId::from_hex(content.trim().as_bytes())
+                    {
+                        let bytes = oid.as_bytes().to_vec();
+                        if !out.contains(&bytes) {
+                            out.push(bytes);
                         }
                     }
                 }
@@ -303,14 +300,14 @@ impl GitImporter {
         if let Ok(packed) = std::fs::read_to_string(dot_git.join("packed-refs")) {
             for line in packed.lines() {
                 let line = line.trim();
-                if !line.starts_with('#') && !line.starts_with('^') {
-                    if let Some((hash, _name)) = line.split_once(' ') {
-                        if let Ok(oid) = gix::hash::ObjectId::from_hex(hash.trim().as_bytes()) {
-                            let bytes = oid.as_bytes().to_vec();
-                            if !head_commit_ids.contains(&bytes) {
-                                head_commit_ids.push(bytes);
-                            }
-                        }
+                if !line.starts_with('#')
+                    && !line.starts_with('^')
+                    && let Some((hash, _name)) = line.split_once(' ')
+                    && let Ok(oid) = gix::hash::ObjectId::from_hex(hash.trim().as_bytes())
+                {
+                    let bytes = oid.as_bytes().to_vec();
+                    if !head_commit_ids.contains(&bytes) {
+                        head_commit_ids.push(bytes);
                     }
                 }
             }
@@ -320,12 +317,12 @@ impl GitImporter {
             let head_str = head_str.trim();
             if let Some(target_ref) = head_str.strip_prefix("ref: ") {
                 let ref_path = dot_git.join(target_ref.trim());
-                if let Ok(ref_str) = std::fs::read_to_string(ref_path) {
-                    if let Ok(oid) = gix::hash::ObjectId::from_hex(ref_str.trim().as_bytes()) {
-                        let bytes = oid.as_bytes().to_vec();
-                        if !head_commit_ids.contains(&bytes) {
-                            head_commit_ids.push(bytes);
-                        }
+                if let Ok(ref_str) = std::fs::read_to_string(ref_path)
+                    && let Ok(oid) = gix::hash::ObjectId::from_hex(ref_str.trim().as_bytes())
+                {
+                    let bytes = oid.as_bytes().to_vec();
+                    if !head_commit_ids.contains(&bytes) {
+                        head_commit_ids.push(bytes);
                     }
                 }
             } else if let Ok(oid) = gix::hash::ObjectId::from_hex(head_str.as_bytes()) {
@@ -336,49 +333,45 @@ impl GitImporter {
             }
         }
 
-        if head_commit_ids.is_empty() {
-            if let Ok(head_commit) = repo.head_commit() {
-                let bytes = head_commit.id.as_bytes().to_vec();
+        if head_commit_ids.is_empty()
+            && let Ok(head_commit) = repo.head_commit()
+        {
+            let bytes = head_commit.id.as_bytes().to_vec();
+            if !head_commit_ids.contains(&bytes) {
+                head_commit_ids.push(bytes);
+            }
+        }
+
+        // Git CLI fallback (for reftable or custom backends)
+        if head_commit_ids.is_empty()
+            && let Ok(output) = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&self.git_dir)
+                .output()
+            && output.status.success()
+        {
+            let hash_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if let Ok(oid) = gix::hash::ObjectId::from_hex(hash_str.as_bytes()) {
+                let bytes = oid.as_bytes().to_vec();
                 if !head_commit_ids.contains(&bytes) {
                     head_commit_ids.push(bytes);
                 }
             }
         }
 
-        // Git CLI fallback (for reftable or custom backends)
-        if head_commit_ids.is_empty() {
-            if let Ok(output) = std::process::Command::new("git")
-                .args(["rev-parse", "HEAD"])
-                .current_dir(&self.git_dir)
-                .output()
-            {
-                if output.status.success() {
-                    let hash_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                    if let Ok(oid) = gix::hash::ObjectId::from_hex(hash_str.as_bytes()) {
-                        let bytes = oid.as_bytes().to_vec();
-                        if !head_commit_ids.contains(&bytes) {
-                            head_commit_ids.push(bytes);
-                        }
-                    }
-                }
-            }
-        }
-
-        if head_commit_ids.is_empty() {
-            if let Ok(output) = std::process::Command::new("git")
+        if head_commit_ids.is_empty()
+            && let Ok(output) = std::process::Command::new("git")
                 .args(["for-each-ref", "--format=%(objectname)"])
                 .current_dir(&self.git_dir)
                 .output()
-            {
-                if output.status.success() {
-                    for line in String::from_utf8_lossy(&output.stdout).lines() {
-                        let hash_str = line.trim();
-                        if let Ok(oid) = gix::hash::ObjectId::from_hex(hash_str.as_bytes()) {
-                            let bytes = oid.as_bytes().to_vec();
-                            if !head_commit_ids.contains(&bytes) {
-                                head_commit_ids.push(bytes);
-                            }
-                        }
+            && output.status.success()
+        {
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                let hash_str = line.trim();
+                if let Ok(oid) = gix::hash::ObjectId::from_hex(hash_str.as_bytes()) {
+                    let bytes = oid.as_bytes().to_vec();
+                    if !head_commit_ids.contains(&bytes) {
+                        head_commit_ids.push(bytes);
                     }
                 }
             }
@@ -422,6 +415,7 @@ impl GitImporter {
     }
 
     /// Imports a single commit into Jujutsu Commit Cloud format
+    #[allow(clippy::too_many_arguments)]
     async fn import_commit(
         &self,
         thread_safe_repo: &gix::ThreadSafeRepository,
@@ -646,13 +640,13 @@ impl GitImporter {
                 let is_link = entry.mode.is_link();
                 let is_commit = entry.mode.is_commit();
                 let is_exec = entry.mode.is_executable();
-                let needs_blob = (is_link
+                let needs_blob_bytes = (is_link
                     && cache.symlinks.get(&entry_oid).is_none_or(Vec::is_empty))
                     || (!is_tree
                         && !is_link
                         && !is_commit
                         && cache.blobs.get(&entry_oid).is_none_or(Vec::is_empty));
-                let blob_data = if needs_blob {
+                let blob_data = if needs_blob_bytes {
                     let blob_obj = repo.find_object(entry_oid)?;
                     Some(blob_obj.data.to_vec())
                 } else {
@@ -793,21 +787,17 @@ impl GitImporter {
                     operation_id: op_head.clone(),
                 }))
                 .await
+                && let Some(op) = op_res.into_inner().operation
+                && let Ok(view_res) = op_client
+                    .read_view(make_request(ReadViewRequest {
+                        repo_id: repo_id.to_string(),
+                        view_id: op.view_id,
+                    }))
+                    .await
+                && let Some(v) = view_res.into_inner().view
             {
-                if let Some(op) = op_res.into_inner().operation {
-                    if let Ok(view_res) = op_client
-                        .read_view(make_request(ReadViewRequest {
-                            repo_id: repo_id.to_string(),
-                            view_id: op.view_id,
-                        }))
-                        .await
-                    {
-                        if let Some(v) = view_res.into_inner().view {
-                            view = v;
-                            break;
-                        }
-                    }
-                }
+                view = v;
+                break;
             }
         }
 
