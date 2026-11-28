@@ -15,11 +15,11 @@
 //! Entrypoint and CLI wiring for the `jj-cc-server` gRPC server.
 //!
 //! # Authority and Crash-Safety Ordering
-//! Pairs a durable [`MetadataStore`] (`memory`, `sqlite`, or `spanner`) with a
-//! content-addressed [`BlobStore`] (`memory`, `local`, or `gcs`) inside [`CompositeStore`]
+//! Pairs a durable [`MetadataStore`] (`memory`, `sqlite`, `postgres`, or `spanner`) with a
+//! content-addressed [`BlobStore`] (`memory`, `local`, `s3`, or `gcs`) inside [`CompositeStore`]
 //! with `validate_dependencies` enabled before serving gRPC traffic. Refuses to start
-//! `--store-type=spanner` without an explicit blob store so metadata never outlives
-//! throwaway in-memory blobs.
+//! `--store-type=spanner` or `--store-type=postgres` without an explicit blob store so metadata
+//! never outlives throwaway in-memory blobs.
 //!
 //! # Security and Network Boundaries
 //! Wires [`ServerAuthLayer`] from optional static Bearer tokens (`--auth-token` /
@@ -53,10 +53,15 @@ use jj_commit_cloud_server::backend::{
 use jj_commit_cloud_server::metrics::{MetricsLayer, ServerMetrics, bind_and_serve_metrics};
 use jj_commit_cloud_server::op_store::CommitCloudOpStoreService;
 use jj_commit_cloud_server::store::gcsblob::{normalize_bucket_identifiers, validate_gcs_endpoint};
+use jj_commit_cloud_server::store::s3blob::{
+    DEFAULT_S3_REGION, normalize_s3_bucket, parse_s3_peer_spec, redact_s3_peer_spec,
+    validate_s3_endpoint,
+};
 use jj_commit_cloud_server::store::{
     BlobStore, CompositeStore, CompositeStoreConfig, GcsBlobStore, GcsConnectConfig,
-    LocalFsBlobStore, MemoryBlobStore, MemoryMetadataStore, MetadataStore, ReplicatedBlobStore,
-    ReplicatedBlobStoreConfig, SpannerConnectConfig, SpannerMetadataStore, SqliteMetadataStore,
+    LocalFsBlobStore, MemoryBlobStore, MemoryMetadataStore, MetadataStore, PostgresConnectConfig,
+    PostgresMetadataStore, ReplicatedBlobStore, ReplicatedBlobStoreConfig, S3BlobStore,
+    S3ConnectConfig, SpannerConnectConfig, SpannerMetadataStore, SqliteMetadataStore,
 };
 use jj_commit_cloud_server::workspace::CommitCloudWorkspaceService;
 
@@ -65,6 +70,7 @@ use jj_commit_cloud_server::workspace::CommitCloudWorkspaceService;
 enum StoreType {
     Memory,
     Sqlite,
+    Postgres,
     Spanner,
 }
 
@@ -73,6 +79,7 @@ enum StoreType {
 enum BlobStoreType {
     Memory,
     Local,
+    S3,
     Gcs,
 }
 
@@ -109,8 +116,9 @@ struct Args {
     #[arg(long, env = "STORE_TYPE", value_enum, default_value_t = StoreType::Memory)]
     store_type: StoreType,
 
-    /// Blob storage backend type (auto-detected from --gcs-bucket, --blob-path, and --store-type
-    /// if omitted; required with --store-type=spanner unless --gcs-bucket or --blob-path is set)
+    /// Blob storage backend type (auto-detected from --gcs-bucket, --s3-bucket, --blob-path, and
+    /// --store-type if omitted; required with --store-type=spanner or --store-type=postgres unless
+    /// --gcs-bucket, --s3-bucket, or --blob-path is set)
     #[arg(long, env = "BLOB_STORE", value_enum)]
     blob_store: Option<BlobStoreType>,
 
@@ -127,6 +135,31 @@ struct Args {
     /// Path to SQLite database file (defaults to ~/.jj-cc-server/commit_cloud.db)
     #[arg(long, env = "SQLITE_PATH")]
     sqlite_path: Option<PathBuf>,
+
+    /// PostgreSQL connection URL (reads `--postgres-url`, `POSTGRES_URL`, or fallback `DATABASE_URL`)
+    #[arg(long, env = "POSTGRES_URL", hide_env_values = true)]
+    postgres_url: Option<String>,
+
+    /// Maximum PostgreSQL connection pool size
+    #[arg(long, env = "POSTGRES_MAX_CONNS", default_value_t = 40)]
+    postgres_max_conns: usize,
+
+    /// Automatically apply `postgres_schema.sql` idempotently on startup (default: true)
+    #[arg(
+        long,
+        env = "POSTGRES_AUTO_MIGRATE",
+        default_value_t = true,
+        default_missing_value = "true",
+        num_args = 0..=1,
+        action = clap::ArgAction::Set
+    )]
+    postgres_auto_migrate: bool,
+
+    /// Optional PEM CA certificate bundle for PostgreSQL TLS verification (overrides `sslrootcert`;
+    /// enforces TLS `verify-full` by default unless overridden by `sslmode=verify-ca` or `require`,
+    /// and rejects `sslmode=disable`, `sslmode=prefer`, and Unix-domain socket hosts)
+    #[arg(long, env = "POSTGRES_CA_CERT")]
+    postgres_ca_cert: Option<PathBuf>,
 
     /// Root directory for local content-addressed blob storage
     #[arg(long, env = "BLOB_PATH")]
@@ -188,6 +221,56 @@ struct Args {
     /// Optional Cloud Storage endpoint override (e.g. local emulator or VPC-SC endpoint)
     #[arg(long, env = "STORAGE_EMULATOR_HOST")]
     gcs_endpoint: Option<String>,
+
+    /// Primary S3-compatible bucket (`my-bucket` or `s3://my-bucket`)
+    #[arg(long, env = "S3_BUCKET")]
+    s3_bucket: Option<String>,
+
+    /// Optional S3-compatible endpoint override (e.g. `http://127.0.0.1:9000` for MinIO or R2/B2)
+    #[arg(long, env = "S3_ENDPOINT")]
+    s3_endpoint: Option<String>,
+
+    /// AWS SigV4 signing region for S3-compatible object storage (falls back to `AWS_REGION`,
+    /// `AWS_DEFAULT_REGION`, then `us-east-1`)
+    #[arg(long, env = "S3_REGION")]
+    s3_region: Option<String>,
+
+    /// S3 access key ID (falls back to `AWS_ACCESS_KEY_ID`)
+    #[arg(long, env = "S3_ACCESS_KEY_ID", hide_env_values = true)]
+    s3_access_key: Option<String>,
+
+    /// S3 secret access key (falls back to `AWS_SECRET_ACCESS_KEY`)
+    #[arg(long, env = "S3_SECRET_ACCESS_KEY", hide_env_values = true)]
+    s3_secret_key: Option<String>,
+
+    /// Optional temporary S3 session token (falls back to `AWS_SESSION_TOKEN`)
+    #[arg(long, env = "S3_SESSION_TOKEN", hide_env_values = true)]
+    s3_session_token: Option<String>,
+
+    /// Force S3 path-style addressing (`/<bucket>/<key>`); defaults to true when `--s3-endpoint` is set
+    #[arg(
+        long,
+        env = "S3_PATH_STYLE",
+        default_missing_value = "true",
+        num_args = 0..=1,
+        action = clap::ArgAction::Set
+    )]
+    s3_path_style: Option<bool>,
+
+    /// Automatically create missing S3 bucket via `HEAD`/`PUT` on startup (defaults to true for `http://` endpoints)
+    #[arg(
+        long,
+        env = "S3_AUTO_CREATE_BUCKET",
+        default_missing_value = "true",
+        num_args = 0..=1,
+        action = clap::ArgAction::Set
+    )]
+    s3_auto_create_bucket: Option<bool>,
+
+    /// Optional comma-separated peer S3 buckets (`s3://peer`, `s3://peer:region`, or
+    /// `s3://peer[:region]=http://endpoint`)
+    #[arg(long, env = "S3_PEER_BUCKETS", value_delimiter = ',')]
+    s3_peer_buckets: Vec<String>,
 
     /// In-memory read-through LRU blob cache size in bytes (0 disables caching). Setting a
     /// non-zero size, or configuring peer blob stores, wraps the blob store in ReplicatedBlobStore
@@ -531,23 +614,49 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         warn!("gRPC authentication disabled: gRPC services accept any caller");
     }
 
+    let clean_opt_preserve_ctrl = |opt: Option<String>| -> Option<String> {
+        opt.and_then(|raw| {
+            if raw.bytes().any(|b| b.is_ascii_control()) {
+                Some(raw)
+            } else {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }
+        })
+    };
+
     let resolved_sqlite_path = args
         .sqlite_path
         .clone()
         .unwrap_or_else(|| default_server_data_dir().join("commit_cloud.db"));
-    let gcs_bucket = args.gcs_bucket.as_deref().and_then(|raw| {
-        if raw.bytes().any(|b| b.is_ascii_control()) {
-            Some(raw.to_string())
-        } else {
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
+    let postgres_url = clean_opt_preserve_ctrl(args.postgres_url.take())
+        .or_else(|| clean_opt_preserve_ctrl(std::env::var("DATABASE_URL").ok()));
+    let postgres_ca_cert = match args.postgres_ca_cert.take() {
+        None => None,
+        Some(path) => {
+            if path.as_os_str().is_empty() || path.to_str().is_some_and(|s| s.trim().is_empty()) {
+                return Err(
+                    "--postgres-ca-cert (or POSTGRES_CA_CERT) must not be empty or whitespace; \
+                     unset it to disable"
+                        .into(),
+                );
             }
+            Some(path)
         }
-    });
+    };
+    let gcs_bucket = clean_opt_preserve_ctrl(args.gcs_bucket.clone());
+    let s3_bucket = clean_opt_preserve_ctrl(args.s3_bucket.take());
+    let s3_endpoint = clean_opt_preserve_ctrl(args.s3_endpoint.take());
+    let s3_region = clean_opt_preserve_ctrl(args.s3_region.take())
+        .or_else(|| clean_opt_preserve_ctrl(std::env::var("AWS_REGION").ok()))
+        .or_else(|| clean_opt_preserve_ctrl(std::env::var("AWS_DEFAULT_REGION").ok()))
+        .unwrap_or_else(|| DEFAULT_S3_REGION.to_string());
     let has_gcs_bucket = gcs_bucket.is_some();
+    let has_s3_bucket = s3_bucket.is_some();
     let has_blob_path = args.blob_path.is_some();
 
     let spanner_database = if args.store_type == StoreType::Spanner {
@@ -556,10 +665,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         // Durable metadata over a silent in-memory blob default would lose file contents
         // on restart while commits and trees still reference them.
-        if args.blob_store.is_none() && !has_gcs_bucket && !has_blob_path {
+        if args.blob_store.is_none() && !has_gcs_bucket && !has_s3_bucket && !has_blob_path {
             return Err("--store-type=spanner requires an explicit blob store: set \
-                        --gcs-bucket (GCS_BUCKET) or --blob-path (BLOB_PATH), or pass \
-                        --blob-store=memory (BLOB_STORE=memory) for throwaway tests"
+                        --gcs-bucket (GCS_BUCKET), --s3-bucket (S3_BUCKET), or --blob-path \
+                        (BLOB_PATH), or pass --blob-store=memory (BLOB_STORE=memory) for \
+                        throwaway tests"
                 .into());
         }
         Some(database)
@@ -567,18 +677,54 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    let effective_blob_store = args.blob_store.unwrap_or(if has_gcs_bucket {
-        BlobStoreType::Gcs
-    } else if has_blob_path {
-        BlobStoreType::Local
-    } else {
-        match args.store_type {
-            StoreType::Memory => BlobStoreType::Memory,
-            // Spanner startup rejects a missing --blob-store, --gcs-bucket, and --blob-path
-            // above, so the Spanner arm is unreachable without explicit flags.
-            StoreType::Sqlite | StoreType::Spanner => BlobStoreType::Local,
+    let postgres_config_url = if args.store_type == StoreType::Postgres {
+        let url = postgres_url.ok_or(
+            "--postgres-url (or POSTGRES_URL / DATABASE_URL) is required when \
+             --store-type=postgres",
+        )?;
+        if args.postgres_max_conns == 0 {
+            return Err("--postgres-max-conns must be greater than 0".into());
         }
-    });
+        if args.blob_store.is_none() && !has_gcs_bucket && !has_s3_bucket && !has_blob_path {
+            return Err(
+                "--store-type=postgres requires an explicit blob store: set \
+                        --s3-bucket (S3_BUCKET), --gcs-bucket (GCS_BUCKET), or --blob-path \
+                        (BLOB_PATH), or pass --blob-store=memory (BLOB_STORE=memory) for \
+                        throwaway tests"
+                    .into(),
+            );
+        }
+        Some(url)
+    } else {
+        None
+    };
+
+    let effective_blob_store = match args.blob_store {
+        Some(explicit) => explicit,
+        None => {
+            if has_gcs_bucket && has_s3_bucket {
+                return Err(
+                    "both --gcs-bucket and --s3-bucket are set; pass --blob-store explicitly"
+                        .into(),
+                );
+            } else if has_gcs_bucket {
+                BlobStoreType::Gcs
+            } else if has_s3_bucket {
+                BlobStoreType::S3
+            } else if has_blob_path {
+                BlobStoreType::Local
+            } else {
+                match args.store_type {
+                    StoreType::Memory => BlobStoreType::Memory,
+                    // Spanner and Postgres startup reject a missing explicit blob store above,
+                    // so those arms are unreachable without explicit flags.
+                    StoreType::Sqlite | StoreType::Spanner | StoreType::Postgres => {
+                        BlobStoreType::Local
+                    }
+                }
+            }
+        }
+    };
     let primary_gcs_config = if effective_blob_store == BlobStoreType::Gcs {
         let bucket =
             gcs_bucket.ok_or("--gcs-bucket (or GCS_BUCKET) is required when --blob-store=gcs")?;
@@ -600,6 +746,55 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         None
     };
+
+    // Fall back to ambient `AWS_*` credentials only as a complete unit when no explicit
+    // `--s3-*` / `S3_*` credential input is set, so explicit S3 keys never mix with an ambient
+    // `AWS_SESSION_TOKEN` or `AWS_SECRET_ACCESS_KEY`.
+    let explicit_s3_ak = clean_opt_preserve_ctrl(args.s3_access_key.take());
+    let explicit_s3_sk = clean_opt_preserve_ctrl(args.s3_secret_key.take());
+    let explicit_s3_st = clean_opt_preserve_ctrl(args.s3_session_token.take());
+    let (s3_access_key, s3_secret_key, s3_session_token) =
+        if explicit_s3_ak.is_some() || explicit_s3_sk.is_some() || explicit_s3_st.is_some() {
+            (explicit_s3_ak, explicit_s3_sk, explicit_s3_st)
+        } else {
+            (
+                clean_opt_preserve_ctrl(std::env::var("AWS_ACCESS_KEY_ID").ok()),
+                clean_opt_preserve_ctrl(std::env::var("AWS_SECRET_ACCESS_KEY").ok()),
+                clean_opt_preserve_ctrl(std::env::var("AWS_SESSION_TOKEN").ok()),
+            )
+        };
+    let s3_defaults = S3ConnectConfig {
+        bucket: String::new(),
+        endpoint: s3_endpoint.clone(),
+        region: s3_region,
+        access_key: s3_access_key,
+        secret_key: s3_secret_key,
+        session_token: s3_session_token,
+        path_style: args.s3_path_style,
+        auto_create_bucket: args.s3_auto_create_bucket,
+    };
+
+    let primary_s3_config = if effective_blob_store == BlobStoreType::S3 {
+        let bucket =
+            s3_bucket.ok_or("--s3-bucket (or S3_BUCKET) is required when --blob-store=s3")?;
+        let location_uri = format!("s3://{}", normalize_s3_bucket(&bucket)?);
+        let cfg = S3ConnectConfig {
+            bucket,
+            ..s3_defaults.clone()
+        };
+        cfg.validate()?;
+        Some((cfg, location_uri))
+    } else {
+        if let Some(bucket) = &s3_bucket {
+            normalize_s3_bucket(bucket)?;
+        }
+        if let Some(ep) = &s3_endpoint {
+            validate_s3_endpoint(ep)?;
+        }
+        None
+    };
+
+    let s3_peer_configs = parse_s3_peer_configs(&args.s3_peer_buckets, &s3_defaults)?;
 
     let mut gcs_peer_configs: Vec<(GcsConnectConfig, String)> = Vec::new();
     for raw_spec in &args.gcs_peer_buckets {
@@ -673,6 +868,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
             Arc::new(SqliteMetadataStore::open(&resolved_sqlite_path)?)
         }
+        StoreType::Postgres => {
+            let url = postgres_config_url.ok_or(
+                "--postgres-url (or POSTGRES_URL / DATABASE_URL) is required when \
+                 --store-type=postgres",
+            )?;
+            info!(
+                "Connecting to PostgreSQL metadata store (max_conns={}, auto_migrate={})",
+                args.postgres_max_conns, args.postgres_auto_migrate
+            );
+            let cfg = PostgresConnectConfig {
+                url,
+                max_conns: args.postgres_max_conns,
+                auto_migrate: args.postgres_auto_migrate,
+                ca_cert: postgres_ca_cert,
+                tx_retries: Some(metrics.db_tx_retries_counter()),
+            };
+            Arc::new(PostgresMetadataStore::connect(&cfg).await?)
+        }
         StoreType::Spanner => {
             let database = spanner_database.ok_or(
                 "--spanner-database (or SPANNER_DATABASE) is required when --store-type=spanner",
@@ -724,6 +937,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 None => Arc::new(LocalFsBlobStore::open(&blob_root)?),
             }
         }
+        BlobStoreType::S3 => {
+            let (cfg, location_uri) = primary_s3_config
+                .ok_or("--s3-bucket (or S3_BUCKET) is required when --blob-store=s3")?;
+            info!(
+                "Connecting to S3-compatible bucket '{location_uri}' (region={})",
+                cfg.region
+            );
+            Arc::new(S3BlobStore::connect(&cfg).await?)
+        }
         BlobStoreType::Gcs => {
             let (cfg, location_uri) = primary_gcs_config
                 .ok_or("--gcs-bucket (or GCS_BUCKET) is required when --blob-store=gcs")?;
@@ -735,19 +957,33 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut seen_peer_locations: HashSet<String> = HashSet::new();
     seen_peer_locations.insert(primary_blob_store.location_id().to_string());
     let mut peer_stores: Vec<Arc<dyn BlobStore>> = Vec::new();
-    for (cfg, location_uri) in gcs_peer_configs {
-        if !seen_peer_locations.insert(location_uri.clone()) {
-            info!("Skipping local or duplicate peer Cloud Storage bucket '{location_uri}'");
-            continue;
-        }
+    for (cfg, location_uri) in select_unique_peers(
+        gcs_peer_configs,
+        &mut seen_peer_locations,
+        "Cloud Storage bucket",
+    ) {
         info!("Registering peer Cloud Storage bucket '{location_uri}'");
         peer_stores.push(Arc::new(GcsBlobStore::connect(&cfg).await?));
     }
-    for (loc_uri, dir_str) in local_peer_specs {
-        if !seen_peer_locations.insert(loc_uri.clone()) {
-            info!("Skipping local or duplicate peer local blob directory '{loc_uri}'");
-            continue;
-        }
+    for (cfg, location_uri) in select_unique_peers(
+        s3_peer_configs,
+        &mut seen_peer_locations,
+        "S3-compatible bucket",
+    ) {
+        info!(
+            "Registering peer S3-compatible bucket '{location_uri}' (region={})",
+            cfg.region
+        );
+        peer_stores.push(Arc::new(S3BlobStore::connect(&cfg).await?));
+    }
+    for (dir_str, loc_uri) in select_unique_peers(
+        local_peer_specs
+            .into_iter()
+            .map(|(loc, dir)| (dir, loc))
+            .collect(),
+        &mut seen_peer_locations,
+        "local blob directory",
+    ) {
         info!("Registering peer local blob directory '{loc_uri}' -> '{dir_str}'");
         peer_stores.push(Arc::new(LocalFsBlobStore::open_with_location_id(
             dir_str, loc_uri,
@@ -883,6 +1119,44 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn parse_s3_peer_configs(
+    raw_specs: &[String],
+    defaults: &S3ConnectConfig,
+) -> Result<Vec<(S3ConnectConfig, String)>, String> {
+    let mut out = Vec::new();
+    for raw_spec in raw_specs {
+        if !raw_spec.bytes().any(|b| b.is_ascii_control()) && raw_spec.trim().is_empty() {
+            continue;
+        }
+        let cfg = parse_s3_peer_spec(raw_spec, defaults).map_err(|e| {
+            let safe_spec = redact_s3_peer_spec(raw_spec);
+            format!("invalid --s3-peer-buckets entry '{safe_spec}': {e}")
+        })?;
+        let canonical_bucket = normalize_s3_bucket(&cfg.bucket).map_err(|e| {
+            let safe_spec = redact_s3_peer_spec(raw_spec);
+            format!("invalid --s3-peer-buckets entry '{safe_spec}': {e}")
+        })?;
+        out.push((cfg, format!("s3://{canonical_bucket}")));
+    }
+    Ok(out)
+}
+
+fn select_unique_peers<T>(
+    peers: Vec<(T, String)>,
+    seen_peer_locations: &mut HashSet<String>,
+    kind: &str,
+) -> Vec<(T, String)> {
+    let mut selected = Vec::with_capacity(peers.len());
+    for (cfg, location_uri) in peers {
+        if !seen_peer_locations.insert(location_uri.clone()) {
+            info!("Skipping local or duplicate peer {kind} '{location_uri}'");
+            continue;
+        }
+        selected.push((cfg, location_uri));
+    }
+    selected
+}
+
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
@@ -949,6 +1223,69 @@ mod tests {
         assert!(
             err.to_string().contains("exceeds maximum allowed value"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_s3_peer_configs_skip_primary_deduplicate_and_block_local_collisions() {
+        let defaults = S3ConnectConfig {
+            bucket: String::new(),
+            endpoint: Some("http://127.0.0.1:9000".to_string()),
+            region: "us-east-1".to_string(),
+            access_key: None,
+            secret_key: None,
+            session_token: None,
+            path_style: Some(true),
+            auto_create_bucket: Some(false),
+        };
+
+        // Symmetric deployment where `--s3-peer-buckets` lists only the primary bucket in
+        // multiple equivalent forms must produce zero peers (so ReplicatedBlobStore is not
+        // spuriously enabled).
+        let primary_only_specs = vec![
+            "my-bucket".to_string(),
+            "s3://my-bucket".to_string(),
+            "s3://my-bucket/".to_string(),
+            "   ".to_string(),
+        ];
+        let parsed = parse_s3_peer_configs(&primary_only_specs, &defaults).unwrap();
+        let mut seen = HashSet::from(["s3://my-bucket".to_string()]);
+        let selected = select_unique_peers(parsed, &mut seen, "S3-compatible bucket");
+        assert!(
+            selected.is_empty(),
+            "primary bucket in --s3-peer-buckets must be skipped"
+        );
+
+        // Duplicate S3 peers keep the first entry and record canonical `s3://<bucket>` URIs in
+        // `seen_peer_locations`, blocking later collisions with `--local-peer-blob-dirs`.
+        let mixed_specs = vec![
+            "s3://my-bucket".to_string(),
+            "s3://peer-a:us-west-2=http://127.0.0.1:9001".to_string(),
+            "peer-a:eu-west-1=http://127.0.0.1:9002".to_string(),
+            "s3://peer-a/".to_string(),
+            "peer-b".to_string(),
+        ];
+        let parsed = parse_s3_peer_configs(&mixed_specs, &defaults).unwrap();
+        let mut seen = HashSet::from(["s3://my-bucket".to_string()]);
+        let selected = select_unique_peers(parsed, &mut seen, "S3-compatible bucket");
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].1, "s3://peer-a");
+        assert_eq!(selected[0].0.region, "us-west-2");
+        assert_eq!(
+            selected[0].0.endpoint.as_deref(),
+            Some("http://127.0.0.1:9001")
+        );
+        assert_eq!(selected[1].1, "s3://peer-b");
+        assert_eq!(selected[1].0.region, "us-east-1");
+
+        let local_peers = vec![
+            ("/tmp/dup".to_string(), "s3://peer-a".to_string()),
+            ("/tmp/ok".to_string(), "s3://local-peer".to_string()),
+        ];
+        let selected_local = select_unique_peers(local_peers, &mut seen, "local blob directory");
+        assert_eq!(
+            selected_local,
+            vec![("/tmp/ok".to_string(), "s3://local-peer".to_string())]
         );
     }
 }
