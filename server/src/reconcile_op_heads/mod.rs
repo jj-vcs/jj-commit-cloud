@@ -20,26 +20,29 @@
 //! pins all adapters (`ServerBackend`, `ServerOpStore`, `ServerOpHeadsStore`, `ServerIndex`,
 //! `ServerIndexStore`) to that `project_id`, writing the merged `View` and `Operation`
 //! through project-pinned `*_for_project` calls before atomically swapping the validated
-//! head snapshot via [`ServerOpHeadsStore::with_expected_heads_for_project`] CAS. Server-authored
-//! merge operations carry `"jj-cc-server"` hostname and username metadata.
+//! head snapshot via [`ServerOpHeadsStore::with_expected_heads_for_project`] CAS.
 //!
 //! # Concurrency and Merge Invariants
-//! In-process callers targeting the same `repo_id` serialize behind a per-repository
-//! async mutex, while concurrent cross-process writers fail CAS with [`StoreError::CasConflict`]
-//! and retry through rewrite-safety checks. Divergent rewrites, abandons, missing
-//! `commit_predecessors`, or walks exceeding safety caps fail closed with
-//! `client_resolution_required = true`.
+//! In-process callers targeting the same `repo_id` serialize behind a per-repository async
+//! mutex, while concurrent cross-process writers retry [`StoreError::CasConflict`] through
+//! rewrite-safety checks. Divergent rewrites, abandons, missing `commit_predecessors`, walks
+//! exceeding safety caps, or [`ReconcileRepoMode::Bypass`] on divergent heads fail closed with
+//! `client_resolution_required = true`. [`ReconcileRepoMode::Quarantine`] fails closed before
+//! store reads with non-retryable `FAILED_PRECONDITION` to shed load during merge storms.
 //!
 //! # Cross-Process and RPC Boundaries
-//! Runs `RepoLoader::load_at_head()` (`!Send` due to `dyn Repo`) on Tokio's
-//! `spawn_blocking` pool via `pollster::block_on`, preserving typed [`StoreError`] gRPC
-//! status codes and retrying transient failures with bounded exponential backoff.
+//! Runs `RepoLoader::load_at_head()` (`!Send` due to `dyn Repo`) on Tokio's `spawn_blocking`
+//! pool via `pollster::block_on`, preserving typed [`StoreError`] gRPC status codes and
+//! retrying transient failures with bounded exponential backoff.
 
 #![allow(elided_lifetimes_in_paths)]
 
 mod errors;
+mod kill_switch;
 #[cfg(test)]
 mod tests;
+
+pub use kill_switch::{ReconcileKillSwitch, ReconcileRepoMode};
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -129,12 +132,60 @@ fn single_head_response(
     })
 }
 
-pub async fn reconcile_repo_op_heads_proto_with_metrics(
+fn quarantine_status(repo_id: &str) -> tonic::Status {
+    tonic::Status::failed_precondition(format!(
+        "server op-head reconciliation is quarantined for repository '{repo_id}'"
+    ))
+}
+
+fn bypass_response(
+    repo_id: &str,
+    heads: Vec<Vec<u8>>,
+) -> Result<cc_common::op_store::ReconcileOpHeadsResponse, tonic::Status> {
+    for head in &heads {
+        if head.len() != cc_common::OPERATION_ID_LENGTH {
+            return Err(StoreError::Corruption(format!(
+                "stored op_head in repo '{repo_id}' must be {} bytes (got {} bytes)",
+                cc_common::OPERATION_ID_LENGTH,
+                head.len()
+            ))
+            .into());
+        }
+    }
+    tracing::warn!(
+        repo_id = %repo_id,
+        head_count = heads.len(),
+        "Server op-head reconciliation bypassed by per-repo kill switch; returning active heads for client resolution"
+    );
+    Ok(cc_common::op_store::ReconcileOpHeadsResponse {
+        op_head: Vec::new(),
+        client_resolution_required: true,
+        current_op_head_ids: heads,
+    })
+}
+
+/// Reconciles operation heads for `repo_id` under an optional per-repository
+/// [`ReconcileKillSwitch`] policy and records outcome metrics when `metrics` is provided.
+///
+/// Mode semantics:
+/// - [`ReconcileRepoMode::Quarantine`]: checked upfront before any store read or per-repo lock
+///   (and re-checked inside the retry loop after lock acquisition and before retry backoff or
+///   fallback responses) to shed DB load and halt automated client merge storms with non-retryable
+///   `FAILED_PRECONDITION`, without incrementing success metrics.
+/// - [`ReconcileRepoMode::Bypass`]: allows already-converged repositories (`heads.len() <= 1`)
+///   to take the zero-merge single-head fast path (`reconcile_merged_total`), and on divergent
+///   heads (`heads.len() > 1`) skips `jj_lib` merging and DB writes to return
+///   `client_resolution_required = true` with validated `current_op_head_ids`
+///   (`reconcile_client_fallback_total`). Re-checked inside the retry loop after lock
+///   acquisition and after transient failures so dynamic toggles take effect immediately
+///   without waiting on backoff sleep.
+pub async fn reconcile_repo_op_heads_proto_with_policy_and_metrics(
     store: Arc<CompositeStore>,
     repo_id: &str,
+    kill_switch: Option<&ReconcileKillSwitch>,
     metrics: Option<&crate::metrics::ServerMetrics>,
 ) -> Result<cc_common::op_store::ReconcileOpHeadsResponse, tonic::Status> {
-    let response = reconcile_repo_op_heads_proto(store, repo_id).await?;
+    let response = reconcile_repo_op_heads_proto_with_policy(store, repo_id, kill_switch).await?;
     if let Some(m) = metrics {
         m.record_reconcile_op_heads(response.client_resolution_required);
     }
@@ -145,17 +196,52 @@ pub async fn reconcile_repo_op_heads_proto(
     store: Arc<CompositeStore>,
     repo_id: &str,
 ) -> Result<cc_common::op_store::ReconcileOpHeadsResponse, tonic::Status> {
-    reconcile_repo_op_heads_with_limits(store, repo_id, IndexWalkLimits::default()).await
+    reconcile_repo_op_heads_proto_with_policy(store, repo_id, None).await
 }
 
+/// Reconciles operation heads for `repo_id` while enforcing an optional per-repository
+/// [`ReconcileKillSwitch`] policy.
+pub async fn reconcile_repo_op_heads_proto_with_policy(
+    store: Arc<CompositeStore>,
+    repo_id: &str,
+    kill_switch: Option<&ReconcileKillSwitch>,
+) -> Result<cc_common::op_store::ReconcileOpHeadsResponse, tonic::Status> {
+    reconcile_repo_op_heads_with_policy_and_limits(
+        store,
+        repo_id,
+        kill_switch,
+        IndexWalkLimits::default(),
+    )
+    .await
+}
+
+#[cfg(test)]
 pub(crate) async fn reconcile_repo_op_heads_with_limits(
     store: Arc<CompositeStore>,
     repo_id: &str,
     walk_limits: IndexWalkLimits,
 ) -> Result<cc_common::op_store::ReconcileOpHeadsResponse, tonic::Status> {
+    reconcile_repo_op_heads_with_policy_and_limits(store, repo_id, None, walk_limits).await
+}
+
+async fn reconcile_repo_op_heads_with_policy_and_limits(
+    store: Arc<CompositeStore>,
+    repo_id: &str,
+    kill_switch: Option<&ReconcileKillSwitch>,
+    walk_limits: IndexWalkLimits,
+) -> Result<cc_common::op_store::ReconcileOpHeadsResponse, tonic::Status> {
     const MAX_RETRIES: usize = 6;
     const BASE_BACKOFF_MS: u64 = 20;
     const MAX_JITTER_MS: u64 = 15;
+
+    // Shed load before touching MetadataStore when a thrashing repository is quarantined.
+    if kill_switch.is_some_and(|ks| ks.mode_for(repo_id) == ReconcileRepoMode::Quarantine) {
+        tracing::warn!(
+            repo_id = %repo_id,
+            "Server op-head reconciliation quarantined by per-repo kill switch"
+        );
+        return Err(quarantine_status(repo_id));
+    }
 
     store
         .ensure_repo_registered(repo_id, "reconciling op heads")
@@ -166,6 +252,21 @@ pub(crate) async fn reconcile_repo_op_heads_with_limits(
     if initial_heads.len() <= 1 {
         return single_head_response(repo_id, initial_heads);
     }
+    if let Some(ks) = kill_switch {
+        match ks.mode_for(repo_id) {
+            ReconcileRepoMode::Quarantine => {
+                tracing::warn!(
+                    repo_id = %repo_id,
+                    "Server op-head reconciliation quarantined by per-repo kill switch"
+                );
+                return Err(quarantine_status(repo_id));
+            }
+            ReconcileRepoMode::Bypass => {
+                return bypass_response(repo_id, initial_heads);
+            }
+            ReconcileRepoMode::Normal => {}
+        }
+    }
 
     // Coalesce concurrent in-process reconcile calls for the same `repo_id`.
     let repo_lock = repo_reconcile_mutex(repo_id);
@@ -173,12 +274,37 @@ pub(crate) async fn reconcile_repo_op_heads_with_limits(
 
     let mut attempt = 0usize;
     loop {
+        if kill_switch.is_some_and(|ks| ks.mode_for(repo_id) == ReconcileRepoMode::Quarantine) {
+            tracing::warn!(
+                repo_id = %repo_id,
+                attempt = attempt + 1,
+                "Server op-head reconciliation quarantined by per-repo kill switch"
+            );
+            return Err(quarantine_status(repo_id));
+        }
+
         let project_id = store
             .resolve_repo_project(repo_id, "reconciling op heads")
             .await?;
         let heads = store.get_op_heads(repo_id).await?;
         if heads.len() <= 1 {
             return single_head_response(repo_id, heads);
+        }
+        if let Some(ks) = kill_switch {
+            match ks.mode_for(repo_id) {
+                ReconcileRepoMode::Quarantine => {
+                    tracing::warn!(
+                        repo_id = %repo_id,
+                        attempt = attempt + 1,
+                        "Server op-head reconciliation quarantined by per-repo kill switch"
+                    );
+                    return Err(quarantine_status(repo_id));
+                }
+                ReconcileRepoMode::Bypass => {
+                    return bypass_response(repo_id, heads);
+                }
+                ReconcileRepoMode::Normal => {}
+            }
         }
         let heads_snapshot = heads.clone();
 
@@ -272,26 +398,65 @@ pub(crate) async fn reconcile_repo_op_heads_with_limits(
                 });
             }
             Ok(None) => {
+                if kill_switch
+                    .is_some_and(|ks| ks.mode_for(repo_id) == ReconcileRepoMode::Quarantine)
+                {
+                    tracing::warn!(
+                        repo_id = %repo_id,
+                        attempt = attempt + 1,
+                        "Server op-head reconciliation quarantined by per-repo kill switch"
+                    );
+                    return Err(quarantine_status(repo_id));
+                }
                 return Ok(cc_common::op_store::ReconcileOpHeadsResponse {
                     op_head: Vec::new(),
                     client_resolution_required: true,
                     current_op_head_ids: heads_snapshot,
                 });
             }
-            Err(err) if attempt + 1 < MAX_RETRIES && err.transient => {
-                tracing::warn!(
-                    repo_id = %repo_id,
-                    attempt = attempt + 1,
-                    error = %err.status,
-                    "Transient op-head reconciliation failure; retrying"
-                );
-                let jitter = rand::random::<u64>() % MAX_JITTER_MS;
-                let sleep_ms = (BASE_BACKOFF_MS << attempt.min(5)) + jitter;
-                tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
-                attempt += 1;
-            }
             Err(err) => {
-                return Err(err.status);
+                if let Some(ks) = kill_switch {
+                    match ks.mode_for(repo_id) {
+                        ReconcileRepoMode::Quarantine => {
+                            tracing::warn!(
+                                repo_id = %repo_id,
+                                attempt = attempt + 1,
+                                "Server op-head reconciliation quarantined by per-repo kill switch"
+                            );
+                            return Err(quarantine_status(repo_id));
+                        }
+                        ReconcileRepoMode::Bypass if err.transient => {
+                            let heads = store.get_op_heads(repo_id).await?;
+                            if ks.mode_for(repo_id) == ReconcileRepoMode::Quarantine {
+                                tracing::warn!(
+                                    repo_id = %repo_id,
+                                    attempt = attempt + 1,
+                                    "Server op-head reconciliation quarantined by per-repo kill switch"
+                                );
+                                return Err(quarantine_status(repo_id));
+                            }
+                            if heads.len() <= 1 {
+                                return single_head_response(repo_id, heads);
+                            }
+                            return bypass_response(repo_id, heads);
+                        }
+                        ReconcileRepoMode::Bypass | ReconcileRepoMode::Normal => {}
+                    }
+                }
+                if attempt + 1 < MAX_RETRIES && err.transient {
+                    tracing::warn!(
+                        repo_id = %repo_id,
+                        attempt = attempt + 1,
+                        error = %err.status,
+                        "Transient op-head reconciliation failure; retrying"
+                    );
+                    let jitter = rand::random::<u64>() % MAX_JITTER_MS;
+                    let sleep_ms = (BASE_BACKOFF_MS << attempt.min(5)) + jitter;
+                    tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                    attempt += 1;
+                } else {
+                    return Err(err.status);
+                }
             }
         }
     }

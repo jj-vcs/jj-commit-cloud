@@ -222,15 +222,35 @@ impl OpHeadsStore for CommitCloudOpHeadsStore {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use cc_common::op_store::op_store_service_server::{OpStoreService, OpStoreServiceServer};
     use tonic::{Request, Response, Status};
 
     use super::*;
     use crate::util::run_async;
 
+    enum MockReconcileBehavior {
+        Status(tonic::Code),
+        CustomError(tonic::Code, String),
+        Response(ReconcileOpHeadsResponse),
+    }
+
     struct ConfigurableOpHeadsServer {
         op_head_ids: Vec<Vec<u8>>,
-        reconcile_status: tonic::Code,
+        reconcile: MockReconcileBehavior,
+        get_op_heads_calls: Arc<AtomicUsize>,
+    }
+
+    impl ConfigurableOpHeadsServer {
+        fn with_status(op_head_ids: Vec<Vec<u8>>, reconcile_status: tonic::Code) -> Self {
+            Self {
+                op_head_ids,
+                reconcile: MockReconcileBehavior::Status(reconcile_status),
+                get_op_heads_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
     }
 
     #[tonic::async_trait]
@@ -263,6 +283,7 @@ mod tests {
             &self,
             _: Request<GetOpHeadsRequest>,
         ) -> Result<Response<GetOpHeadsResponse>, Status> {
+            self.get_op_heads_calls.fetch_add(1, Ordering::SeqCst);
             Ok(Response::new(GetOpHeadsResponse {
                 op_head_ids: self.op_head_ids.clone(),
             }))
@@ -277,7 +298,11 @@ mod tests {
             &self,
             _: Request<ReconcileOpHeadsRequest>,
         ) -> Result<Response<ReconcileOpHeadsResponse>, Status> {
-            Err(Status::new(self.reconcile_status, "reconcile status"))
+            match &self.reconcile {
+                MockReconcileBehavior::Status(code) => Err(Status::new(*code, "reconcile status")),
+                MockReconcileBehavior::CustomError(code, msg) => Err(Status::new(*code, msg)),
+                MockReconcileBehavior::Response(resp) => Ok(Response::new(resp.clone())),
+            }
         }
         async fn resolve_operation_prefix(
             &self,
@@ -312,10 +337,10 @@ mod tests {
 
     #[tokio::test]
     async fn get_op_heads_without_reconciliation_rejects_invalid_id_length() {
-        let url = spawn_mock_op_heads_server(ConfigurableOpHeadsServer {
-            op_head_ids: vec![vec![0xaa; 5]],
-            reconcile_status: tonic::Code::Unimplemented,
-        })
+        let url = spawn_mock_op_heads_server(ConfigurableOpHeadsServer::with_status(
+            vec![vec![0xaa; 5]],
+            tonic::Code::Unimplemented,
+        ))
         .await;
 
         let store = CommitCloudOpHeadsStore::new("repo-1".to_string(), url);
@@ -344,10 +369,10 @@ mod tests {
         ];
 
         for code in [tonic::Code::Aborted, tonic::Code::Unimplemented] {
-            let url = spawn_mock_op_heads_server(ConfigurableOpHeadsServer {
-                op_head_ids: vec![head_a.clone(), head_b.clone()],
-                reconcile_status: code,
-            })
+            let url = spawn_mock_op_heads_server(ConfigurableOpHeadsServer::with_status(
+                vec![head_a.clone(), head_b.clone()],
+                code,
+            ))
             .await;
             let store = CommitCloudOpHeadsStore::new("repo-1".to_string(), url);
             let heads = store
@@ -358,10 +383,10 @@ mod tests {
         }
 
         // Non-fallback errors such as PermissionDenied must still propagate.
-        let denied_url = spawn_mock_op_heads_server(ConfigurableOpHeadsServer {
-            op_head_ids: vec![head_a],
-            reconcile_status: tonic::Code::PermissionDenied,
-        })
+        let denied_url = spawn_mock_op_heads_server(ConfigurableOpHeadsServer::with_status(
+            vec![head_a],
+            tonic::Code::PermissionDenied,
+        ))
         .await;
         let denied_store = CommitCloudOpHeadsStore::new("repo-1".to_string(), denied_url);
         assert!(
@@ -374,11 +399,87 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_op_heads_rejects_empty_response_directly_and_on_reconcile_fallback() {
-        let direct_url = spawn_mock_op_heads_server(ConfigurableOpHeadsServer {
-            op_head_ids: Vec::new(),
-            reconcile_status: tonic::Code::Unimplemented,
+    async fn get_op_heads_with_reconciliation_does_not_fall_back_on_failed_precondition_quarantine()
+    {
+        let head_a = vec![0x11; cc_common::OPERATION_ID_LENGTH];
+        let get_op_heads_calls = Arc::new(AtomicUsize::new(0));
+        let url = spawn_mock_op_heads_server(ConfigurableOpHeadsServer {
+            op_head_ids: vec![head_a],
+            reconcile: MockReconcileBehavior::CustomError(
+                tonic::Code::FailedPrecondition,
+                "server op-head reconciliation is quarantined for repository 'repo-1'".to_string(),
+            ),
+            get_op_heads_calls: Arc::clone(&get_op_heads_calls),
         })
+        .await;
+
+        let store = CommitCloudOpHeadsStore::new("repo-1".to_string(), url);
+        let err = store
+            .get_op_heads_with_reconciliation()
+            .await
+            .expect_err("FAILED_PRECONDITION (quarantine mode) must fail without fallback");
+        match err {
+            OpHeadsStoreError::Read(source) => {
+                let status = source
+                    .downcast_ref::<tonic::Status>()
+                    .expect("error source should retain tonic::Status");
+                assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+                assert!(
+                    status.message().contains("quarantined"),
+                    "unexpected status message: {}",
+                    status.message()
+                );
+            }
+            other => panic!("expected OpHeadsStoreError::Read, got {other:?}"),
+        }
+        assert_eq!(
+            get_op_heads_calls.load(Ordering::SeqCst),
+            0,
+            "quarantine FAILED_PRECONDITION must not fall back to GetOpHeads"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_op_heads_with_reconciliation_returns_bypass_heads_without_get_op_heads_call() {
+        let head_a = vec![0x33; cc_common::OPERATION_ID_LENGTH];
+        let head_b = vec![0x44; cc_common::OPERATION_ID_LENGTH];
+        let get_op_heads_calls = Arc::new(AtomicUsize::new(0));
+        let url = spawn_mock_op_heads_server(ConfigurableOpHeadsServer {
+            op_head_ids: vec![vec![0x99; cc_common::OPERATION_ID_LENGTH]],
+            reconcile: MockReconcileBehavior::Response(ReconcileOpHeadsResponse {
+                op_head: Vec::new(),
+                client_resolution_required: true,
+                current_op_head_ids: vec![head_a.clone(), head_b.clone()],
+            }),
+            get_op_heads_calls: Arc::clone(&get_op_heads_calls),
+        })
+        .await;
+
+        let store = CommitCloudOpHeadsStore::new("repo-1".to_string(), url);
+        let heads = store
+            .get_op_heads_with_reconciliation()
+            .await
+            .expect("bypass response with current_op_head_ids must succeed");
+        assert_eq!(
+            heads,
+            vec![
+                OperationId::from_bytes(&head_a),
+                OperationId::from_bytes(&head_b),
+            ]
+        );
+        assert_eq!(
+            get_op_heads_calls.load(Ordering::SeqCst),
+            0,
+            "bypass response with populated current_op_head_ids must not invoke GetOpHeads"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_op_heads_rejects_empty_response_directly_and_on_reconcile_fallback() {
+        let direct_url = spawn_mock_op_heads_server(ConfigurableOpHeadsServer::with_status(
+            Vec::new(),
+            tonic::Code::Unimplemented,
+        ))
         .await;
         let direct_store = CommitCloudOpHeadsStore::new("repo-1".to_string(), direct_url);
         let direct_err = direct_store
@@ -396,10 +497,10 @@ mod tests {
         }
 
         for code in [tonic::Code::Aborted, tonic::Code::Unimplemented] {
-            let fallback_url = spawn_mock_op_heads_server(ConfigurableOpHeadsServer {
-                op_head_ids: Vec::new(),
-                reconcile_status: code,
-            })
+            let fallback_url = spawn_mock_op_heads_server(ConfigurableOpHeadsServer::with_status(
+                Vec::new(),
+                code,
+            ))
             .await;
             let fallback_store = CommitCloudOpHeadsStore::new("repo-1".to_string(), fallback_url);
             let fallback_err = fallback_store

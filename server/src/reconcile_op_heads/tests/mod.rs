@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod budgets_and_lifecycle;
+mod kill_switch;
 mod merge_and_rewrites;
 
 use std::collections::HashMap;

@@ -229,6 +229,8 @@ pub const SANITIZED_SERVER_ENV_VARS: &[&str] = &[
     "JJ_CC_AUTH_K8S_CA_CERT",
     "JJ_CC_AUTH_K8S_SA_TOKEN_FILE",
     "METRICS_LISTEN",
+    "RECONCILE_BYPASS_REPOS",
+    "RECONCILE_QUARANTINE_REPOS",
 ];
 
 pub async fn spawn_server_with_env(env_vars: &[(&str, &str)], extra_args: &[&str]) -> ServerGuard {
@@ -1059,6 +1061,12 @@ mod tests {
     #[test]
     fn sanitized_server_env_vars_includes_spanner_emulator() {
         assert!(SANITIZED_SERVER_ENV_VARS.contains(&"SPANNER_EMULATOR"));
+    }
+
+    #[test]
+    fn sanitized_server_env_vars_includes_reconcile_kill_switch_vars() {
+        assert!(SANITIZED_SERVER_ENV_VARS.contains(&"RECONCILE_BYPASS_REPOS"));
+        assert!(SANITIZED_SERVER_ENV_VARS.contains(&"RECONCILE_QUARANTINE_REPOS"));
     }
 
     #[tokio::test]

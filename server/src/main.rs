@@ -52,6 +52,7 @@ use jj_commit_cloud_server::backend::{
 };
 use jj_commit_cloud_server::metrics::{MetricsLayer, ServerMetrics, bind_and_serve_metrics};
 use jj_commit_cloud_server::op_store::CommitCloudOpStoreService;
+use jj_commit_cloud_server::reconcile_op_heads::ReconcileKillSwitch;
 use jj_commit_cloud_server::store::gcsblob::{normalize_bucket_identifiers, validate_gcs_endpoint};
 use jj_commit_cloud_server::store::s3blob::{
     DEFAULT_S3_REGION, normalize_s3_bucket, parse_s3_peer_spec, redact_s3_peer_spec,
@@ -361,6 +362,25 @@ struct Args {
     /// (`/healthz`, `/statz`, `/metrics`), e.g. `127.0.0.1:9090` (disabled when unset or blank)
     #[arg(long, env = "METRICS_LISTEN")]
     metrics_listen: Option<String>,
+
+    /// Optional comma-separated repository IDs whose server-side op-head reconciliation is
+    /// bypassed (`ReconcileOpHeads` returns `client_resolution_required = true` with active
+    /// heads on divergence for off-server CLI recovery)
+    #[arg(long, env = "RECONCILE_BYPASS_REPOS", value_delimiter = ',')]
+    reconcile_bypass_repos: Vec<String>,
+
+    /// Optional comma-separated repository IDs whose server-side op-head reconciliation is
+    /// quarantined (`ReconcileOpHeads` fails closed with non-retryable `FAILED_PRECONDITION`
+    /// to halt automated client merge storms; `GetOpHeads` remains unaffected)
+    #[arg(long, env = "RECONCILE_QUARANTINE_REPOS", value_delimiter = ',')]
+    reconcile_quarantine_repos: Vec<String>,
+}
+
+fn build_reconcile_kill_switch(args: &Args) -> Result<ReconcileKillSwitch, String> {
+    ReconcileKillSwitch::try_from_repo_lists(
+        &args.reconcile_bypass_repos,
+        &args.reconcile_quarantine_repos,
+    )
 }
 
 const DEFAULT_BLOB_CACHE_BYTES: usize = 64 * 1024 * 1024;
@@ -418,6 +438,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             })
         })
         .transpose()?;
+    let reconcile_kill_switch = build_reconcile_kill_switch(&args)?;
+    if !reconcile_kill_switch.is_empty() {
+        let (bypass_count, quarantine_count) = reconcile_kill_switch.counts();
+        warn!(
+            bypass_count,
+            quarantine_count,
+            bypass_repos = ?reconcile_kill_switch.bypass_repos(),
+            quarantine_repos = ?reconcile_kill_switch.quarantine_repos(),
+            "Per-repository op-head reconciliation kill switch enabled"
+        );
+    }
     let mut combined_tokens = std::mem::take(&mut args.auth_tokens);
     if let Some(token_file) = &args.auth_token_file {
         match load_tokens_from_file(token_file) {
@@ -1076,7 +1107,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let backend_service = CommitCloudBackendService::with_metrics(store.clone(), metrics.clone())
         .with_actor_repo_suffix_enforcement(enforce_actor_repo_suffix);
     let op_store_service = CommitCloudOpStoreService::with_metrics(store.clone(), metrics.clone())
-        .with_actor_repo_suffix_enforcement(enforce_actor_repo_suffix);
+        .with_actor_repo_suffix_enforcement(enforce_actor_repo_suffix)
+        .with_reconcile_kill_switch(reconcile_kill_switch);
     let workspace_service = CommitCloudWorkspaceService::with_metrics(store, metrics.clone())
         .with_actor_repo_suffix_enforcement(enforce_actor_repo_suffix);
 
@@ -1287,5 +1319,60 @@ mod tests {
             selected_local,
             vec![("/tmp/ok".to_string(), "s3://local-peer".to_string())]
         );
+    }
+
+    #[test]
+    fn test_cli_reconcile_kill_switch_flags_parse_and_validate() {
+        use jj_commit_cloud_server::reconcile_op_heads::ReconcileRepoMode;
+
+        let default_args = Args::try_parse_from(["jj-cc-server"]).unwrap();
+        assert!(default_args.reconcile_bypass_repos.is_empty());
+        assert!(default_args.reconcile_quarantine_repos.is_empty());
+        assert!(
+            build_reconcile_kill_switch(&default_args)
+                .unwrap()
+                .is_empty()
+        );
+
+        let args = Args::try_parse_from([
+            "jj-cc-server",
+            "--reconcile-bypass-repos=repo-a, repo-b",
+            "--reconcile-bypass-repos=repo-c",
+            "--reconcile-quarantine-repos=repo-q1,repo-q2",
+        ])
+        .unwrap();
+        let ks = build_reconcile_kill_switch(&args).unwrap();
+        assert_eq!(ks.counts(), (3, 2));
+        assert_eq!(ks.mode_for("repo-a"), ReconcileRepoMode::Bypass);
+        assert_eq!(ks.mode_for("repo-b"), ReconcileRepoMode::Bypass);
+        assert_eq!(ks.mode_for("repo-c"), ReconcileRepoMode::Bypass);
+        assert_eq!(ks.mode_for("repo-q1"), ReconcileRepoMode::Quarantine);
+        assert_eq!(ks.mode_for("repo-q2"), ReconcileRepoMode::Quarantine);
+        assert_eq!(ks.mode_for("repo-normal"), ReconcileRepoMode::Normal);
+
+        let conflict_args = Args::try_parse_from([
+            "jj-cc-server",
+            "--reconcile-bypass-repos=repo-a,shared-repo",
+            "--reconcile-quarantine-repos=shared-repo",
+        ])
+        .unwrap();
+        let conflict_err = build_reconcile_kill_switch(&conflict_args)
+            .expect_err("overlapping bypass and quarantine repos must be rejected");
+        assert!(
+            conflict_err.contains("cannot be configured in both"),
+            "unexpected conflict error: {conflict_err}"
+        );
+
+        for bad in ["../bad", "repo\nnewline", "repo\ttab"] {
+            let bad_args = Args::try_parse_from([
+                "jj-cc-server",
+                &format!("--reconcile-quarantine-repos={bad}"),
+            ])
+            .unwrap();
+            assert!(
+                build_reconcile_kill_switch(&bad_args).is_err(),
+                "invalid repo_id {bad:?} must fail startup validation"
+            );
+        }
     }
 }

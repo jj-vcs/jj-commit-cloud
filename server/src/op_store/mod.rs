@@ -23,7 +23,9 @@
 //! # Concurrency and Merge Invariants
 //! `UpdateOpHeads` delegates to `MetadataStore::update_op_heads` under serializable
 //! isolation, removing superseded `old_op_head_ids` while preserving concurrent sibling
-//! heads for lock-free client-side reconciliation.
+//! heads for lock-free client-side reconciliation. `ReconcileOpHeads` enforces optional
+//! per-repository [`ReconcileKillSwitch`] policies (`Bypass` and `Quarantine`) while
+//! keeping `GetOpHeads` pure and unaffected.
 //!
 //! # Cross-Process and RPC Boundaries
 //! Synthesizes the all-zero root `Operation` and root `View` on read without requiring
@@ -41,7 +43,9 @@ use crate::auth::{CallerIdentity, enforce_actor_repo_suffix};
 use crate::backend::{validate_digest_len, validate_identifier};
 use crate::hash_utils::{hash_operation, hash_view};
 use crate::metrics::ServerMetrics;
-use crate::reconcile_op_heads::reconcile_repo_op_heads_proto_with_metrics;
+use crate::reconcile_op_heads::{
+    ReconcileKillSwitch, reconcile_repo_op_heads_proto_with_policy_and_metrics,
+};
 use crate::store::{CompositeStore, IdPrefixResolution};
 
 fn validate_ref_target(
@@ -171,6 +175,7 @@ pub struct CommitCloudOpStoreService {
     store: Arc<CompositeStore>,
     metrics: ServerMetrics,
     enforce_actor_repo_suffix: bool,
+    reconcile_kill_switch: ReconcileKillSwitch,
 }
 
 impl CommitCloudOpStoreService {
@@ -183,11 +188,17 @@ impl CommitCloudOpStoreService {
             store,
             metrics,
             enforce_actor_repo_suffix: false,
+            reconcile_kill_switch: ReconcileKillSwitch::new(),
         }
     }
 
     pub fn with_actor_repo_suffix_enforcement(mut self, enforce: bool) -> Self {
         self.enforce_actor_repo_suffix = enforce;
+        self
+    }
+
+    pub fn with_reconcile_kill_switch(mut self, kill_switch: ReconcileKillSwitch) -> Self {
+        self.reconcile_kill_switch = kill_switch;
         self
     }
 }
@@ -432,9 +443,10 @@ impl OpStoreService for CommitCloudOpStoreService {
             &req.repo_id,
         )?;
         info!("Reconcile op heads for repo: {}", req.repo_id);
-        let response = reconcile_repo_op_heads_proto_with_metrics(
+        let response = reconcile_repo_op_heads_proto_with_policy_and_metrics(
             self.store.clone(),
             &req.repo_id,
+            Some(&self.reconcile_kill_switch),
             Some(&self.metrics),
         )
         .await?;

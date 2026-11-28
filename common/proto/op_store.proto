@@ -46,8 +46,10 @@ package commit_cloud.op_store;
 //   references an unpersisted non-root `commit_id`, `WriteOperation` or
 //   `PublishOperation` references an unpersisted `view_id` or parent
 //   `operation_id`, `UpdateOpHeads` references an unpersisted `new_op_head_id`,
-//   or `repo_id` was concurrently deleted and re-bound to a different
-//   `project_id` during the write or reconciliation attempt.
+//   `repo_id` was concurrently deleted and re-bound to a different `project_id`
+//   during the write or reconciliation attempt, or `ReconcileOpHeads` is
+//   quarantined for `repo_id` via the per-repository reconciliation kill
+//   switch.
 // - `INVALID_ARGUMENT`: Malformed identifier, digest length, or hex prefix;
 //   empty `view.head_ids`, absent `RefTarget` (except tracked remote
 //   bookmarks), or malformed bookmark key; parentless non-root `Operation`,
@@ -97,8 +99,13 @@ service OpStoreService {
   // `op_head` set to the 16-byte resolved `OperationId`, and
   // `current_op_head_ids = [op_head]`. When cross-branch commit rewrites or
   // abandonments require client-side `DefaultIndexStore` descendant rebasing,
-  // returns `client_resolution_required = true`, an empty `op_head`, and the
-  // active unreconciled `current_op_head_ids` in a single round-trip.
+  // or when the per-repository kill switch places `repo_id` in bypass mode on
+  // divergent heads, returns `client_resolution_required = true`, an empty
+  // `op_head`, and the active unreconciled `current_op_head_ids` in a single
+  // round-trip without mutating repository state. When the per-repository kill
+  // switch places `repo_id` in quarantine mode, fails closed immediately with
+  // non-retryable `FAILED_PRECONDITION` before reading or mutating repository
+  // state (`GetOpHeads` remains unaffected).
   rpc ReconcileOpHeads(ReconcileOpHeadsRequest)
       returns (ReconcileOpHeadsResponse);
 
@@ -196,7 +203,9 @@ message ReconcileOpHeadsResponse {
   // (empty when `client_resolution_required == true`).
   bytes op_head = 1;
   // True when cross-branch commit rewrites or abandonments require client-side
-  // descendant rebasing against `current_op_head_ids`.
+  // descendant rebasing against `current_op_head_ids`, or when the
+  // per-repository reconciliation kill switch is in bypass mode on divergent
+  // heads.
   bool client_resolution_required = 2;
   // Active 16-byte operation head IDs after the call (`[op_head]` when
   // `client_resolution_required == false`, or the unreconciled heads when

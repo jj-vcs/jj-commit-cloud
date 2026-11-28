@@ -823,3 +823,202 @@ async fn test_update_op_heads_rejects_root_operation_id() {
     assert_eq!(err.code(), Code::InvalidArgument);
     assert_eq!(store.get_op_heads("repo-1").await.unwrap(), vec![op1_id]);
 }
+
+#[tokio::test]
+async fn test_op_store_reconcile_kill_switch_and_pure_get_op_heads() {
+    async fn seed_divergent_via_service(
+        svc: &CommitCloudOpStoreService,
+        repo_id: &str,
+        c1_byte: u8,
+        c2_byte: u8,
+    ) -> (Vec<u8>, Vec<u8>) {
+        svc.store.register_repo(repo_id, None).await.unwrap();
+        let root_op = cc_common::ROOT_OPERATION_ID_BYTES.to_vec();
+        let c1 = vec![c1_byte; cc_common::COMMIT_ID_LENGTH];
+        let c2 = vec![c2_byte; cc_common::COMMIT_ID_LENGTH];
+        for (cid, change_byte) in [(&c1, c1_byte), (&c2, c2_byte)] {
+            svc.store
+                .put_commit(
+                    repo_id,
+                    cid,
+                    &cc_common::backend::Commit {
+                        commit_id: cid.clone(),
+                        change_id: vec![change_byte; cc_common::CHANGE_ID_LENGTH],
+                        parent_commit_ids: vec![cc_common::ROOT_COMMIT_ID_BYTES.to_vec()],
+                        root_tree_id: vec![cc_common::EMPTY_TREE_ID_BYTES.to_vec()],
+                        description: format!("commit {change_byte}\n"),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let op_a = svc
+            .publish_operation(Request::new(PublishOperationRequest {
+                repo_id: repo_id.to_string(),
+                view: Some(View {
+                    head_ids: vec![c1.clone()],
+                    wc_commit_ids: HashMap::new(),
+                    local_bookmarks: HashMap::new(),
+                    remote_bookmarks: HashMap::new(),
+                }),
+                operation: Some(Operation {
+                    view_id: Vec::new(),
+                    parents: vec![root_op.clone()],
+                    metadata: Some(OperationMetadata {
+                        description: "branch a".to_string(),
+                        ..Default::default()
+                    }),
+                    commit_predecessors: vec![CommitPredecessors {
+                        commit_id: c1,
+                        predecessor_ids: Vec::new(),
+                    }],
+                    commit_predecessors_set: true,
+                }),
+                old_op_head_ids: vec![root_op.clone()],
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .operation_id;
+
+        let op_b = svc
+            .publish_operation(Request::new(PublishOperationRequest {
+                repo_id: repo_id.to_string(),
+                view: Some(View {
+                    head_ids: vec![c2.clone()],
+                    wc_commit_ids: HashMap::new(),
+                    local_bookmarks: HashMap::new(),
+                    remote_bookmarks: HashMap::new(),
+                }),
+                operation: Some(Operation {
+                    view_id: Vec::new(),
+                    parents: vec![root_op],
+                    metadata: Some(OperationMetadata {
+                        description: "branch b".to_string(),
+                        ..Default::default()
+                    }),
+                    commit_predecessors: vec![CommitPredecessors {
+                        commit_id: c2,
+                        predecessor_ids: Vec::new(),
+                    }],
+                    commit_predecessors_set: true,
+                }),
+                old_op_head_ids: Vec::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .operation_id;
+
+        (op_a, op_b)
+    }
+
+    let store = Arc::new(CompositeStore::in_memory());
+    let metrics = ServerMetrics::new();
+    let kill_switch =
+        ReconcileKillSwitch::try_from_repo_lists(["bypass-repo"], ["quarantine-repo"]).unwrap();
+    let svc = CommitCloudOpStoreService::with_metrics(store, metrics.clone())
+        .with_reconcile_kill_switch(kill_switch.clone());
+    let cloned = svc.clone();
+
+    let (bypass_a, bypass_b) = seed_divergent_via_service(&svc, "bypass-repo", 0x11, 0x12).await;
+    let (quar_a, quar_b) = seed_divergent_via_service(&svc, "quarantine-repo", 0x21, 0x22).await;
+    let (_norm_a, _norm_b) = seed_divergent_via_service(&svc, "normal-repo", 0x31, 0x32).await;
+
+    // Bypass repo returns client_resolution_required = true with active heads intact.
+    let bypass_resp = svc
+        .reconcile_op_heads(Request::new(ReconcileOpHeadsRequest {
+            repo_id: "bypass-repo".to_string(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(bypass_resp.client_resolution_required);
+    assert!(bypass_resp.op_head.is_empty());
+    let expected_bypass: std::collections::HashSet<Vec<u8>> =
+        std::collections::HashSet::from([bypass_a, bypass_b]);
+    assert_eq!(
+        std::collections::HashSet::from_iter(bypass_resp.current_op_head_ids),
+        expected_bypass
+    );
+
+    // Quarantined repo fails ReconcileOpHeads with FAILED_PRECONDITION, while GetOpHeads
+    // remains pure and unaffected.
+    let quar_err = svc
+        .reconcile_op_heads(Request::new(ReconcileOpHeadsRequest {
+            repo_id: "quarantine-repo".to_string(),
+        }))
+        .await
+        .expect_err("quarantined repo must fail ReconcileOpHeads");
+    assert_eq!(quar_err.code(), Code::FailedPrecondition);
+
+    let quar_heads = svc
+        .get_op_heads(Request::new(GetOpHeadsRequest {
+            repo_id: "quarantine-repo".to_string(),
+        }))
+        .await
+        .expect("GetOpHeads must remain pure and succeed on quarantined repos")
+        .into_inner()
+        .op_head_ids;
+    assert_eq!(
+        std::collections::HashSet::from_iter(quar_heads),
+        std::collections::HashSet::from([quar_a, quar_b])
+    );
+
+    // Unaffected sibling repo reconciles normally to a single merged head.
+    let normal_resp = svc
+        .reconcile_op_heads(Request::new(ReconcileOpHeadsRequest {
+            repo_id: "normal-repo".to_string(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!normal_resp.client_resolution_required);
+    assert_eq!(normal_resp.op_head.len(), cc_common::OPERATION_ID_LENGTH);
+    let normal_heads = svc
+        .get_op_heads(Request::new(GetOpHeadsRequest {
+            repo_id: "normal-repo".to_string(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .op_head_ids;
+    assert_eq!(normal_heads, vec![normal_resp.op_head]);
+
+    // Cloned service instances share runtime ReconcileKillSwitch updates immediately.
+    kill_switch
+        .set_mode(
+            "bypass-repo",
+            crate::reconcile_op_heads::ReconcileRepoMode::Quarantine,
+        )
+        .unwrap();
+    let cloned_quar_err = cloned
+        .reconcile_op_heads(Request::new(ReconcileOpHeadsRequest {
+            repo_id: "bypass-repo".to_string(),
+        }))
+        .await
+        .expect_err("cloned service must observe runtime Quarantine toggle immediately");
+    assert_eq!(cloned_quar_err.code(), Code::FailedPrecondition);
+
+    kill_switch
+        .set_mode(
+            "bypass-repo",
+            crate::reconcile_op_heads::ReconcileRepoMode::Normal,
+        )
+        .unwrap();
+    let cloned_merged = cloned
+        .reconcile_op_heads(Request::new(ReconcileOpHeadsRequest {
+            repo_id: "bypass-repo".to_string(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!cloned_merged.client_resolution_required);
+    assert_eq!(cloned_merged.op_head.len(), cc_common::OPERATION_ID_LENGTH);
+
+    let snap = metrics.snapshot();
+    assert_eq!(snap.reconcile_client_fallback_total, 1);
+    assert_eq!(snap.reconcile_op_heads_total, 3);
+}
