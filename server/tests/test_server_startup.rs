@@ -102,6 +102,7 @@ async fn test_server_bearer_auth_enforces_tokens_while_keeping_health_open() {
             file_id: vec![0u8; 20],
             offset: 0,
             max_bytes: 0,
+            path: String::new(),
         }))
         .await
         .expect_err("unauthenticated streaming ReadFile must fail");
@@ -150,6 +151,7 @@ async fn test_server_bearer_auth_enforces_tokens_while_keeping_health_open() {
     let mut write_file_req = Request::new(WriteFileRequest {
         project_id: "auth-test-proj".to_string(),
         content: b"hello bearer auth".to_vec(),
+        path: String::new(),
     });
     write_file_req
         .metadata_mut()
@@ -167,6 +169,7 @@ async fn test_server_bearer_auth_enforces_tokens_while_keeping_health_open() {
             file_id: file_id.clone(),
             offset: 0,
             max_bytes: 0,
+            path: String::new(),
         }))
         .await
         .expect_err("unauthenticated streaming ReadFile for an existing file must fail");
@@ -177,6 +180,7 @@ async fn test_server_bearer_auth_enforces_tokens_while_keeping_health_open() {
         file_id,
         offset: 0,
         max_bytes: 0,
+        path: String::new(),
     });
     read_file_req
         .metadata_mut()

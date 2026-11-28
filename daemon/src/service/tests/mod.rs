@@ -183,10 +183,17 @@ struct MockUpstreamState {
     read_tree_calls: usize,
     read_tree_page_sizes: Vec<u32>,
     read_tree_requests: Vec<(u32, String)>,
+    read_tree_paths: Vec<String>,
+    write_tree_paths: Vec<String>,
     reject_nonzero_tree_page_size: bool,
     read_file_calls: usize,
     read_file_requests: Vec<(u64, u64)>,
+    read_file_paths: Vec<String>,
+    write_file_paths: Vec<String>,
+    write_file_stream_paths: Vec<Vec<String>>,
     read_symlink_calls: usize,
+    read_symlink_paths: Vec<String>,
+    write_symlink_paths: Vec<String>,
     read_view_calls: usize,
     read_op_calls: usize,
     write_file_stream_calls: usize,
@@ -424,6 +431,7 @@ impl BackendService for MockUpstream {
         st.read_tree_page_sizes.push(req.page_size);
         st.read_tree_requests
             .push((req.page_size, req.page_token.clone()));
+        st.read_tree_paths.push(req.path.clone());
         if st.reject_nonzero_tree_page_size && req.page_size != 0 {
             return Err(Status::unimplemented(
                 "paginated ReadTree is not implemented yet",
@@ -469,6 +477,7 @@ impl BackendService for MockUpstream {
         let mut entries = req.entries;
         entries.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.write_tree_paths.push(req.path);
         for entry in &mut entries {
             if let Some(tree_value::Value::File(f)) =
                 entry.value.as_mut().and_then(|v| v.value.as_mut())
@@ -512,6 +521,7 @@ impl BackendService for MockUpstream {
             let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             st.read_file_calls += 1;
             st.read_file_requests.push((req.offset, req.max_bytes));
+            st.read_file_paths.push(req.path);
             st.files
                 .get(&req.file_id)
                 .cloned()
@@ -528,6 +538,7 @@ impl BackendService for MockUpstream {
         let req = request.into_inner();
         let file_id = git_blob_id(&req.content);
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.write_file_paths.push(req.path);
         st.files.insert(file_id.clone(), Bytes::from(req.content));
         Ok(Response::new(WriteFileResponse { file_id }))
     }
@@ -549,8 +560,11 @@ impl BackendService for MockUpstream {
         let had_upstream_header = request.metadata().get(UPSTREAM_HEADER).is_some();
         let mut stream = request.into_inner();
         let mut data = Vec::new();
+        let mut frame_paths = Vec::new();
         while let Some(chunk) = stream.next().await {
-            data.extend_from_slice(&chunk?.chunk);
+            let chunk = chunk?;
+            frame_paths.push(chunk.path);
+            data.extend_from_slice(&chunk.chunk);
         }
         let file_id = git_blob_id(&data);
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -558,6 +572,7 @@ impl BackendService for MockUpstream {
         st.last_write_file_stream_auth = auth;
         st.last_write_file_stream_timeout = timeout;
         st.last_write_file_stream_had_upstream_header = had_upstream_header;
+        st.write_file_stream_paths.push(frame_paths);
         st.files.insert(file_id.clone(), Bytes::from(data));
         Ok(Response::new(WriteFileResponse { file_id }))
     }
@@ -571,6 +586,7 @@ impl BackendService for MockUpstream {
         self.check_object_acl(&meta, &req.project_id, &req.symlink_id)?;
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         st.read_symlink_calls += 1;
+        st.read_symlink_paths.push(req.path);
         let target = st
             .symlinks
             .get(&req.symlink_id)
@@ -586,6 +602,7 @@ impl BackendService for MockUpstream {
         let req = request.into_inner();
         let symlink_id = git_blob_id(req.target.as_bytes());
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.write_symlink_paths.push(req.path);
         st.symlinks.insert(symlink_id.clone(), req.target);
         Ok(Response::new(WriteSymlinkResponse { symlink_id }))
     }

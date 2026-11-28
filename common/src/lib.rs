@@ -32,9 +32,9 @@
 //!
 //! # Cross-Process and RPC Boundaries
 //! [`FILE_STREAM_CHUNK_SIZE`] (64 KiB) defines the shared streaming chunk target for file
-//! transfers, and [`MAX_GRPC_MESSAGE_BYTES`] (64 MiB) defines the message size bound for
-//! callers configuring `.max_decoding_message_size` / `.max_encoding_message_size` on
-//! `tonic` clients and servers handling wide directory trees or multi-agent views.
+//! transfers, [`MAX_GRPC_MESSAGE_BYTES`] (64 MiB) defines the message size bound for
+//! `tonic` clients and servers, and [`validate_optional_repo_path`] enforces canonical
+//! repository-relative path rules across tree, file, and symlink RPCs.
 
 #[allow(clippy::result_large_err)]
 pub mod backend {
@@ -60,6 +60,7 @@ pub const OPERATION_ID_LENGTH: usize = 16;
 pub const VIEW_ID_LENGTH: usize = 16;
 pub const FILE_STREAM_CHUNK_SIZE: usize = 64 * 1024;
 pub const MAX_GRPC_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_REPO_PATH_BYTES: usize = 4096;
 pub const ROOT_COMMIT_ID_BYTES: [u8; COMMIT_ID_LENGTH] = [0u8; COMMIT_ID_LENGTH];
 pub const ROOT_CHANGE_ID_BYTES: [u8; CHANGE_ID_LENGTH] = [0u8; CHANGE_ID_LENGTH];
 pub const ROOT_OPERATION_ID_BYTES: [u8; OPERATION_ID_LENGTH] = [0u8; OPERATION_ID_LENGTH];
@@ -70,10 +71,136 @@ pub const EMPTY_TREE_ID_BYTES: [u8; TREE_ID_LENGTH] = [
     0xfb, 0xee, 0x49, 0x04,
 ];
 
+/// Validates an optional canonical repository-relative path carried on tree,
+/// file, and symlink RPCs.
+///
+/// Empty paths (`""`) are accepted (representing the repository root on tree
+/// RPCs or an omitted path). Non-empty paths must be at most
+/// [`MAX_REPO_PATH_BYTES`] bytes and must not contain NUL bytes (`\0`),
+/// leading or trailing `/`, empty segments (`//`), or `.` / `..` segments.
+pub fn validate_optional_repo_path(path: &str) -> Result<(), &'static str> {
+    if path.is_empty() {
+        return Ok(());
+    }
+    if path.len() > MAX_REPO_PATH_BYTES {
+        return Err("path exceeds maximum length of 4096 bytes");
+    }
+    if path.as_bytes().contains(&0) {
+        return Err("path must not contain NUL bytes");
+    }
+    if path.starts_with('/') || path.ends_with('/') {
+        return Err("path must not start or end with '/'");
+    }
+    for segment in path.split('/') {
+        if segment.is_empty() {
+            return Err("path must not contain empty segments ('//')");
+        }
+        if segment == "." || segment == ".." {
+            return Err("path must not contain '.' or '..' segments");
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use prost::Message as _;
+
+    #[test]
+    fn validate_optional_repo_path_accepts_empty_and_canonical_paths() {
+        for valid in [
+            "",
+            "a",
+            "src/lib.rs",
+            "a/.hidden",
+            "a/foo..bar",
+            "a/..hidden",
+            "a/foo.",
+            "docs/日本語.md",
+        ] {
+            assert!(
+                validate_optional_repo_path(valid).is_ok(),
+                "expected valid path {valid:?}"
+            );
+        }
+
+        let max_len = "a".repeat(MAX_REPO_PATH_BYTES);
+        assert!(validate_optional_repo_path(&max_len).is_ok());
+    }
+
+    #[test]
+    fn validate_optional_repo_path_rejects_malformed_and_oversized_paths() {
+        for invalid in [
+            "/", "/abs", "dir/", "a//b", ".", "..", "./a", "a/.", "a/./b", "../a", "a/..",
+            "a/../b", "a\0b", "\0",
+        ] {
+            assert!(
+                validate_optional_repo_path(invalid).is_err(),
+                "expected invalid path {invalid:?}"
+            );
+        }
+
+        let too_long = "a".repeat(MAX_REPO_PATH_BYTES + 1);
+        assert!(validate_optional_repo_path(&too_long).is_err());
+    }
+
+    #[test]
+    fn file_and_symlink_rpc_messages_round_trip_optional_path() {
+        let read_file = backend::ReadFileRequest {
+            project_id: "proj-1".to_string(),
+            file_id: vec![0x11; FILE_ID_LENGTH],
+            offset: 10,
+            max_bytes: 20,
+            path: "src/main.rs".to_string(),
+        };
+        assert_eq!(
+            backend::ReadFileRequest::decode(read_file.encode_to_vec().as_slice()).unwrap(),
+            read_file
+        );
+
+        let write_file = backend::WriteFileRequest {
+            project_id: "proj-1".to_string(),
+            content: b"hello".to_vec(),
+            path: "src/main.rs".to_string(),
+        };
+        assert_eq!(
+            backend::WriteFileRequest::decode(write_file.encode_to_vec().as_slice()).unwrap(),
+            write_file
+        );
+
+        let write_chunk = backend::WriteFileChunk {
+            project_id: "proj-1".to_string(),
+            chunk: b"hello".to_vec(),
+            total_size: Some(5),
+            expected_file_id: Some(vec![0x22; FILE_ID_LENGTH]),
+            path: "src/main.rs".to_string(),
+        };
+        assert_eq!(
+            backend::WriteFileChunk::decode(write_chunk.encode_to_vec().as_slice()).unwrap(),
+            write_chunk
+        );
+
+        let read_symlink = backend::ReadSymlinkRequest {
+            project_id: "proj-1".to_string(),
+            symlink_id: vec![0x33; SYMLINK_ID_LENGTH],
+            path: "docs/latest".to_string(),
+        };
+        assert_eq!(
+            backend::ReadSymlinkRequest::decode(read_symlink.encode_to_vec().as_slice()).unwrap(),
+            read_symlink
+        );
+
+        let write_symlink = backend::WriteSymlinkRequest {
+            project_id: "proj-1".to_string(),
+            target: "../v2".to_string(),
+            path: "docs/latest".to_string(),
+        };
+        assert_eq!(
+            backend::WriteSymlinkRequest::decode(write_symlink.encode_to_vec().as_slice()).unwrap(),
+            write_symlink
+        );
+    }
 
     #[test]
     #[allow(deprecated)]

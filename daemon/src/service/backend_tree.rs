@@ -37,7 +37,9 @@ use prost::Message;
 use tonic::metadata::MetadataMap;
 use tonic::{Request, Response, Status};
 
-use super::{DaemonProxy, MAX_TREE_PAGE_SIZE, backend_client, validate_identifier};
+use super::{
+    DaemonProxy, MAX_TREE_PAGE_SIZE, backend_client, validate_identifier, validate_optional_path,
+};
 use crate::cache::ObjectKind;
 
 pub(super) fn is_valid_tree_entry_name(name: &str) -> bool {
@@ -133,6 +135,7 @@ impl DaemonProxy {
         let meta = request.metadata().clone();
         let req = request.into_inner();
         let scope = self.scope_for(&meta, &req.project_id)?;
+        validate_optional_path(&req.path)?;
         if req.tree_id.as_slice() == EMPTY_TREE_ID_BYTES {
             validate_identifier(&req.project_id, "project_id")?;
             self.inner.cache.touch_activity();
@@ -409,6 +412,7 @@ impl DaemonProxy {
         let meta = request.metadata().clone();
         let req = request.into_inner();
         let scope = self.scope_for(&meta, &req.project_id)?;
+        validate_optional_path(&req.path)?;
         let cache_epoch = self.inner.cache.purge_epoch();
         let entries_for_cache =
             (req.entries.len() <= self.inner.max_cached_tree_entries).then(|| req.entries.clone());

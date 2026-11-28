@@ -1881,7 +1881,7 @@ fn test_read_file_rejects_oversized_stream_and_digest_mismatch() {
     futures::executor::block_on(async {
         // Oversized stream rejected before buffering past limit.
         let oversized_err = backend
-            .read_file_with_max_bytes(&valid_id, 15)
+            .read_file_with_max_bytes(RepoPath::root(), &valid_id, 15)
             .await
             .expect_err("file stream exceeding max_bytes must be rejected");
         assert!(
@@ -2163,4 +2163,254 @@ fn test_read_tree_verifies_canonical_git_tree_digest_and_preserves_jj_order() {
             "unexpected tree mismatch error: {mismatch_err:?}"
         );
     });
+}
+
+#[test]
+fn test_file_and_symlink_rpcs_populate_canonical_path() {
+    #[derive(Default)]
+    struct RecordedPaths {
+        read_file_paths: Vec<String>,
+        write_file_paths: Vec<String>,
+        write_file_stream_paths: Vec<Vec<String>>,
+        read_symlink_paths: Vec<String>,
+        write_symlink_paths: Vec<String>,
+    }
+
+    struct PathRecordingBackend {
+        reject_stream: AtomicBool,
+        recorded: Arc<std::sync::Mutex<RecordedPaths>>,
+        files: Arc<std::sync::Mutex<std::collections::HashMap<Vec<u8>, Vec<u8>>>>,
+        symlinks: Arc<std::sync::Mutex<std::collections::HashMap<Vec<u8>, String>>>,
+    }
+
+    #[tonic::async_trait]
+    impl BackendService for PathRecordingBackend {
+        async fn register_project(
+            &self,
+            _: Request<RegisterProjectRequest>,
+        ) -> Result<Response<RegisterProjectResponse>, Status> {
+            unimpl()
+        }
+        async fn register_repository(
+            &self,
+            _: Request<RegisterRepositoryRequest>,
+        ) -> Result<Response<RegisterRepositoryResponse>, Status> {
+            unimpl()
+        }
+        async fn delete_repository(
+            &self,
+            _: Request<cc_common::backend::DeleteRepositoryRequest>,
+        ) -> Result<Response<cc_common::backend::DeleteRepositoryResponse>, Status> {
+            unimpl()
+        }
+        async fn read_commit(
+            &self,
+            _: Request<ReadCommitRequest>,
+        ) -> Result<Response<ReadCommitResponse>, Status> {
+            unimpl()
+        }
+        async fn write_commit(
+            &self,
+            _: Request<WriteCommitRequest>,
+        ) -> Result<Response<WriteCommitResponse>, Status> {
+            unimpl()
+        }
+        async fn list_commits(
+            &self,
+            _: Request<ListCommitsRequest>,
+        ) -> Result<Response<ListCommitsResponse>, Status> {
+            unimpl()
+        }
+        async fn resolve_commit_prefix(
+            &self,
+            _: Request<ResolveCommitPrefixRequest>,
+        ) -> Result<Response<ResolveCommitPrefixResponse>, Status> {
+            unimpl()
+        }
+        async fn resolve_change_prefix(
+            &self,
+            _: Request<ResolveChangePrefixRequest>,
+        ) -> Result<Response<ResolveChangePrefixResponse>, Status> {
+            unimpl()
+        }
+        async fn read_tree(
+            &self,
+            _: Request<ReadTreeRequest>,
+        ) -> Result<Response<ReadTreeResponse>, Status> {
+            unimpl()
+        }
+        async fn write_tree(
+            &self,
+            _: Request<WriteTreeRequest>,
+        ) -> Result<Response<WriteTreeResponse>, Status> {
+            unimpl()
+        }
+        type ReadFileStream =
+            Pin<Box<dyn futures::Stream<Item = Result<ReadFileResponse, Status>> + Send + 'static>>;
+        async fn read_file(
+            &self,
+            req: Request<ReadFileRequest>,
+        ) -> Result<Response<Self::ReadFileStream>, Status> {
+            let r = req.into_inner();
+            self.recorded.lock().unwrap().read_file_paths.push(r.path);
+            let data = self
+                .files
+                .lock()
+                .unwrap()
+                .get(&r.file_id)
+                .cloned()
+                .ok_or_else(|| Status::not_found("file not found"))?;
+            Ok(Response::new(Box::pin(stream::iter(vec![Ok(
+                ReadFileResponse { chunk: data },
+            )]))))
+        }
+        async fn write_file(
+            &self,
+            req: Request<WriteFileRequest>,
+        ) -> Result<Response<WriteFileResponse>, Status> {
+            let r = req.into_inner();
+            self.recorded.lock().unwrap().write_file_paths.push(r.path);
+            let id = git_blob_sha1(&r.content);
+            self.files.lock().unwrap().insert(id.clone(), r.content);
+            Ok(Response::new(WriteFileResponse { file_id: id }))
+        }
+        async fn write_file_stream(
+            &self,
+            req: Request<Streaming<WriteFileChunk>>,
+        ) -> Result<Response<WriteFileResponse>, Status> {
+            if self.reject_stream.load(Ordering::SeqCst) {
+                return Err(Status::unimplemented("force unary fallback"));
+            }
+            let mut stream = req.into_inner();
+            let mut body = Vec::new();
+            let mut frame_paths = Vec::new();
+            while let Some(frame) = stream.next().await {
+                let chunk = frame?;
+                frame_paths.push(chunk.path);
+                body.extend_from_slice(&chunk.chunk);
+            }
+            self.recorded
+                .lock()
+                .unwrap()
+                .write_file_stream_paths
+                .push(frame_paths);
+            let id = git_blob_sha1(&body);
+            self.files.lock().unwrap().insert(id.clone(), body);
+            Ok(Response::new(WriteFileResponse { file_id: id }))
+        }
+        async fn read_symlink(
+            &self,
+            req: Request<ReadSymlinkRequest>,
+        ) -> Result<Response<ReadSymlinkResponse>, Status> {
+            let r = req.into_inner();
+            self.recorded
+                .lock()
+                .unwrap()
+                .read_symlink_paths
+                .push(r.path);
+            let target = self
+                .symlinks
+                .lock()
+                .unwrap()
+                .get(&r.symlink_id)
+                .cloned()
+                .ok_or_else(|| Status::not_found("symlink not found"))?;
+            Ok(Response::new(ReadSymlinkResponse { target }))
+        }
+        async fn write_symlink(
+            &self,
+            req: Request<WriteSymlinkRequest>,
+        ) -> Result<Response<WriteSymlinkResponse>, Status> {
+            let r = req.into_inner();
+            self.recorded
+                .lock()
+                .unwrap()
+                .write_symlink_paths
+                .push(r.path);
+            let id = git_blob_sha1(r.target.as_bytes());
+            self.symlinks.lock().unwrap().insert(id.clone(), r.target);
+            Ok(Response::new(WriteSymlinkResponse { symlink_id: id }))
+        }
+    }
+
+    let recorded = Arc::new(std::sync::Mutex::new(RecordedPaths::default()));
+    let svc = Arc::new(PathRecordingBackend {
+        reject_stream: AtomicBool::new(false),
+        recorded: Arc::clone(&recorded),
+        files: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        symlinks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+    });
+    let svc_for_server = Arc::clone(&svc);
+    let url = run_async(move || async move {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let incoming = tonic::transport::server::TcpIncoming::from_listener(listener, true, None)
+            .map_err(|e| format!("incoming error: {e}"))?;
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(BackendServiceServer::from_arc(svc_for_server))
+                .serve_with_incoming(incoming),
+        );
+        Ok(format!("http://{addr}"))
+    })
+    .unwrap();
+
+    let backend = CommitCloudBackend::from_config(CommitCloudConfig {
+        server_url: url,
+        repo_id: "repo-paths".to_string(),
+        project_id: Some("proj-paths".to_string()),
+    });
+
+    let streamed_path = RepoPath::from_internal_string("src/streamed.bin").unwrap();
+    let unary_path = RepoPath::from_internal_string("src/unary.txt").unwrap();
+    let symlink_path = RepoPath::from_internal_string("docs/latest").unwrap();
+
+    futures::executor::block_on(async {
+        // Multi-chunk streaming upload: first chunk carries path, subsequent chunks send "".
+        let big_payload = vec![b'x'; cc_common::FILE_STREAM_CHUNK_SIZE + 17];
+        let mut cursor = futures::io::Cursor::new(big_payload.clone());
+        let streamed_id = backend
+            .write_file(streamed_path, &mut cursor)
+            .await
+            .unwrap();
+
+        let mut reader = backend
+            .read_file(streamed_path, &streamed_id)
+            .await
+            .unwrap();
+        let mut read_back = Vec::new();
+        reader.read_to_end(&mut read_back).await.unwrap();
+        assert_eq!(read_back, big_payload);
+
+        // Force unary fallback on WriteFile and verify path is still sent.
+        svc.reject_stream.store(true, Ordering::SeqCst);
+        let small_payload = b"unary content".to_vec();
+        let mut small_cursor = futures::io::Cursor::new(small_payload.clone());
+        let unary_id = backend
+            .write_file(unary_path, &mut small_cursor)
+            .await
+            .unwrap();
+        let mut reader2 = backend.read_file(unary_path, &unary_id).await.unwrap();
+        let mut read_back2 = Vec::new();
+        reader2.read_to_end(&mut read_back2).await.unwrap();
+        assert_eq!(read_back2, small_payload);
+
+        // Symlink write + read populate path.
+        let sym_id = backend.write_symlink(symlink_path, "../v2").await.unwrap();
+        let target = backend.read_symlink(symlink_path, &sym_id).await.unwrap();
+        assert_eq!(target, "../v2");
+    });
+
+    let rec = recorded.lock().unwrap();
+    assert_eq!(
+        rec.write_file_stream_paths,
+        vec![vec!["src/streamed.bin".to_string(), String::new()]]
+    );
+    assert_eq!(rec.write_file_paths, vec!["src/unary.txt".to_string()]);
+    assert_eq!(
+        rec.read_file_paths,
+        vec!["src/streamed.bin".to_string(), "src/unary.txt".to_string()]
+    );
+    assert_eq!(rec.write_symlink_paths, vec!["docs/latest".to_string()]);
+    assert_eq!(rec.read_symlink_paths, vec!["docs/latest".to_string()]);
 }

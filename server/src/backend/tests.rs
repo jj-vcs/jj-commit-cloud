@@ -68,6 +68,7 @@ async fn test_write_tree_and_write_commit_reject_malformed_inputs_with_invalid_a
         .write_file(Request::new(WriteFileRequest {
             project_id: "repo-1".to_string(),
             content: b"hello\n".to_vec(),
+            path: String::new(),
         }))
         .await
         .unwrap()
@@ -337,6 +338,7 @@ async fn test_backend_validates_identifiers_digests_copy_id_and_symlink_nul() {
         .write_symlink(Request::new(WriteSymlinkRequest {
             project_id: "valid-proj".to_string(),
             target: "foo\0bar".to_string(),
+            path: String::new(),
         }))
         .await
         .unwrap_err();
@@ -352,6 +354,7 @@ async fn test_backend_validates_identifiers_digests_copy_id_and_symlink_nul() {
         .read_symlink(Request::new(ReadSymlinkRequest {
             project_id: "valid-proj".to_string(),
             symlink_id: corrupted_id,
+            path: String::new(),
         }))
         .await
         .unwrap_err();
@@ -362,6 +365,7 @@ async fn test_backend_validates_identifiers_digests_copy_id_and_symlink_nul() {
         .write_file(Request::new(WriteFileRequest {
             project_id: "valid-proj".to_string(),
             content: b"hello".to_vec(),
+            path: String::new(),
         }))
         .await
         .unwrap()
@@ -404,6 +408,7 @@ async fn test_write_and_read_symlink_roundtrip_nul_rejection_and_not_found() {
         .write_symlink(tonic::Request::new(WriteSymlinkRequest {
             project_id: "proj-sym".to_string(),
             target: target.to_string(),
+            path: String::new(),
         }))
         .await
         .unwrap()
@@ -418,6 +423,7 @@ async fn test_write_and_read_symlink_roundtrip_nul_rejection_and_not_found() {
         .read_symlink(tonic::Request::new(ReadSymlinkRequest {
             project_id: "proj-sym".to_string(),
             symlink_id,
+            path: String::new(),
         }))
         .await
         .unwrap()
@@ -429,6 +435,7 @@ async fn test_write_and_read_symlink_roundtrip_nul_rejection_and_not_found() {
         .write_symlink(tonic::Request::new(WriteSymlinkRequest {
             project_id: "proj-sym".to_string(),
             target: "bad\0target".to_string(),
+            path: String::new(),
         }))
         .await
         .unwrap_err();
@@ -439,6 +446,7 @@ async fn test_write_and_read_symlink_roundtrip_nul_rejection_and_not_found() {
         .read_symlink(tonic::Request::new(ReadSymlinkRequest {
             project_id: "proj-sym".to_string(),
             symlink_id: vec![0x99; cc_common::SYMLINK_ID_LENGTH],
+            path: String::new(),
         }))
         .await
         .unwrap_err();
@@ -455,6 +463,7 @@ async fn test_write_and_read_symlink_roundtrip_nul_rejection_and_not_found() {
         .read_symlink(tonic::Request::new(ReadSymlinkRequest {
             project_id: "proj-sym".to_string(),
             symlink_id: bad_target_id,
+            path: String::new(),
         }))
         .await
         .unwrap_err();
@@ -568,6 +577,7 @@ async fn test_read_file_empty_and_end_offset_returns_zero_frames_and_past_eof_re
         .write_file(Request::new(WriteFileRequest {
             project_id: "proj-range".to_string(),
             content: Vec::new(),
+            path: String::new(),
         }))
         .await
         .unwrap()
@@ -579,6 +589,7 @@ async fn test_read_file_empty_and_end_offset_returns_zero_frames_and_past_eof_re
             file_id: empty_id.clone(),
             offset: 0,
             max_bytes: 0,
+            path: String::new(),
         }))
         .await
         .unwrap()
@@ -593,6 +604,7 @@ async fn test_read_file_empty_and_end_offset_returns_zero_frames_and_past_eof_re
             file_id: empty_id,
             offset: 1,
             max_bytes: 0,
+            path: String::new(),
         }))
         .await
         .unwrap_err();
@@ -603,6 +615,7 @@ async fn test_read_file_empty_and_end_offset_returns_zero_frames_and_past_eof_re
         .write_file(Request::new(WriteFileRequest {
             project_id: "proj-range".to_string(),
             content: b"abcdef".to_vec(),
+            path: String::new(),
         }))
         .await
         .unwrap()
@@ -614,6 +627,7 @@ async fn test_read_file_empty_and_end_offset_returns_zero_frames_and_past_eof_re
             file_id: file_id.clone(),
             offset: 6,
             max_bytes: 10,
+            path: String::new(),
         }))
         .await
         .unwrap()
@@ -628,6 +642,7 @@ async fn test_read_file_empty_and_end_offset_returns_zero_frames_and_past_eof_re
             file_id,
             offset: 7,
             max_bytes: 0,
+            path: String::new(),
         }))
         .await
         .unwrap_err();
@@ -805,18 +820,21 @@ async fn test_write_file_stream_uploads_validation_and_empty_chunk_guards() {
                 chunk: b"hello ".to_vec(),
                 total_size: Some(full_payload.len() as u64),
                 expected_file_id: Some(expected_hash.clone()),
+                path: String::new(),
             },
             WriteFileChunk {
                 project_id: String::new(),
                 chunk: b"streaming ".to_vec(),
                 total_size: None,
                 expected_file_id: None,
+                path: String::new(),
             },
             WriteFileChunk {
                 project_id: "proj-stream".to_string(),
                 chunk: b"world!".to_vec(),
                 total_size: None,
                 expected_file_id: None,
+                path: String::new(),
             },
         ]))
         .await
@@ -840,12 +858,14 @@ async fn test_write_file_stream_uploads_validation_and_empty_chunk_guards() {
                 chunk: b"chunked-".to_vec(),
                 total_size: None,
                 expected_file_id: None,
+                path: String::new(),
             },
             WriteFileChunk {
                 project_id: String::new(),
                 chunk: b"without-size".to_vec(),
                 total_size: None,
                 expected_file_id: None,
+                path: String::new(),
             },
         ]))
         .await
@@ -861,6 +881,7 @@ async fn test_write_file_stream_uploads_validation_and_empty_chunk_guards() {
             chunk: Vec::new(),
             total_size: Some(0),
             expected_file_id: Some(empty_hash.clone()),
+            path: String::new(),
         }]))
         .await
         .unwrap()
@@ -880,6 +901,7 @@ async fn test_write_file_stream_uploads_validation_and_empty_chunk_guards() {
             chunk: b"short".to_vec(),
             total_size: Some(10),
             expected_file_id: None,
+            path: String::new(),
         }]))
         .await
         .unwrap_err();
@@ -892,12 +914,14 @@ async fn test_write_file_stream_uploads_validation_and_empty_chunk_guards() {
                 chunk: b"12345".to_vec(),
                 total_size: Some(6),
                 expected_file_id: None,
+                path: String::new(),
             },
             WriteFileChunk {
                 project_id: String::new(),
                 chunk: b"67".to_vec(),
                 total_size: None,
                 expected_file_id: None,
+                path: String::new(),
             },
         ]))
         .await
@@ -911,6 +935,7 @@ async fn test_write_file_stream_uploads_validation_and_empty_chunk_guards() {
             chunk: b"actual".to_vec(),
             total_size: Some(6),
             expected_file_id: Some(vec![0xaa; cc_common::FILE_ID_LENGTH]),
+            path: String::new(),
         }]))
         .await
         .unwrap_err();
@@ -922,6 +947,7 @@ async fn test_write_file_stream_uploads_validation_and_empty_chunk_guards() {
             chunk: b"actual".to_vec(),
             total_size: None,
             expected_file_id: Some(vec![0xaa; 4]),
+            path: String::new(),
         }]))
         .await
         .unwrap_err();
@@ -935,12 +961,14 @@ async fn test_write_file_stream_uploads_validation_and_empty_chunk_guards() {
                 chunk: b"part1".to_vec(),
                 total_size: None,
                 expected_file_id: None,
+                path: String::new(),
             },
             WriteFileChunk {
                 project_id: "other-proj".to_string(),
                 chunk: b"part2".to_vec(),
                 total_size: None,
                 expected_file_id: None,
+                path: String::new(),
             },
         ],
         vec![
@@ -949,12 +977,14 @@ async fn test_write_file_stream_uploads_validation_and_empty_chunk_guards() {
                 chunk: b"part1".to_vec(),
                 total_size: None,
                 expected_file_id: None,
+                path: String::new(),
             },
             WriteFileChunk {
                 project_id: String::new(),
                 chunk: b"part2".to_vec(),
                 total_size: Some(10),
                 expected_file_id: None,
+                path: String::new(),
             },
         ],
         vec![
@@ -963,12 +993,14 @@ async fn test_write_file_stream_uploads_validation_and_empty_chunk_guards() {
                 chunk: b"part1".to_vec(),
                 total_size: None,
                 expected_file_id: None,
+                path: String::new(),
             },
             WriteFileChunk {
                 project_id: String::new(),
                 chunk: b"part2".to_vec(),
                 total_size: None,
                 expected_file_id: Some(vec![0x11; cc_common::FILE_ID_LENGTH]),
+                path: String::new(),
             },
         ],
         vec![
@@ -977,12 +1009,14 @@ async fn test_write_file_stream_uploads_validation_and_empty_chunk_guards() {
                 chunk: b"part1".to_vec(),
                 total_size: None,
                 expected_file_id: None,
+                path: String::new(),
             },
             WriteFileChunk {
                 project_id: String::new(),
                 chunk: Vec::new(),
                 total_size: None,
                 expected_file_id: None,
+                path: String::new(),
             },
         ],
     ];
@@ -1135,6 +1169,7 @@ async fn test_write_file_stream_spill_to_disk_and_read_file_streaming_and_trunca
             chunk: slice.to_vec(),
             total_size: (idx == 0).then_some(big_len as u64),
             expected_file_id: (idx == 0).then(|| expected_big_id.clone()),
+            path: String::new(),
         });
     }
     let big_resp = client
@@ -1151,6 +1186,7 @@ async fn test_write_file_stream_spill_to_disk_and_read_file_streaming_and_trunca
             file_id: expected_big_id.clone(),
             offset: 0,
             max_bytes: 0,
+            path: String::new(),
         })
         .await
         .unwrap()
@@ -1182,6 +1218,7 @@ async fn test_write_file_stream_spill_to_disk_and_read_file_streaming_and_trunca
             chunk: slice.to_vec(),
             total_size: None,
             expected_file_id: (idx == 0).then(|| expected_unsized_id.clone()),
+            path: String::new(),
         })
         .collect();
     let unsized_resp = client
@@ -1198,6 +1235,7 @@ async fn test_write_file_stream_spill_to_disk_and_read_file_streaming_and_trunca
             file_id: expected_unsized_id.clone(),
             offset: 1000,
             max_bytes: 90_000,
+            path: String::new(),
         })
         .await
         .unwrap()
@@ -1224,6 +1262,7 @@ async fn test_write_file_stream_spill_to_disk_and_read_file_streaming_and_trunca
             file_id: expected_unsized_id,
             offset: 0,
             max_bytes: 0,
+            path: String::new(),
         })
         .await
         .unwrap_err();
@@ -1277,6 +1316,7 @@ async fn test_write_tree_utf8_order_size_bytes_and_duplicate_rejection() {
         .write_file(Request::new(WriteFileRequest {
             project_id: "proj-tree".to_string(),
             content: b"hello".to_vec(),
+            path: String::new(),
         }))
         .await
         .unwrap()
@@ -1286,6 +1326,7 @@ async fn test_write_tree_utf8_order_size_bytes_and_duplicate_rejection() {
         .write_file(Request::new(WriteFileRequest {
             project_id: "proj-tree".to_string(),
             content: b"world!".to_vec(),
+            path: String::new(),
         }))
         .await
         .unwrap()
@@ -1541,4 +1582,315 @@ async fn test_delete_repository_rpc_validation_precondition_and_metrics() {
         .unwrap()
         .into_inner();
     assert!(!repeat.existed);
+}
+
+#[tokio::test]
+async fn test_optional_path_validation_across_file_symlink_and_tree_rpcs() {
+    let svc = make_service();
+    svc.register_project(Request::new(RegisterProjectRequest {
+        project_id: Some("proj-paths".to_string()),
+        name: None,
+    }))
+    .await
+    .unwrap();
+    let (mut client, server_handle) = spawn_backend_client(svc.clone()).await;
+
+    // Empty and valid canonical paths succeed across file, symlink, and tree RPCs.
+    let file_id = svc
+        .write_file(Request::new(WriteFileRequest {
+            project_id: "proj-paths".to_string(),
+            content: b"hello".to_vec(),
+            path: String::new(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .file_id;
+    let file_id_with_path = svc
+        .write_file(Request::new(WriteFileRequest {
+            project_id: "proj-paths".to_string(),
+            content: b"hello".to_vec(),
+            path: "src/lib.rs".to_string(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .file_id;
+    assert_eq!(file_id_with_path, file_id);
+
+    for ok_path in ["", "src/lib.rs", "other/alias.rs"] {
+        let mut stream = svc
+            .read_file(Request::new(ReadFileRequest {
+                project_id: "proj-paths".to_string(),
+                file_id: file_id.clone(),
+                offset: 0,
+                max_bytes: 0,
+                path: ok_path.to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut buf = Vec::new();
+        while let Some(frame) = stream.next().await {
+            buf.extend_from_slice(&frame.unwrap().chunk);
+        }
+        assert_eq!(buf, b"hello");
+    }
+
+    // WriteFileStream accepts path on first chunk with omitted or identical path on later chunks.
+    for second_path in ["", "src/stream.rs"] {
+        let resp = client
+            .write_file_stream(tokio_stream::iter(vec![
+                WriteFileChunk {
+                    project_id: "proj-paths".to_string(),
+                    chunk: b"ab".to_vec(),
+                    total_size: Some(4),
+                    expected_file_id: None,
+                    path: "src/stream.rs".to_string(),
+                },
+                WriteFileChunk {
+                    project_id: String::new(),
+                    chunk: b"cd".to_vec(),
+                    total_size: None,
+                    expected_file_id: None,
+                    path: second_path.to_string(),
+                },
+            ]))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.file_id, try_compute_git_blob_hash(b"abcd").unwrap());
+    }
+
+    let sym_id = svc
+        .write_symlink(Request::new(WriteSymlinkRequest {
+            project_id: "proj-paths".to_string(),
+            target: "../v2".to_string(),
+            path: "docs/latest".to_string(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .symlink_id;
+    for alt_path in ["", "docs/other-link"] {
+        let sym_id_alt = svc
+            .write_symlink(Request::new(WriteSymlinkRequest {
+                project_id: "proj-paths".to_string(),
+                target: "../v2".to_string(),
+                path: alt_path.to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .symlink_id;
+        assert_eq!(sym_id_alt, sym_id);
+    }
+    for ok_path in ["", "docs/latest", "docs/other-link"] {
+        let target = svc
+            .read_symlink(Request::new(ReadSymlinkRequest {
+                project_id: "proj-paths".to_string(),
+                symlink_id: sym_id.clone(),
+                path: ok_path.to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .target;
+        assert_eq!(target, "../v2");
+    }
+
+    let tree_entries = vec![TreeEntry {
+        name: "lib.rs".to_string(),
+        value: Some(TreeValue {
+            value: Some(tree_value::Value::File(File {
+                id: file_id.clone(),
+                executable: false,
+                copy_id: Vec::new(),
+                size_bytes: None,
+            })),
+        }),
+    }];
+    let tree_id = svc
+        .write_tree(Request::new(WriteTreeRequest {
+            project_id: "proj-paths".to_string(),
+            path: "src/subdir".to_string(),
+            entries: tree_entries.clone(),
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .tree_id;
+    for alt_path in ["", "other/subdir"] {
+        let tree_id_alt = svc
+            .write_tree(Request::new(WriteTreeRequest {
+                project_id: "proj-paths".to_string(),
+                path: alt_path.to_string(),
+                entries: tree_entries.clone(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .tree_id;
+        assert_eq!(tree_id_alt, tree_id);
+    }
+    for ok_path in ["", "src/subdir", "other/subdir"] {
+        let resp = svc
+            .read_tree(Request::new(ReadTreeRequest {
+                project_id: "proj-paths".to_string(),
+                tree_id: tree_id.clone(),
+                path: ok_path.to_string(),
+                page_size: 0,
+                page_token: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.entries.len(), 1);
+    }
+
+    // Malformed and oversized paths return INVALID_ARGUMENT on all 7 RPCs.
+    let oversized = "a".repeat(cc_common::MAX_REPO_PATH_BYTES + 1);
+    for bad_path in [
+        "/abs",
+        "dir/",
+        "a//b",
+        "./a",
+        "a/../b",
+        "a\0b",
+        oversized.as_str(),
+    ] {
+        let wf_err = svc
+            .write_file(Request::new(WriteFileRequest {
+                project_id: "proj-paths".to_string(),
+                content: b"x".to_vec(),
+                path: bad_path.to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            wf_err.code(),
+            tonic::Code::InvalidArgument,
+            "write_file bad_path={bad_path:?}"
+        );
+
+        let rf_err = svc
+            .read_file(Request::new(ReadFileRequest {
+                project_id: "proj-paths".to_string(),
+                file_id: file_id.clone(),
+                offset: 0,
+                max_bytes: 0,
+                path: bad_path.to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            rf_err.code(),
+            tonic::Code::InvalidArgument,
+            "read_file bad_path={bad_path:?}"
+        );
+
+        let wfs_err = client
+            .write_file_stream(tokio_stream::iter(vec![WriteFileChunk {
+                project_id: "proj-paths".to_string(),
+                chunk: b"x".to_vec(),
+                total_size: Some(1),
+                expected_file_id: None,
+                path: bad_path.to_string(),
+            }]))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            wfs_err.code(),
+            tonic::Code::InvalidArgument,
+            "write_file_stream bad_path={bad_path:?}"
+        );
+
+        let ws_err = svc
+            .write_symlink(Request::new(WriteSymlinkRequest {
+                project_id: "proj-paths".to_string(),
+                target: "../v2".to_string(),
+                path: bad_path.to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            ws_err.code(),
+            tonic::Code::InvalidArgument,
+            "write_symlink bad_path={bad_path:?}"
+        );
+
+        let rs_err = svc
+            .read_symlink(Request::new(ReadSymlinkRequest {
+                project_id: "proj-paths".to_string(),
+                symlink_id: sym_id.clone(),
+                path: bad_path.to_string(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            rs_err.code(),
+            tonic::Code::InvalidArgument,
+            "read_symlink bad_path={bad_path:?}"
+        );
+
+        let wt_err = svc
+            .write_tree(Request::new(WriteTreeRequest {
+                project_id: "proj-paths".to_string(),
+                path: bad_path.to_string(),
+                entries: Vec::new(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            wt_err.code(),
+            tonic::Code::InvalidArgument,
+            "write_tree bad_path={bad_path:?}"
+        );
+
+        let rt_err = svc
+            .read_tree(Request::new(ReadTreeRequest {
+                project_id: "proj-paths".to_string(),
+                tree_id: tree_id.clone(),
+                path: bad_path.to_string(),
+                page_size: 0,
+                page_token: String::new(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            rt_err.code(),
+            tonic::Code::InvalidArgument,
+            "read_tree bad_path={bad_path:?}"
+        );
+    }
+
+    // WriteFileStream rejects mid-stream path changes (including "" -> non-empty).
+    for (p1, p2) in [("", "src/later.rs"), ("src/a.rs", "src/b.rs")] {
+        let err = client
+            .write_file_stream(tokio_stream::iter(vec![
+                WriteFileChunk {
+                    project_id: "proj-paths".to_string(),
+                    chunk: b"part1".to_vec(),
+                    total_size: None,
+                    expected_file_id: None,
+                    path: p1.to_string(),
+                },
+                WriteFileChunk {
+                    project_id: String::new(),
+                    chunk: b"part2".to_vec(),
+                    total_size: None,
+                    expected_file_id: None,
+                    path: p2.to_string(),
+                },
+            ]))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            tonic::Code::InvalidArgument,
+            "write_file_stream mid-stream ({p1:?}, {p2:?})"
+        );
+    }
+
+    server_handle.abort();
 }

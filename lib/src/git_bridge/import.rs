@@ -448,6 +448,7 @@ async fn upload_blobs_streaming(
                     .write_file(WriteFileRequest {
                         project_id: p_id,
                         content: data.into(),
+                        path: String::new(),
                     })
                     .await?
                     .into_inner()
@@ -473,6 +474,7 @@ async fn upload_blobs_streaming(
                         chunk: stream_data.slice(start..end).to_vec(),
                         total_size: (idx == 0).then_some(total_len as u64),
                         expected_file_id: (idx == 0).then(|| expected_oid.clone()),
+                        path: String::new(),
                     }
                 });
                 match client.write_file_stream(frames).await {
@@ -483,6 +485,7 @@ async fn upload_blobs_streaming(
                             .write_file(WriteFileRequest {
                                 project_id: p_id,
                                 content: data.into(),
+                                path: String::new(),
                             })
                             .await?
                             .into_inner()
@@ -523,6 +526,7 @@ async fn upload_symlinks(
                 .write_symlink(WriteSymlinkRequest {
                     project_id: p_id,
                     target,
+                    path: String::new(),
                 })
                 .await?
                 .into_inner();

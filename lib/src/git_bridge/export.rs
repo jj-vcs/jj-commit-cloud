@@ -384,6 +384,7 @@ async fn read_file_with_max_bytes(
             file_id: file_id.to_vec(),
             offset: 0,
             max_bytes: 0,
+            path: String::new(),
         })
         .await?
         .into_inner();
@@ -674,6 +675,7 @@ async fn export_tree_recursive_inner(
                         .read_symlink(ReadSymlinkRequest {
                             project_id: project_id.to_string(),
                             symlink_id: sym_id.clone(),
+                            path: String::new(),
                         })
                         .await?
                         .into_inner()

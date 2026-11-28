@@ -2276,6 +2276,7 @@ async fn test_import_git_rejects_non_utf8_tree_filename_before_uploads() {
                 file_id: blob_bytes,
                 offset: 0,
                 max_bytes: 0,
+                path: String::new(),
             })
             .await;
         Ok(res.err().map(|s| s.code()))

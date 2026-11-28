@@ -46,9 +46,10 @@ package commit_cloud.backend;
 // - `FAILED_PRECONDITION`: A `WriteTree` or `WriteCommit` references missing
 //   dependencies, or `DeleteRepository` supplies a `project_id` that does not
 //   match the repository's registered `project_id`.
-// - `INVALID_ARGUMENT`: Malformed identifier or digest length, hash mismatch,
-//   duplicate or invalid tree entry name, unsupported `File.copy_id`, invalid
-//   symlink target, missing payload, or invalid cursor.
+// - `INVALID_ARGUMENT`: Malformed identifier, canonical repository `path`, or
+//   digest length, hash mismatch, duplicate or invalid tree entry name,
+//   unsupported `File.copy_id`, invalid symlink target, missing payload, or
+//   invalid cursor.
 // - `OUT_OF_RANGE`: `ReadFile` byte `offset > stored file length` (`offset ==
 //   stored file length` returns an empty stream, including `offset == 0` for
 //   empty files).
@@ -407,6 +408,13 @@ message TreeEntry {
 message ReadTreeRequest {
   string project_id = 1;
   bytes tree_id = 2;
+  // Optional canonical repository-relative directory path (empty for root or
+  // when omitted) passed as advisory context such as path-aware routing or
+  // observability. Does not affect canonical content-addressed `tree_id`
+  // digests or deduplication, so callers may omit `path` or read a tree with a
+  // different canonical `path` than the one supplied on write. Must not exceed
+  // 4,096 bytes or contain NUL bytes (`\0`), leading or trailing `/`, empty
+  // segments (`//`), or `.` / `..` segments.
   string path = 3;
   // Optional page size for wide directories (`0` returns all entries in one
   // response up to the server ceiling; positive values are clamped to the
@@ -426,6 +434,13 @@ message ReadTreeResponse {
 
 message WriteTreeRequest {
   string project_id = 1;
+  // Optional canonical repository-relative directory path (empty for root or
+  // when omitted) passed as advisory context such as path-aware routing or
+  // observability. Does not affect canonical content-addressed `tree_id`
+  // digests or deduplication, so callers may omit `path` or read a tree with a
+  // different canonical `path` than the one supplied on write. Must not exceed
+  // 4,096 bytes or contain NUL bytes (`\0`), leading or trailing `/`, empty
+  // segments (`//`), or `.` / `..` segments.
   string path = 2;
   repeated TreeEntry entries = 3;
 }
@@ -442,6 +457,15 @@ message ReadFileRequest {
   uint64 offset = 3;
   // Maximum number of bytes to stream (`0` streams until EOF).
   uint64 max_bytes = 4;
+  // Optional canonical repository-relative file path (for example
+  // `src/main.rs`) passed as advisory context such as path-aware routing or
+  // observability; empty when omitted. Does not affect canonical
+  // content-addressed `file_id` digests or deduplication, so callers may omit
+  // `path` or read a file with a different canonical `path` than the one
+  // supplied on write. Must not exceed 4,096 bytes or contain NUL bytes
+  // (`\0`), leading or trailing `/`, empty segments (`//`), or `.` / `..`
+  // segments.
+  string path = 5;
 }
 
 message ReadFileResponse {
@@ -451,14 +475,26 @@ message ReadFileResponse {
 message WriteFileRequest {
   string project_id = 1;
   bytes content = 2;
+  // Optional canonical repository-relative file path (for example
+  // `src/main.rs`) passed as advisory context such as path-aware routing or
+  // observability; empty when omitted. Does not affect canonical
+  // content-addressed `file_id` digests or deduplication, so callers may omit
+  // `path` or read a file with a different canonical `path` than the one
+  // supplied on write. Must not exceed 4,096 bytes or contain NUL bytes
+  // (`\0`), leading or trailing `/`, empty segments (`//`), or `.` / `..`
+  // segments.
+  string path = 3;
 }
 
 // Client-streaming frame for `WriteFileStream`. `project_id` MUST be populated
 // on the first frame (and, if repeated on subsequent frames, MUST match the
-// first frame's `project_id`). `total_size` and `expected_file_id` MAY be set
-// only on the first frame (`INVALID_ARGUMENT` on subsequent frames). An empty
-// file MUST be sent as a single frame with `project_id` and an empty `chunk`; a
-// zero-frame stream returns `INVALID_ARGUMENT`.
+// first frame's `project_id`). `path` MAY be populated on the first frame (and,
+// if non-empty on subsequent frames, MUST match the first frame's `path`,
+// returning `INVALID_ARGUMENT` on mismatch including when the first frame
+// omitted `path`). `total_size` and `expected_file_id` MAY be set only on the
+// first frame (`INVALID_ARGUMENT` on subsequent frames). An empty file MUST be
+// sent as a single frame with `project_id` and an empty `chunk`; a zero-frame
+// stream returns `INVALID_ARGUMENT`.
 message WriteFileChunk {
   string project_id = 1;
   bytes chunk = 2;
@@ -470,6 +506,17 @@ message WriteFileChunk {
   // Verified against the server-computed `file_id` at EOF (`INVALID_ARGUMENT`
   // on wrong byte length or digest mismatch).
   optional bytes expected_file_id = 4;
+  // Optional canonical repository-relative file path (for example
+  // `src/main.rs`) passed as advisory context such as path-aware routing or
+  // observability; empty when omitted. Does not affect canonical
+  // content-addressed `file_id` digests or deduplication, so callers may omit
+  // `path` or read a file with a different canonical `path` than the one
+  // supplied on write. Carried on the first frame alongside `project_id`;
+  // optional on subsequent frames, and if non-empty on a subsequent frame MUST
+  // match the first frame's `path`. Must not exceed 4,096 bytes or contain NUL
+  // bytes (`\0`), leading or trailing `/`, empty segments (`//`), or `.` / `..`
+  // segments.
+  string path = 5;
 }
 
 message WriteFileResponse {
@@ -479,6 +526,15 @@ message WriteFileResponse {
 message ReadSymlinkRequest {
   string project_id = 1;
   bytes symlink_id = 2;
+  // Optional canonical repository-relative symlink path (for example
+  // `docs/latest`) passed as advisory context such as path-aware routing or
+  // observability; empty when omitted. Does not affect canonical
+  // content-addressed `symlink_id` digests or deduplication, so callers may
+  // omit `path` or read a symlink with a different canonical `path` than the
+  // one supplied on write. Must not exceed 4,096 bytes or contain NUL bytes
+  // (`\0`), leading or trailing `/`, empty segments (`//`), or `.` / `..`
+  // segments.
+  string path = 3;
 }
 
 message ReadSymlinkResponse {
@@ -488,6 +544,15 @@ message ReadSymlinkResponse {
 message WriteSymlinkRequest {
   string project_id = 1;
   string target = 2;
+  // Optional canonical repository-relative symlink path (for example
+  // `docs/latest`) passed as advisory context such as path-aware routing or
+  // observability; empty when omitted. Does not affect canonical
+  // content-addressed `symlink_id` digests or deduplication, so callers may
+  // omit `path` or read a symlink with a different canonical `path` than the
+  // one supplied on write. Must not exceed 4,096 bytes or contain NUL bytes
+  // (`\0`), leading or trailing `/`, empty segments (`//`), or `.` / `..`
+  // segments.
+  string path = 3;
 }
 
 message WriteSymlinkResponse {

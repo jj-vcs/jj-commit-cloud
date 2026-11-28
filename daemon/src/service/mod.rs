@@ -174,6 +174,10 @@ fn validate_identifier(id: &str, field: &str) -> Result<(), Status> {
     Ok(())
 }
 
+fn validate_optional_path(path: &str) -> Result<(), Status> {
+    cc_common::validate_optional_repo_path(path).map_err(Status::invalid_argument)
+}
+
 fn backend_client(channel: Channel) -> BackendServiceClient<Channel> {
     BackendServiceClient::new(channel)
         .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)

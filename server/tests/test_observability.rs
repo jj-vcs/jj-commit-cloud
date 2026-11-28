@@ -224,6 +224,7 @@ async fn test_observability_endpoints_live_metrics_and_prometheus_format() {
         .write_file(Request::new(WriteFileRequest {
             project_id: "obs-proj".to_string(),
             content: b"observability cached blob".to_vec(),
+            path: String::new(),
         }))
         .await
         .unwrap()
@@ -236,6 +237,7 @@ async fn test_observability_endpoints_live_metrics_and_prometheus_format() {
                 file_id: file_id.clone(),
                 offset: 0,
                 max_bytes: 0,
+                path: String::new(),
             }))
             .await
             .unwrap()
@@ -706,6 +708,7 @@ async fn test_multi_replica_delete_and_reregister_immediately_isolates_projects_
         .write_file(Request::new(WriteFileRequest {
             project_id: "repo-1".to_string(),
             content: b"replica proj-a secret".to_vec(),
+            path: String::new(),
         }))
         .await
         .unwrap()
@@ -728,6 +731,7 @@ async fn test_multi_replica_delete_and_reregister_immediately_isolates_projects_
             file_id: file_a.clone(),
             offset: 0,
             max_bytes: 0,
+            path: String::new(),
         }))
         .await
         .unwrap()
@@ -765,6 +769,7 @@ async fn test_multi_replica_delete_and_reregister_immediately_isolates_projects_
             file_id: file_a,
             offset: 0,
             max_bytes: 0,
+            path: String::new(),
         }))
         .await
         .unwrap_err();

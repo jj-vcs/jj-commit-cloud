@@ -826,6 +826,7 @@ async fn cross_scope_write_and_read_commit_or_tree_do_not_authorize_victim_share
             WriteFileRequest {
                 project_id: "proj-a".to_string(),
                 content: victim_file.clone(),
+                path: String::new(),
             },
             &url,
             auth_a,
@@ -842,6 +843,7 @@ async fn cross_scope_write_and_read_commit_or_tree_do_not_authorize_victim_share
             WriteSymlinkRequest {
                 project_id: "proj-a".to_string(),
                 target: "/secret/victim/target".to_string(),
+                path: String::new(),
             },
             &url,
             auth_a,
@@ -1052,6 +1054,7 @@ async fn cross_scope_write_and_read_commit_or_tree_do_not_authorize_victim_share
                     file_id: victim_file_id.clone(),
                     offset: 0,
                     max_bytes: 0,
+                    path: String::new(),
                 },
                 &url,
                 attacker_auth,
@@ -1086,6 +1089,7 @@ async fn cross_scope_write_and_read_commit_or_tree_do_not_authorize_victim_share
                 ReadSymlinkRequest {
                     project_id: attacker_proj.to_string(),
                     symlink_id: victim_symlink_id.clone(),
+                    path: String::new(),
                 },
                 &url,
                 attacker_auth,

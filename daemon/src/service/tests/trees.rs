@@ -44,6 +44,7 @@ async fn write_tree_sorts_utf8_and_enriches_cached_file_sizes() {
             WriteFileRequest {
                 project_id: "proj".to_string(),
                 content: file_content.clone(),
+                path: String::new(),
             },
             &url,
             None,

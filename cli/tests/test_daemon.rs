@@ -371,6 +371,7 @@ async fn test_daemon_preserves_repo_path_component_sort_order_and_isolates_unrel
         file_id: foo_rs_file.id,
         offset: 0,
         max_bytes: 0,
+        path: String::new(),
     });
     unauthorized_read
         .metadata_mut()

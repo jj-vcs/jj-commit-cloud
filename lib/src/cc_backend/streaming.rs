@@ -265,20 +265,21 @@ fn verify_git_tree_digest(tree: &Tree, expected_id: &TreeId) -> BackendResult<()
 fn write_file_chunk_stream(
     raw_bytes: bytes::Bytes,
     project_id: String,
+    path: String,
 ) -> impl futures::Stream<Item = cc_common::backend::WriteFileChunk> + Send + 'static {
     let total_len = raw_bytes.len() as u64;
     stream::unfold(
-        (raw_bytes, Some(project_id)),
-        move |(mut remaining, mut first_project_id)| async move {
-            let first_pid = first_project_id.take();
-            if first_pid.is_none() && remaining.is_empty() {
+        (raw_bytes, Some((project_id, path))),
+        move |(mut remaining, mut first_meta)| async move {
+            let first = first_meta.take();
+            if first.is_none() && remaining.is_empty() {
                 return None;
             }
             let take = remaining.len().min(cc_common::FILE_STREAM_CHUNK_SIZE);
             let chunk = remaining.split_to(take).to_vec();
-            let (chunk_project_id, total_size) = match first_pid {
-                Some(pid) => (pid, Some(total_len)),
-                None => (String::new(), None),
+            let (chunk_project_id, chunk_path, total_size) = match first {
+                Some((pid, p)) => (pid, p, Some(total_len)),
+                None => (String::new(), String::new(), None),
             };
             Some((
                 cc_common::backend::WriteFileChunk {
@@ -286,6 +287,7 @@ fn write_file_chunk_stream(
                     chunk,
                     total_size,
                     expected_file_id: None,
+                    path: chunk_path,
                 },
                 (remaining, None),
             ))
@@ -296,6 +298,7 @@ fn write_file_chunk_stream(
 impl CommitCloudBackend {
     pub(super) async fn read_file_with_max_bytes(
         &self,
+        path: &RepoPath,
         id: &FileId,
         max_bytes: usize,
     ) -> BackendResult<Vec<u8>> {
@@ -303,6 +306,7 @@ impl CommitCloudBackend {
         let project_id = self.project_id.clone();
         let file_id_bytes = id.to_bytes().to_vec();
         let file_id_hex = id.hex();
+        let path_str = path.as_internal_file_string().to_string();
 
         let content = run_on_tokio(async move {
             let mut client = crate::util::connect_backend_client(server_url).await?;
@@ -312,6 +316,7 @@ impl CommitCloudBackend {
                     file_id: file_id_bytes,
                     offset: 0,
                     max_bytes: 0,
+                    path: path_str,
                 }))
                 .await;
 
@@ -372,11 +377,11 @@ impl CommitCloudBackend {
 
     pub(super) async fn read_file_streaming(
         &self,
-        _path: &RepoPath,
+        path: &RepoPath,
         id: &FileId,
     ) -> BackendResult<Pin<Box<dyn futures::AsyncRead + Send>>> {
         let content = self
-            .read_file_with_max_bytes(id, MAX_STREAM_FILE_BYTES)
+            .read_file_with_max_bytes(path, id, MAX_STREAM_FILE_BYTES)
             .await?;
         let cursor = futures::io::Cursor::new(content);
         Ok(Box::pin(cursor) as Pin<Box<dyn futures::AsyncRead + Send>>)
@@ -384,7 +389,7 @@ impl CommitCloudBackend {
 
     pub(super) async fn write_file_streaming_with_max_bytes(
         &self,
-        _path: &RepoPath,
+        path: &RepoPath,
         contents: &mut (dyn futures::AsyncRead + Send + Unpin),
         max_bytes: usize,
     ) -> BackendResult<FileId> {
@@ -413,12 +418,17 @@ impl CommitCloudBackend {
 
         let server_url = self.server_url.clone();
         let project_id = self.project_id.clone();
+        let path_str = path.as_internal_file_string().to_string();
         let try_unary_first = self.prefer_unary_write_file.load(Ordering::Relaxed);
 
         let (file_id_bytes, switched_to_unary) = run_on_tokio(async move {
             let mut client = crate::util::connect_backend_client(server_url).await?;
             if !try_unary_first {
-                let chunk_stream = write_file_chunk_stream(raw_bytes.clone(), project_id.clone());
+                let chunk_stream = write_file_chunk_stream(
+                    raw_bytes.clone(),
+                    project_id.clone(),
+                    path_str.clone(),
+                );
                 match client
                     .write_file_stream(tonic::Request::new(chunk_stream))
                     .await
@@ -433,6 +443,7 @@ impl CommitCloudBackend {
                 .write_file(tonic::Request::new(cc_common::backend::WriteFileRequest {
                     project_id,
                     content: Vec::from(raw_bytes),
+                    path: path_str,
                 }))
                 .await?;
             Ok((res.into_inner().file_id, true))
@@ -463,13 +474,14 @@ impl CommitCloudBackend {
 
     pub(super) async fn read_symlink_verified(
         &self,
-        _path: &RepoPath,
+        path: &RepoPath,
         id: &SymlinkId,
     ) -> BackendResult<String> {
         let server_url = self.server_url.clone();
         let project_id = self.project_id.clone();
         let symlink_id_bytes = id.to_bytes().to_vec();
         let symlink_id_hex = id.hex();
+        let path_str = path.as_internal_file_string().to_string();
 
         let target = run_on_tokio(async move {
             let mut client = crate::util::connect_backend_client(server_url).await?;
@@ -478,6 +490,7 @@ impl CommitCloudBackend {
                     cc_common::backend::ReadSymlinkRequest {
                         project_id,
                         symlink_id: symlink_id_bytes,
+                        path: path_str,
                     },
                 ))
                 .await;
@@ -516,12 +529,13 @@ impl CommitCloudBackend {
 
     pub(super) async fn write_symlink_rpc(
         &self,
-        _path: &RepoPath,
+        path: &RepoPath,
         target: &str,
     ) -> BackendResult<SymlinkId> {
         let server_url = self.server_url.clone();
         let project_id = self.project_id.clone();
         let target_owned = target.to_string();
+        let path_str = path.as_internal_file_string().to_string();
 
         let symlink_id_bytes = run_on_tokio(async move {
             let mut client = crate::util::connect_backend_client(server_url).await?;
@@ -530,6 +544,7 @@ impl CommitCloudBackend {
                     cc_common::backend::WriteSymlinkRequest {
                         project_id,
                         target: target_owned,
+                        path: path_str,
                     },
                 ))
                 .await?;

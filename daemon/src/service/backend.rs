@@ -34,7 +34,7 @@ use cc_common::backend::*;
 use prost::Message;
 use tonic::{Request, Response, Status, Streaming};
 
-use super::{DaemonProxy, backend_client};
+use super::{DaemonProxy, backend_client, validate_optional_path};
 use crate::cache::ObjectKind;
 
 pub(super) fn decode_symlink_target(raw: &[u8]) -> Result<String, Status> {
@@ -348,6 +348,7 @@ impl BackendService for DaemonProxy {
         let meta = request.metadata().clone();
         let req = request.into_inner();
         let scope = self.scope_for(&meta, &req.project_id)?;
+        validate_optional_path(&req.path)?;
         let symlink_id = req.symlink_id.clone();
         let upstream = Arc::clone(&self.inner.upstream);
         let cache_for_fetch = Arc::clone(&self.inner.cache);
@@ -380,6 +381,7 @@ impl BackendService for DaemonProxy {
         let meta = request.metadata().clone();
         let req = request.into_inner();
         let scope = self.scope_for(&meta, &req.project_id)?;
+        validate_optional_path(&req.path)?;
         let cache_epoch = self.inner.cache.purge_epoch();
         let target_bytes = Bytes::from(req.target.clone().into_bytes());
         let out = self.inner.upstream.prepare_outbound(&meta, req)?;

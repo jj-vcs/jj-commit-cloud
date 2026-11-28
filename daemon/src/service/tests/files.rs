@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
+use cc_common::EMPTY_TREE_ID_BYTES;
 use cc_common::backend::backend_service_client::BackendServiceClient;
 use cc_common::backend::backend_service_server::{BackendService, BackendServiceServer};
 use cc_common::backend::*;
@@ -78,6 +79,7 @@ async fn cold_read_file_serves_fetched_bytes_that_neither_cache_tier_kept() {
             file_id: file_id.clone(),
             offset,
             max_bytes,
+            path: String::new(),
         });
         request
             .metadata_mut()
@@ -181,6 +183,7 @@ async fn write_file_stream_early_rejects_disallowed_upstream_validates_errors_an
                 chunk: b"hi".to_vec(),
                 total_size: None,
                 expected_file_id: None,
+                path: String::new(),
             }]
         )
         .await
@@ -197,6 +200,7 @@ async fn write_file_stream_early_rejects_disallowed_upstream_validates_errors_an
                 chunk: b"hi".to_vec(),
                 total_size: None,
                 expected_file_id: Some(vec![0x01; 5]),
+                path: String::new(),
             }]
         )
         .await
@@ -222,6 +226,7 @@ async fn write_file_stream_early_rejects_disallowed_upstream_validates_errors_an
                 chunk: Vec::new(),
                 total_size: Some(DEFAULT_MAX_L2_OBJECT_BYTES + 1),
                 expected_file_id: None,
+                path: String::new(),
             }]
         )
         .await
@@ -239,12 +244,14 @@ async fn write_file_stream_early_rejects_disallowed_upstream_validates_errors_an
                     chunk: b"ab".to_vec(),
                     total_size: Some(10),
                     expected_file_id: None,
+                    path: String::new(),
                 },
                 WriteFileChunk {
                     project_id: "proj".to_string(),
                     chunk: b"cd".to_vec(),
                     total_size: None,
                     expected_file_id: None,
+                    path: String::new(),
                 },
             ]
         )
@@ -263,12 +270,14 @@ async fn write_file_stream_early_rejects_disallowed_upstream_validates_errors_an
                     chunk: b"ab".to_vec(),
                     total_size: Some(2),
                     expected_file_id: None,
+                    path: String::new(),
                 },
                 WriteFileChunk {
                     project_id: "proj".to_string(),
                     chunk: b"c".to_vec(),
                     total_size: None,
                     expected_file_id: None,
+                    path: String::new(),
                 },
             ]
         )
@@ -287,12 +296,14 @@ async fn write_file_stream_early_rejects_disallowed_upstream_validates_errors_an
                     chunk: b"a".to_vec(),
                     total_size: None,
                     expected_file_id: None,
+                    path: String::new(),
                 },
                 WriteFileChunk {
                     project_id: "other-proj".to_string(),
                     chunk: b"b".to_vec(),
                     total_size: None,
                     expected_file_id: None,
+                    path: String::new(),
                 },
             ]
         )
@@ -327,12 +338,14 @@ async fn write_file_stream_early_rejects_disallowed_upstream_validates_errors_an
                 chunk: payload[..10].to_vec(),
                 total_size: Some(payload.len() as u64),
                 expected_file_id: Some(expected_id.clone()),
+                path: String::new(),
             },
             WriteFileChunk {
                 project_id: String::new(),
                 chunk: payload[10..].to_vec(),
                 total_size: None,
                 expected_file_id: None,
+                path: String::new(),
             },
         ],
     )
@@ -354,6 +367,7 @@ async fn write_file_stream_early_rejects_disallowed_upstream_validates_errors_an
                 file_id: expected_id,
                 offset: 0,
                 max_bytes: 0,
+                path: String::new(),
             },
             &upstream_url,
             None,
@@ -401,6 +415,7 @@ async fn read_file_out_of_range_and_eof_empty_stream() {
                     file_id: empty_id.clone(),
                     offset: 0,
                     max_bytes: 0,
+                    path: String::new(),
                 },
                 &url,
                 None,
@@ -422,6 +437,7 @@ async fn read_file_out_of_range_and_eof_empty_stream() {
                 file_id: empty_id,
                 offset: 1,
                 max_bytes: 0,
+                path: String::new(),
             },
             &url,
             None,
@@ -441,6 +457,7 @@ async fn read_file_out_of_range_and_eof_empty_stream() {
                 file_id: file_id.clone(),
                 offset: 7,
                 max_bytes: 0,
+                path: String::new(),
             },
             &url,
             None,
@@ -461,6 +478,7 @@ async fn read_file_out_of_range_and_eof_empty_stream() {
                 file_id: file_id.clone(),
                 offset: 0,
                 max_bytes: 0,
+                path: String::new(),
             },
             &url,
             None,
@@ -486,6 +504,7 @@ async fn read_file_out_of_range_and_eof_empty_stream() {
                 file_id: file_id.clone(),
                 offset: 7,
                 max_bytes: 0,
+                path: String::new(),
             },
             &url,
             None,
@@ -504,6 +523,7 @@ async fn read_file_out_of_range_and_eof_empty_stream() {
                 file_id,
                 offset: 6,
                 max_bytes: 10,
+                path: String::new(),
             },
             &url,
             None,
@@ -526,6 +546,7 @@ async fn read_file_out_of_range_and_eof_empty_stream() {
                 file_id: cold_eof_id,
                 offset: 6,
                 max_bytes: 10,
+                path: String::new(),
             },
             &url,
             None,
@@ -569,6 +590,7 @@ async fn read_symlink_rejects_nul_and_invalid_utf8_with_data_loss() {
             ReadSymlinkRequest {
                 project_id: "proj".to_string(),
                 symlink_id: bad_id,
+                path: String::new(),
             },
             &url,
             None,
@@ -610,6 +632,7 @@ async fn ranged_cold_read_file_forwards_exact_range_without_fetching_full_file()
                 file_id: file_id.clone(),
                 offset,
                 max_bytes,
+                path: String::new(),
             },
             &url,
             None,
@@ -838,6 +861,7 @@ async fn write_file_stream_streams_directly_to_upstream_and_spools_to_l2_without
         chunk: large_payload[..CACHE_STREAM_CHUNK_BYTES].to_vec(),
         total_size: Some(large_payload.len() as u64),
         expected_file_id: Some(expected_id.clone()),
+        path: String::new(),
     })
     .await
     .unwrap();
@@ -855,6 +879,7 @@ async fn write_file_stream_streams_directly_to_upstream_and_spools_to_l2_without
             chunk: chunk.to_vec(),
             total_size: None,
             expected_file_id: None,
+            path: String::new(),
         })
         .await
         .unwrap();
@@ -888,6 +913,7 @@ async fn write_file_stream_streams_directly_to_upstream_and_spools_to_l2_without
                 file_id: expected_id,
                 offset: MAX_L1_OBJECT_BYTES as u64,
                 max_bytes: 4096,
+                path: String::new(),
             },
             &upstream_url,
             None,
@@ -952,6 +978,7 @@ async fn write_file_stream_streams_directly_to_upstream_and_spools_to_l2_without
                 chunk: c.to_vec(),
                 total_size: (idx == 0 && include_total_size).then_some(oversized.len() as u64),
                 expected_file_id: None,
+                path: String::new(),
             })
             .collect();
         let mut req = Request::new(futures::stream::iter(frames));
@@ -1017,6 +1044,7 @@ async fn cold_full_read_file_spills_to_l2_staging_and_streams_above_l2_cap_witho
                 file_id: spilled_id.clone(),
                 offset: 0,
                 max_bytes: 0,
+                path: String::new(),
             },
             &url,
             None,
@@ -1047,6 +1075,7 @@ async fn cold_full_read_file_spills_to_l2_staging_and_streams_above_l2_cap_witho
                 file_id: spilled_id,
                 offset: MAX_L1_OBJECT_BYTES as u64,
                 max_bytes: 4096,
+                path: String::new(),
             },
             &url,
             None,
@@ -1076,6 +1105,7 @@ async fn cold_full_read_file_spills_to_l2_staging_and_streams_above_l2_cap_witho
                 file_id: above_cap_id.clone(),
                 offset: 0,
                 max_bytes: 0,
+                path: String::new(),
             },
             &url,
             None,
@@ -1160,12 +1190,14 @@ async fn write_file_stream_forwards_metadata_and_rejects_duplicate_auth_before_r
             chunk: payload[..12].to_vec(),
             total_size: Some(payload.len() as u64),
             expected_file_id: Some(expected_id.clone()),
+            path: String::new(),
         },
         WriteFileChunk {
             project_id: String::new(),
             chunk: payload[12..].to_vec(),
             total_size: None,
             expected_file_id: None,
+            path: String::new(),
         },
     ];
     let mut valid_req = Request::new(futures::stream::iter(chunks));
@@ -1208,6 +1240,7 @@ async fn write_file_stream_forwards_metadata_and_rejects_duplicate_auth_before_r
         chunk: b"denied".to_vec(),
         total_size: Some(6),
         expected_file_id: None,
+        path: String::new(),
     }]));
     wrong_auth_req
         .metadata_mut()
@@ -1389,6 +1422,7 @@ async fn write_file_stream_cancels_upstream_with_rst_stream_and_reuses_channel()
                 chunk: b"partial".to_vec(),
                 total_size: Some(4096),
                 expected_file_id: None,
+                path: String::new(),
             })
             .await
             .unwrap();
@@ -1404,6 +1438,7 @@ async fn write_file_stream_cancels_upstream_with_rst_stream_and_reuses_channel()
                 chunk: vec![0x55; 2048],
                 total_size: None,
                 expected_file_id: None,
+                path: String::new(),
             })
             .await
             .unwrap();
@@ -1433,6 +1468,7 @@ async fn write_file_stream_cancels_upstream_with_rst_stream_and_reuses_channel()
                 chunk: b"chunk-1".to_vec(),
                 total_size: None,
                 expected_file_id: None,
+                path: String::new(),
             })
             .await
             .unwrap();
@@ -1448,6 +1484,7 @@ async fn write_file_stream_cancels_upstream_with_rst_stream_and_reuses_channel()
                 chunk: b"chunk-2".to_vec(),
                 total_size: None,
                 expected_file_id: None,
+                path: String::new(),
             })
             .await
             .unwrap();
@@ -1477,6 +1514,7 @@ async fn write_file_stream_cancels_upstream_with_rst_stream_and_reuses_channel()
                 chunk: b"short".to_vec(),
                 total_size: Some(100),
                 expected_file_id: None,
+                path: String::new(),
             })
             .await
             .unwrap();
@@ -1511,6 +1549,7 @@ async fn write_file_stream_cancels_upstream_with_rst_stream_and_reuses_channel()
                 chunk: b"dropped-mid-upload".to_vec(),
                 total_size: Some(4096),
                 expected_file_id: None,
+                path: String::new(),
             })
             .await
             .unwrap();
@@ -1554,4 +1593,599 @@ async fn write_file_stream_cancels_upstream_with_rst_stream_and_reuses_channel()
 
     proxy_task.abort();
     upstream_task.abort();
+}
+
+#[tokio::test]
+async fn optional_path_forwarded_to_upstream_and_malformed_paths_rejected_before_cache() {
+    let mock = MockUpstream::default();
+    let cold_file_bytes = Bytes::from_static(b"cold-file-payload");
+    let cold_file_id = git_blob_id(&cold_file_bytes);
+    let ranged_file_bytes = Bytes::from_static(b"ranged-file-payload");
+    let ranged_file_id = git_blob_id(&ranged_file_bytes);
+    let cold_sym_target = "../targets/cold";
+    let cold_sym_id = git_blob_id(cold_sym_target.as_bytes());
+    {
+        let mut st = mock.state.lock().unwrap();
+        st.files.insert(cold_file_id.clone(), cold_file_bytes);
+        st.files.insert(ranged_file_id.clone(), ranged_file_bytes);
+        st.symlinks
+            .insert(cold_sym_id.clone(), cold_sym_target.to_string());
+    }
+
+    let upstream_url = spawn_mock_upstream(mock.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let cache = Arc::new(TwoTierCache::new(dir.path().to_path_buf(), 4 * 1024 * 1024).unwrap());
+    let proxy = DaemonProxy::new(Arc::clone(&cache), Arc::new(UpstreamPool::new(None)), None);
+
+    // Spawn daemon gRPC server so we can exercise client-streaming `WriteFileStream`.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let daemon_addr = listener.local_addr().unwrap();
+    let incoming =
+        tonic::transport::server::TcpIncoming::from_listener(listener, true, None).unwrap();
+    let proxy_for_srv = proxy.clone();
+    let srv_handle = tokio::spawn(async move {
+        let _ = tonic::transport::Server::builder()
+            .add_service(
+                cc_common::backend::backend_service_server::BackendServiceServer::new(
+                    proxy_for_srv,
+                ),
+            )
+            .serve_with_incoming(incoming)
+            .await;
+    });
+    let daemon_channel = tonic::transport::Endpoint::from_shared(format!("http://{daemon_addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut daemon_client = BackendServiceClient::new(daemon_channel);
+
+    // Valid canonical `path` values forward to upstream across writes and cold reads.
+    let unary_id = BackendService::write_file(
+        &proxy,
+        req_with_upstream(
+            WriteFileRequest {
+                project_id: "proj-path".to_string(),
+                content: b"unary-cached".to_vec(),
+                path: "src/unary.rs".to_string(),
+            },
+            &upstream_url,
+            None,
+        ),
+    )
+    .await
+    .unwrap()
+    .into_inner()
+    .file_id;
+
+    let stream_req = req_with_upstream(
+        futures::stream::iter(vec![
+            WriteFileChunk {
+                project_id: "proj-path".to_string(),
+                chunk: b"stream-".to_vec(),
+                total_size: Some(11),
+                expected_file_id: None,
+                path: "src/streamed.rs".to_string(),
+            },
+            WriteFileChunk {
+                project_id: String::new(),
+                chunk: b"body".to_vec(),
+                total_size: None,
+                expected_file_id: None,
+                path: String::new(),
+            },
+        ]),
+        &upstream_url,
+        None,
+    );
+    let streamed_id = daemon_client
+        .write_file_stream(stream_req)
+        .await
+        .unwrap()
+        .into_inner()
+        .file_id;
+    assert_eq!(streamed_id, git_blob_id(b"stream-body"));
+
+    // Repeating the matching `path` on subsequent `WriteFileStream` frames also succeeds
+    // and forwards each frame's `path` to upstream.
+    let repeated_stream_req = req_with_upstream(
+        futures::stream::iter(vec![
+            WriteFileChunk {
+                project_id: "proj-path".to_string(),
+                chunk: b"stream-".to_vec(),
+                total_size: Some(11),
+                expected_file_id: None,
+                path: "src/streamed.rs".to_string(),
+            },
+            WriteFileChunk {
+                project_id: String::new(),
+                chunk: b"body".to_vec(),
+                total_size: None,
+                expected_file_id: None,
+                path: "src/streamed.rs".to_string(),
+            },
+        ]),
+        &upstream_url,
+        None,
+    );
+    let repeated_streamed_id = daemon_client
+        .write_file_stream(repeated_stream_req)
+        .await
+        .unwrap()
+        .into_inner()
+        .file_id;
+    assert_eq!(repeated_streamed_id, streamed_id);
+
+    // Full cold read miss forwards `path`.
+    let mut full_stream = BackendService::read_file(
+        &proxy,
+        req_with_upstream(
+            ReadFileRequest {
+                project_id: "proj-path".to_string(),
+                file_id: cold_file_id.clone(),
+                offset: 0,
+                max_bytes: 0,
+                path: "src/cold.rs".to_string(),
+            },
+            &upstream_url,
+            None,
+        ),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    while let Some(frame) = full_stream.next().await {
+        frame.unwrap();
+    }
+
+    // Ranged cold read miss forwards `path`.
+    let mut ranged_stream = BackendService::read_file(
+        &proxy,
+        req_with_upstream(
+            ReadFileRequest {
+                project_id: "proj-path".to_string(),
+                file_id: ranged_file_id,
+                offset: 2,
+                max_bytes: 4,
+                path: "src/ranged.rs".to_string(),
+            },
+            &upstream_url,
+            None,
+        ),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    while let Some(frame) = ranged_stream.next().await {
+        frame.unwrap();
+    }
+
+    // Symlink write + cold read forward `path`.
+    let written_sym_id = BackendService::write_symlink(
+        &proxy,
+        req_with_upstream(
+            WriteSymlinkRequest {
+                project_id: "proj-path".to_string(),
+                target: "../v2".to_string(),
+                path: "docs/latest".to_string(),
+            },
+            &upstream_url,
+            None,
+        ),
+    )
+    .await
+    .unwrap()
+    .into_inner()
+    .symlink_id;
+
+    let cold_sym = BackendService::read_symlink(
+        &proxy,
+        req_with_upstream(
+            ReadSymlinkRequest {
+                project_id: "proj-path".to_string(),
+                symlink_id: cold_sym_id.clone(),
+                path: "docs/cold-link".to_string(),
+            },
+            &upstream_url,
+            None,
+        ),
+    )
+    .await
+    .unwrap()
+    .into_inner();
+    assert_eq!(cold_sym.target, cold_sym_target);
+
+    // Tree write + cold read forward `path`.
+    let tree_id = BackendService::write_tree(
+        &proxy,
+        req_with_upstream(
+            WriteTreeRequest {
+                project_id: "proj-path".to_string(),
+                path: "src/sub".to_string(),
+                entries: vec![TreeEntry {
+                    name: "a.rs".to_string(),
+                    value: Some(TreeValue {
+                        value: Some(tree_value::Value::File(File {
+                            id: unary_id.clone(),
+                            executable: false,
+                            copy_id: Vec::new(),
+                            size_bytes: None,
+                        })),
+                    }),
+                }],
+            },
+            &upstream_url,
+            None,
+        ),
+    )
+    .await
+    .unwrap()
+    .into_inner()
+    .tree_id;
+    // Read under a distinct project so it's a cold miss to upstream.
+    let _ = BackendService::read_tree(
+        &proxy,
+        req_with_upstream(
+            ReadTreeRequest {
+                project_id: "proj-path-2".to_string(),
+                tree_id: tree_id.clone(),
+                path: "src/sub".to_string(),
+                page_size: 0,
+                page_token: String::new(),
+            },
+            &upstream_url,
+            None,
+        ),
+    )
+    .await
+    .unwrap();
+
+    {
+        let st = mock.state.lock().unwrap();
+        assert_eq!(st.write_file_paths, vec!["src/unary.rs".to_string()]);
+        assert_eq!(
+            st.write_file_stream_paths,
+            vec![
+                vec!["src/streamed.rs".to_string(), String::new()],
+                vec!["src/streamed.rs".to_string(), "src/streamed.rs".to_string()],
+            ]
+        );
+        assert_eq!(
+            st.read_file_paths,
+            vec!["src/cold.rs".to_string(), "src/ranged.rs".to_string()]
+        );
+        assert_eq!(st.write_symlink_paths, vec!["docs/latest".to_string()]);
+        assert_eq!(st.read_symlink_paths, vec!["docs/cold-link".to_string()]);
+        assert_eq!(st.write_tree_paths, vec!["src/sub".to_string()]);
+        assert_eq!(st.read_tree_paths, vec!["src/sub".to_string()]);
+    }
+
+    // Warm cache hits do not fragment by `path`: reading cached objects with omitted
+    // or distinct canonical paths returns identical payloads with zero upstream RPCs.
+    let warm_calls_before = {
+        let st = mock.state.lock().unwrap();
+        (
+            st.read_file_calls,
+            st.read_symlink_calls,
+            st.read_tree_calls,
+            cache.stats().upstream_rpcs,
+        )
+    };
+    for warm_path in ["", "src/alias.rs"] {
+        let mut warm_stream = BackendService::read_file(
+            &proxy,
+            req_with_upstream(
+                ReadFileRequest {
+                    project_id: "proj-path".to_string(),
+                    file_id: unary_id.clone(),
+                    offset: 0,
+                    max_bytes: 0,
+                    path: warm_path.to_string(),
+                },
+                &upstream_url,
+                None,
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let mut payload = Vec::new();
+        while let Some(frame) = warm_stream.next().await {
+            payload.extend_from_slice(&frame.unwrap().chunk);
+        }
+        assert_eq!(payload, b"unary-cached");
+    }
+    for warm_path in ["", "docs/alias-link"] {
+        let warm_sym = BackendService::read_symlink(
+            &proxy,
+            req_with_upstream(
+                ReadSymlinkRequest {
+                    project_id: "proj-path".to_string(),
+                    symlink_id: written_sym_id.clone(),
+                    path: warm_path.to_string(),
+                },
+                &upstream_url,
+                None,
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(warm_sym.target, "../v2");
+    }
+    for warm_path in ["", "src/other-sub"] {
+        let warm_tree = BackendService::read_tree(
+            &proxy,
+            req_with_upstream(
+                ReadTreeRequest {
+                    project_id: "proj-path".to_string(),
+                    tree_id: tree_id.clone(),
+                    path: warm_path.to_string(),
+                    page_size: 0,
+                    page_token: String::new(),
+                },
+                &upstream_url,
+                None,
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(warm_tree.tree_id, tree_id);
+        assert_eq!(warm_tree.entries.len(), 1);
+        assert_eq!(warm_tree.entries[0].name, "a.rs");
+    }
+    let warm_calls_after = {
+        let st = mock.state.lock().unwrap();
+        (
+            st.read_file_calls,
+            st.read_symlink_calls,
+            st.read_tree_calls,
+            cache.stats().upstream_rpcs,
+        )
+    };
+    assert_eq!(warm_calls_after, warm_calls_before);
+
+    // Malformed paths return INVALID_ARGUMENT ahead of L1/L2 cache hits & short-circuits.
+    let calls_before = {
+        let st = mock.state.lock().unwrap();
+        (
+            st.read_file_calls,
+            st.read_symlink_calls,
+            st.read_tree_calls,
+            st.write_file_paths.len(),
+            st.write_symlink_paths.len(),
+            st.write_tree_paths.len(),
+            st.write_file_stream_calls,
+            cache.stats().upstream_rpcs,
+        )
+    };
+    let oversized = "a".repeat(cc_common::MAX_REPO_PATH_BYTES + 1);
+    for bad_path in [
+        "/abs",
+        "dir/",
+        "a//b",
+        "./a",
+        "a/../b",
+        "a\0b",
+        oversized.as_str(),
+    ] {
+        // `unary_id` is already cached from write-through above.
+        let rf_err = BackendService::read_file(
+            &proxy,
+            req_with_upstream(
+                ReadFileRequest {
+                    project_id: "proj-path".to_string(),
+                    file_id: unary_id.clone(),
+                    offset: 0,
+                    max_bytes: 0,
+                    path: bad_path.to_string(),
+                },
+                &upstream_url,
+                None,
+            ),
+        )
+        .await
+        .err()
+        .expect("malformed ReadFile path must fail even on cache hit");
+        assert_eq!(
+            rf_err.code(),
+            tonic::Code::InvalidArgument,
+            "bad={bad_path:?}"
+        );
+
+        // `written_sym_id` is already cached from write-through above.
+        let rs_err = BackendService::read_symlink(
+            &proxy,
+            req_with_upstream(
+                ReadSymlinkRequest {
+                    project_id: "proj-path".to_string(),
+                    symlink_id: written_sym_id.clone(),
+                    path: bad_path.to_string(),
+                },
+                &upstream_url,
+                None,
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            rs_err.code(),
+            tonic::Code::InvalidArgument,
+            "bad={bad_path:?}"
+        );
+
+        // Both empty-tree short-circuit and cached non-empty trees must reject malformed paths.
+        for bad_tree_id in [EMPTY_TREE_ID_BYTES.to_vec(), tree_id.clone()] {
+            let rt_err = BackendService::read_tree(
+                &proxy,
+                req_with_upstream(
+                    ReadTreeRequest {
+                        project_id: "proj-path".to_string(),
+                        tree_id: bad_tree_id,
+                        path: bad_path.to_string(),
+                        page_size: 0,
+                        page_token: String::new(),
+                    },
+                    &upstream_url,
+                    None,
+                ),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                rt_err.code(),
+                tonic::Code::InvalidArgument,
+                "bad={bad_path:?}"
+            );
+        }
+
+        let wf_err = BackendService::write_file(
+            &proxy,
+            req_with_upstream(
+                WriteFileRequest {
+                    project_id: "proj-path".to_string(),
+                    content: b"x".to_vec(),
+                    path: bad_path.to_string(),
+                },
+                &upstream_url,
+                None,
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            wf_err.code(),
+            tonic::Code::InvalidArgument,
+            "bad={bad_path:?}"
+        );
+
+        let ws_err = BackendService::write_symlink(
+            &proxy,
+            req_with_upstream(
+                WriteSymlinkRequest {
+                    project_id: "proj-path".to_string(),
+                    target: "target".to_string(),
+                    path: bad_path.to_string(),
+                },
+                &upstream_url,
+                None,
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            ws_err.code(),
+            tonic::Code::InvalidArgument,
+            "bad={bad_path:?}"
+        );
+
+        let wt_err = BackendService::write_tree(
+            &proxy,
+            req_with_upstream(
+                WriteTreeRequest {
+                    project_id: "proj-path".to_string(),
+                    path: bad_path.to_string(),
+                    entries: Vec::new(),
+                },
+                &upstream_url,
+                None,
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            wt_err.code(),
+            tonic::Code::InvalidArgument,
+            "bad={bad_path:?}"
+        );
+
+        let wfs_err = daemon_client
+            .write_file_stream(req_with_upstream(
+                futures::stream::iter(vec![WriteFileChunk {
+                    project_id: "proj-path".to_string(),
+                    chunk: b"x".to_vec(),
+                    total_size: Some(1),
+                    expected_file_id: None,
+                    path: bad_path.to_string(),
+                }]),
+                &upstream_url,
+                None,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            wfs_err.code(),
+            tonic::Code::InvalidArgument,
+            "bad={bad_path:?}"
+        );
+    }
+
+    // All malformed cache-hit, short-circuit, write, and frame-0 stream paths must fail
+    // locally without issuing any upstream RPCs.
+    let calls_after = {
+        let st = mock.state.lock().unwrap();
+        (
+            st.read_file_calls,
+            st.read_symlink_calls,
+            st.read_tree_calls,
+            st.write_file_paths.len(),
+            st.write_symlink_paths.len(),
+            st.write_tree_paths.len(),
+            st.write_file_stream_calls,
+            cache.stats().upstream_rpcs,
+        )
+    };
+    assert_eq!(calls_after, calls_before);
+
+    // Mid-stream `path` mismatch on `WriteFileStream` returns INVALID_ARGUMENT without
+    // writing through to cache or leaking staging temp files.
+    let scope = CacheScope::new_with_auth(&upstream_url, "proj-path", None);
+    for (p1, p2) in [("", "src/later.rs"), ("src/a.rs", "src/b.rs")] {
+        let mismatch_err = daemon_client
+            .write_file_stream(req_with_upstream(
+                futures::stream::iter(vec![
+                    WriteFileChunk {
+                        project_id: "proj-path".to_string(),
+                        chunk: b"part1".to_vec(),
+                        total_size: None,
+                        expected_file_id: None,
+                        path: p1.to_string(),
+                    },
+                    WriteFileChunk {
+                        project_id: String::new(),
+                        chunk: b"part2".to_vec(),
+                        total_size: None,
+                        expected_file_id: None,
+                        path: p2.to_string(),
+                    },
+                ]),
+                &upstream_url,
+                None,
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            mismatch_err.code(),
+            tonic::Code::InvalidArgument,
+            "expected InvalidArgument for ({p1:?}, {p2:?})"
+        );
+    }
+    assert!(
+        cache
+            .lookup_cached(&scope, ObjectKind::File, &git_blob_id(b"part1part2"))
+            .is_none()
+    );
+    assert!(
+        cache
+            .lookup_cached(&scope, ObjectKind::File, &git_blob_id(b"part1"))
+            .is_none()
+    );
+    assert_eq!(
+        std::fs::read_dir(cache.staging_dir()).unwrap().count(),
+        0,
+        "failed WriteFileStream calls must clean up staging temp files"
+    );
+
+    srv_handle.abort();
 }

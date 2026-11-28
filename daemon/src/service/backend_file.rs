@@ -34,7 +34,9 @@ use cc_common::backend::{
 use futures::{Stream, StreamExt};
 use tonic::{Request, Response, Status, Streaming};
 
-use super::{ActiveRpcGuard, DaemonProxy, STREAM_CHANNEL_CAPACITY, backend_client};
+use super::{
+    ActiveRpcGuard, DaemonProxy, STREAM_CHANNEL_CAPACITY, backend_client, validate_optional_path,
+};
 use crate::cache::{CacheRangeError, CacheScope, MAX_L1_OBJECT_BYTES, ObjectKind};
 use crate::upstream::extract_auth_header;
 
@@ -134,6 +136,7 @@ impl DaemonProxy {
         let meta = request.metadata().clone();
         let req = request.into_inner();
         let scope = self.scope_for(&meta, &req.project_id)?;
+        validate_optional_path(&req.path)?;
         let offset = req.offset;
         let max_bytes = req.max_bytes;
 
@@ -238,6 +241,7 @@ impl DaemonProxy {
         let meta = request.metadata().clone();
         let req = request.into_inner();
         let scope = self.scope_for(&meta, &req.project_id)?;
+        validate_optional_path(&req.path)?;
         let cache_epoch = self.inner.cache.purge_epoch();
         let content_len = req.content.len();
         let max_l2 = self.inner.cache.max_l2_object_bytes();
@@ -292,6 +296,7 @@ impl DaemonProxy {
                 "first WriteFileStream chunk must specify a non-empty project_id",
             ));
         }
+        validate_optional_path(&first_chunk.path)?;
         let declared_total_size = first_chunk.total_size;
         if let Some(exp_id) = &first_chunk.expected_file_id
             && exp_id.len() != cc_common::FILE_ID_LENGTH
@@ -302,6 +307,7 @@ impl DaemonProxy {
             )));
         }
         let project_id = first_chunk.project_id.clone();
+        let file_path = first_chunk.path.clone();
         let mut bytes_received = first_chunk.chunk.len() as u64;
         if let Some(total) = declared_total_size
             && bytes_received > total
@@ -375,6 +381,12 @@ impl DaemonProxy {
                 spooler.discard().await;
                 return Err(Status::invalid_argument(
                     "WriteFileStream chunk project_id does not match the first chunk",
+                ));
+            }
+            if !chunk.path.is_empty() && chunk.path != file_path {
+                spooler.discard().await;
+                return Err(Status::invalid_argument(
+                    "WriteFileStream chunk path does not match the first chunk",
                 ));
             }
             if chunk.total_size.is_some() || chunk.expected_file_id.is_some() {

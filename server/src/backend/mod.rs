@@ -109,6 +109,10 @@ pub(crate) fn validate_digest_len(
     Ok(())
 }
 
+fn validate_optional_path(path: &str) -> Result<(), tonic::Status> {
+    cc_common::validate_optional_repo_path(path).map_err(tonic::Status::invalid_argument)
+}
+
 #[derive(Clone)]
 pub struct CommitCloudBackendService {
     store: Arc<CompositeStore>,
@@ -523,6 +527,7 @@ impl BackendService for CommitCloudBackendService {
         let req = request.into_inner();
         validate_identifier(&req.project_id, "project_id")?;
         validate_digest_len(&req.tree_id, cc_common::TREE_ID_LENGTH, "tree_id")?;
+        validate_optional_path(&req.path)?;
         let (entries, next_page_token) = self
             .store
             .get_tree_page(
@@ -545,6 +550,7 @@ impl BackendService for CommitCloudBackendService {
     ) -> Result<tonic::Response<WriteTreeResponse>, tonic::Status> {
         let req = request.into_inner();
         validate_identifier(&req.project_id, "project_id")?;
+        validate_optional_path(&req.path)?;
         let tree_id =
             compute_git_tree_hash(&req.entries).map_err(tonic::Status::invalid_argument)?;
         self.store
@@ -563,6 +569,7 @@ impl BackendService for CommitCloudBackendService {
         let req = request.into_inner();
         validate_identifier(&req.project_id, "project_id")?;
         validate_digest_len(&req.file_id, cc_common::FILE_ID_LENGTH, "file_id")?;
+        validate_optional_path(&req.path)?;
         let max_bytes = (req.max_bytes > 0).then_some(req.max_bytes);
         let mut chunk_rx = self
             .store
@@ -595,6 +602,7 @@ impl BackendService for CommitCloudBackendService {
     ) -> Result<tonic::Response<WriteFileResponse>, tonic::Status> {
         let req = request.into_inner();
         validate_identifier(&req.project_id, "project_id")?;
+        validate_optional_path(&req.path)?;
         let file_id =
             try_compute_git_blob_hash(&req.content).map_err(tonic::Status::invalid_argument)?;
         self.store
@@ -610,6 +618,7 @@ impl BackendService for CommitCloudBackendService {
         const MAX_STREAM_FILE_BYTES: u64 = 512 * 1024 * 1024;
         let mut stream = request.into_inner();
         let mut project_id: Option<String> = None;
+        let mut file_path = String::new();
         let mut declared_total_size: Option<u64> = None;
         let mut expected_file_id: Option<Vec<u8>> = None;
         let mut streaming_hasher: Option<gix::hash::Hasher> = None;
@@ -624,6 +633,7 @@ impl BackendService for CommitCloudBackendService {
             match &project_id {
                 None => {
                     validate_identifier(&frame.project_id, "project_id")?;
+                    validate_optional_path(&frame.path)?;
                     if let Some(total) = frame.total_size {
                         if total > MAX_STREAM_FILE_BYTES {
                             return Err(tonic::Status::resource_exhausted(format!(
@@ -649,6 +659,7 @@ impl BackendService for CommitCloudBackendService {
                         .resolve_project_namespace(&frame.project_id, "writing files")
                         .await?;
                     project_id = Some(frame.project_id);
+                    file_path = frame.path;
                     if declared_total_size
                         .is_some_and(|total| total > self.write_stream_spill_threshold as u64)
                     {
@@ -660,6 +671,11 @@ impl BackendService for CommitCloudBackendService {
                     if !frame.project_id.is_empty() && &frame.project_id != expected {
                         return Err(tonic::Status::invalid_argument(
                             "WriteFileChunk project_id changed mid-stream",
+                        ));
+                    }
+                    if !frame.path.is_empty() && frame.path != file_path {
+                        return Err(tonic::Status::invalid_argument(
+                            "WriteFileChunk path changed mid-stream",
                         ));
                     }
                     if frame.total_size.is_some() || frame.expected_file_id.is_some() {
@@ -822,6 +838,7 @@ impl BackendService for CommitCloudBackendService {
         let req = request.into_inner();
         validate_identifier(&req.project_id, "project_id")?;
         validate_digest_len(&req.symlink_id, cc_common::SYMLINK_ID_LENGTH, "symlink_id")?;
+        validate_optional_path(&req.path)?;
         let target = self
             .store
             .get_symlink(&req.project_id, &req.symlink_id)
@@ -835,6 +852,7 @@ impl BackendService for CommitCloudBackendService {
     ) -> Result<tonic::Response<WriteSymlinkResponse>, tonic::Status> {
         let req = request.into_inner();
         validate_identifier(&req.project_id, "project_id")?;
+        validate_optional_path(&req.path)?;
         if req.target.as_bytes().contains(&0) {
             return Err(tonic::Status::invalid_argument(
                 "symlink target must not contain NUL bytes",
