@@ -12,111 +12,281 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use clap::Parser;
-use std::fs;
+//! CLI entry point and process lifecycle wrapper for the `jj-cc-daemon` binary.
+//!
+//! # Authority and Crash-Safety Ordering
+//! Empty or whitespace-only path environment variables fall back to per-user defaults before
+//! resolving `state_dir`, `socket_path`, and `cache_dir`. Legacy invocations passing `--socket`
+//! without `--state-dir` or `--listen` disable discovery files so ad-hoc test or per-workspace
+//! sockets never acquire or clobber the user's primary `state_dir` lock, `daemon.json`, or
+//! `daemon.stats.json`.
+//!
+//! # Concurrency and Merge Invariants
+//! All concurrency, singleflight, and state-directory lock enforcement live in
+//! [`jj_commit_cloud_daemon::run_daemon`]; this binary forwards `SIGINT`/`SIGTERM` into a
+//! single graceful shutdown signal.
+//!
+//! # Cross-Process and RPC Boundaries
+//! Accepts `--upstream` (legacy `--server`), `--allow-upstream`, `--socket`, `--listen`, and
+//! `--idle-timeout-secs` (legacy `--idle-timeout`) via CLI flags or `JJ_CC_*` environment vars.
+
+use std::net::SocketAddr;
 use std::path::PathBuf;
-use tokio::net::UnixListener;
-use tokio_stream::wrappers::UnixListenerStream;
-use tonic::transport::Server;
-use tracing::info;
 
-mod connection;
-mod proxy_backend;
-mod proxy_op_store;
-mod proxy_workspace;
+use clap::Parser;
+use clap::builder::{OsStringValueParser, TypedValueParser as _};
+use jj_commit_cloud_daemon::{
+    DaemonConfig, default_daemon_cache_dir, default_daemon_state_dir, run_daemon,
+};
 
-use connection::RemoteConnectionManager;
-use proxy_backend::DaemonBackendProxy;
-use proxy_op_store::DaemonOpStoreProxy;
-use proxy_workspace::DaemonWorkspaceProxy;
-
-use cc_common::backend::backend_service_server::BackendServiceServer;
-use cc_common::op_store::op_store_service_server::OpStoreServiceServer;
-use cc_common::workspace::workspace_service_server::WorkspaceServiceServer;
+fn permissive_path_parser() -> impl clap::builder::TypedValueParser<Value = PathBuf> {
+    OsStringValueParser::new().map(PathBuf::from)
+}
 
 #[derive(Parser, Debug)]
-#[command(name = "jj-cc-daemon", about = "Commit Cloud Local Daemon")]
+#[command(
+    name = "jj-cc-daemon",
+    about = "Local two-tier caching gRPC proxy daemon for jj-commit-cloud"
+)]
 struct Args {
-    /// Remote Commit Cloud server address (e.g. http://127.0.0.1:8080)
-    #[arg(long, default_value = "http://127.0.0.1:8080")]
-    server: String,
+    /// Directory storing runtime discovery metadata (`daemon.json` and `daemon.stats.json`)
+    #[arg(long, env = "JJ_CC_DAEMON_DIR", value_parser = permissive_path_parser())]
+    state_dir: Option<PathBuf>,
 
-    /// Unix domain socket path for local IPC
-    #[arg(long)]
-    socket: PathBuf,
+    /// Unix domain socket path on Linux and macOS
+    #[arg(long, env = "JJ_CC_DAEMON_SOCKET", value_parser = permissive_path_parser())]
+    socket: Option<PathBuf>,
 
-    /// Optional idle timeout in seconds before daemon exits
-    #[arg(long)]
-    idle_timeout: Option<u64>,
+    /// Optional loopback TCP bind address (for example `127.0.0.1:0` or `127.0.0.1:50055`);
+    /// TCP clients must send the secret recorded in `daemon.json`
+    #[arg(long, env = "JJ_CC_DAEMON_LISTEN")]
+    listen: Option<SocketAddr>,
+
+    /// Local L2 content-addressed disk cache directory
+    #[arg(long, env = "JJ_CC_CACHE_DIR", value_parser = permissive_path_parser())]
+    cache_dir: Option<PathBuf>,
+
+    /// Optional default upstream `jj-cc-server` URL when callers omit `x-jj-cc-upstream`
+    #[arg(long, alias = "server", env = "JJ_CC_UPSTREAM")]
+    upstream: Option<String>,
+
+    /// Optional allowlist of permitted upstream `jj-cc-server` origins (comma-separated or
+    /// repeatable; `--upstream` is automatically included when set)
+    #[arg(
+        long = "allow-upstream",
+        env = "JJ_CC_DAEMON_ALLOW_UPSTREAM",
+        value_delimiter = ','
+    )]
+    allow_upstreams: Vec<String>,
+
+    /// Maximum L1 in-memory object cache capacity in MiB
+    #[arg(long, default_value_t = 256, env = "JJ_CC_DAEMON_MEMORY_MB")]
+    memory_cache_mb: usize,
+
+    /// Idle shutdown timeout in seconds (`0` disables automatic idle exit)
+    #[arg(
+        long,
+        alias = "idle-timeout",
+        default_value_t = 1800,
+        env = "JJ_CC_DAEMON_IDLE_SECS"
+    )]
+    idle_timeout_secs: u64,
 }
 
-struct SocketGuard {
-    path: PathBuf,
-}
-
-impl SocketGuard {
-    fn new(path: PathBuf) -> Self {
-        Self { path }
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("SIGTERM signal handler should register");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 
-impl Drop for SocketGuard {
-    fn drop(&mut self) {
-        if self.path.exists() {
-            let _ = fs::remove_file(&self.path);
-        }
+fn non_empty_path(path: Option<PathBuf>) -> Option<PathBuf> {
+    path.filter(|p| {
+        p.to_str()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(!p.as_os_str().is_empty())
+    })
+}
+
+fn non_empty_string(val: Option<String>) -> Option<String> {
+    val.and_then(|s| {
+        let trimmed = s.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    })
+}
+
+fn build_config(args: Args) -> DaemonConfig {
+    let explicit_state_dir = non_empty_path(args.state_dir);
+    let explicit_socket = non_empty_path(args.socket);
+    let cache_dir = non_empty_path(args.cache_dir).unwrap_or_else(default_daemon_cache_dir);
+    let listen_addr = if cfg!(unix) {
+        args.listen
+    } else {
+        Some(
+            args.listen
+                .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0))),
+        )
+    };
+
+    // Legacy per-socket invocations (`--socket` without `--state-dir` and without `--listen`)
+    // skip discovery files so ad-hoc daemons never collide with or clobber the user's primary
+    // `daemon.json`, `daemon.stats.json`, or `daemon.instance.lock`.
+    let write_discovery_files =
+        explicit_state_dir.is_some() || explicit_socket.is_none() || listen_addr.is_some();
+    let state_dir = if write_discovery_files {
+        explicit_state_dir.unwrap_or_else(default_daemon_state_dir)
+    } else {
+        PathBuf::new()
+    };
+    let socket_path = if cfg!(unix) {
+        Some(explicit_socket.unwrap_or_else(|| state_dir.join("daemon.sock")))
+    } else {
+        explicit_socket
+    };
+
+    DaemonConfig {
+        state_dir,
+        socket_path,
+        listen_addr,
+        cache_dir,
+        default_upstream: non_empty_string(args.upstream),
+        allowed_upstreams: args.allow_upstreams,
+        memory_cache_mb: args.memory_cache_mb,
+        idle_timeout_secs: args.idle_timeout_secs,
+        write_discovery_files,
     }
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
 
-    let args = Args::parse();
+    let config = build_config(Args::parse());
+    run_daemon(config, shutdown_signal()).await
+}
 
-    if let Some(parent) = args.socket.parent() {
-        fs::create_dir_all(parent)?;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_accepts_legacy_server_and_idle_timeout_aliases() {
+        let legacy = Args::try_parse_from([
+            "jj-cc-daemon",
+            "--server",
+            "http://127.0.0.1:8080",
+            "--socket",
+            "/tmp/test.sock",
+            "--idle-timeout",
+            "45",
+        ])
+        .expect("legacy flags should parse");
+        assert_eq!(legacy.upstream.as_deref(), Some("http://127.0.0.1:8080"));
+        assert_eq!(legacy.socket, Some(PathBuf::from("/tmp/test.sock")));
+        assert_eq!(legacy.idle_timeout_secs, 45);
+
+        let modern = Args::try_parse_from([
+            "jj-cc-daemon",
+            "--upstream",
+            "http://127.0.0.1:9090",
+            "--idle-timeout-secs",
+            "0",
+        ])
+        .expect("modern flags should parse");
+        assert_eq!(modern.upstream.as_deref(), Some("http://127.0.0.1:9090"));
+        assert_eq!(modern.idle_timeout_secs, 0);
     }
 
-    if args.socket.exists() {
-        info!(
-            "Removing existing stale socket file at '{}'",
-            args.socket.display()
+    #[test]
+    fn build_config_filters_empty_paths_and_isolates_explicit_socket_mode() {
+        let blank_args = Args::try_parse_from([
+            "jj-cc-daemon",
+            "--state-dir",
+            "   ",
+            "--socket",
+            "",
+            "--cache-dir",
+            "\t",
+            "--upstream",
+            "  ",
+        ])
+        .expect("blank path arguments should parse");
+        let blank_cfg = build_config(blank_args);
+        assert!(blank_cfg.write_discovery_files);
+        assert_eq!(blank_cfg.state_dir, default_daemon_state_dir());
+        assert_eq!(blank_cfg.cache_dir, default_daemon_cache_dir());
+        assert_eq!(blank_cfg.default_upstream, None);
+        #[cfg(unix)]
+        assert_eq!(
+            blank_cfg.socket_path,
+            Some(default_daemon_state_dir().join("daemon.sock"))
         );
-        let _ = fs::remove_file(&args.socket);
+
+        let legacy_socket_args = Args::try_parse_from([
+            "jj-cc-daemon",
+            "--state-dir",
+            "",
+            "--socket",
+            "/tmp/adhoc.sock",
+        ])
+        .expect("explicit socket args should parse");
+        let legacy_cfg = build_config(legacy_socket_args);
+        #[cfg(unix)]
+        {
+            assert!(
+                !legacy_cfg.write_discovery_files,
+                "explicit --socket without --state-dir or --listen must skip discovery files"
+            );
+            assert!(legacy_cfg.state_dir.as_os_str().is_empty());
+            assert_eq!(
+                legacy_cfg.socket_path,
+                Some(PathBuf::from("/tmp/adhoc.sock"))
+            );
+        }
+
+        let explicit_both_args = Args::try_parse_from([
+            "jj-cc-daemon",
+            "--state-dir",
+            "/tmp/custom-state",
+            "--socket",
+            "/tmp/adhoc.sock",
+        ])
+        .expect("explicit state-dir + socket args should parse");
+        let explicit_both = build_config(explicit_both_args);
+        assert!(explicit_both.write_discovery_files);
+        assert_eq!(explicit_both.state_dir, PathBuf::from("/tmp/custom-state"));
+        assert_eq!(
+            explicit_both.socket_path,
+            Some(PathBuf::from("/tmp/adhoc.sock"))
+        );
+
+        let socket_with_tcp_args = Args::try_parse_from([
+            "jj-cc-daemon",
+            "--socket",
+            "/tmp/adhoc.sock",
+            "--listen",
+            "127.0.0.1:0",
+        ])
+        .expect("socket + listen args should parse");
+        let socket_with_tcp = build_config(socket_with_tcp_args);
+        assert!(
+            socket_with_tcp.write_discovery_files,
+            "TCP listener needs daemon.json to publish its secret"
+        );
     }
-
-    let _socket_guard = SocketGuard::new(args.socket.clone());
-
-    let listener = UnixListener::bind(&args.socket)?;
-    info!(
-        "Commit Cloud Daemon listening on Unix socket '{}', proxying to '{}'",
-        args.socket.display(),
-        args.server
-    );
-
-    let stream = UnixListenerStream::new(listener);
-
-    let conn_manager = RemoteConnectionManager::new(args.server);
-
-    let backend_proxy = DaemonBackendProxy::new(conn_manager.clone());
-    let op_store_proxy = DaemonOpStoreProxy::new(conn_manager.clone());
-    let workspace_proxy = DaemonWorkspaceProxy::new(conn_manager);
-
-    let res = Server::builder()
-        .add_service(BackendServiceServer::new(backend_proxy))
-        .add_service(OpStoreServiceServer::new(op_store_proxy))
-        .add_service(WorkspaceServiceServer::new(workspace_proxy))
-        .serve_with_incoming_shutdown(stream, async {
-            let _ = tokio::signal::ctrl_c().await;
-            info!("Shutting down Commit Cloud Daemon...");
-        })
-        .await;
-
-    if let Err(e) = res {
-        eprintln!("Daemon server error: {e}");
-        return Err(e.into());
-    }
-
-    Ok(())
 }
