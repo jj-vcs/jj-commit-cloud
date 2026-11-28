@@ -19,7 +19,6 @@ async fn test_log_snapshots_working_copy() {
     let workspace = testutils::TestWorkspace::init().await;
     let repo_path = workspace.repo_path();
 
-    // Create a file in the working copy
     fs::write(repo_path.join("hello.txt"), "hello commit cloud!\n").unwrap();
 
     workspace
@@ -28,7 +27,6 @@ async fn test_log_snapshots_working_copy() {
         .assert()
         .success();
 
-    // Run jj log with -T description to only print the commit description and verify string match to the set description above
     workspace
         .jj_cmd()
         .args(["log", "--no-graph", "-r", "@", "-T", "description"])

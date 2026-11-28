@@ -28,6 +28,7 @@ use prost::Message as _;
 use tokio_postgres::error::SqlState;
 
 use super::codec::{decode_blob_row, map_pg_err};
+use super::pool::run_pg_bounded;
 use super::{PostgresMetadataStore, TREE_ENTRY_BATCH_SIZE, UNNEST_BATCH_SIZE};
 use crate::store::{BlobRecord, StoreError, StoreResult};
 
@@ -37,26 +38,43 @@ impl PostgresMetadataStore {
         project_id: &str,
         tree_id: &[u8],
     ) -> StoreResult<Option<Vec<TreeEntry>>> {
-        let client = self.get_client().await?;
-        let exists = client
-            .query_opt(
+        let mut conn = self.checkout_guarded_client().await?;
+        conn.arm_for_query("PostgreSQL read")?;
+        let exists_res = run_pg_bounded(
+            "PostgreSQL read",
+            conn.client().query_opt(
                 "SELECT 1 FROM trees WHERE project_id = $1 AND tree_id = $2 AND ready = TRUE",
                 &[&project_id, &tree_id],
-            )
-            .await
-            .map_err(map_pg_err)?;
+            ),
+        )
+        .await?;
+        let exists = match exists_res {
+            Ok(row) => {
+                conn.disarm_cancel_on_drop();
+                row
+            }
+            Err(err) => {
+                conn.mark_clean_if_db_error(&err);
+                return Err(map_pg_err(err));
+            }
+        };
         if exists.is_none() {
+            conn.mark_clean();
             return Ok(None);
         }
-        let rows = client
-            .query(
+        conn.arm_for_query("PostgreSQL read")?;
+        let res = run_pg_bounded(
+            "PostgreSQL read",
+            conn.client().query(
                 "SELECT proto_bytes FROM tree_entries
                  WHERE project_id = $1 AND tree_id = $2
                  ORDER BY name COLLATE \"C\" ASC",
                 &[&project_id, &tree_id],
-            )
-            .await
-            .map_err(map_pg_err)?;
+            ),
+        )
+        .await?;
+        conn.mark_clean_if_healthy(&res);
+        let rows = res.map_err(map_pg_err)?;
         let mut entries = Vec::with_capacity(rows.len());
         for row in rows {
             let bytes: Vec<u8> = row.get(0);
@@ -77,41 +95,63 @@ impl PostgresMetadataStore {
         after_name: Option<&str>,
         limit: usize,
     ) -> StoreResult<Option<Vec<TreeEntry>>> {
-        let client = self.get_client().await?;
-        let exists = client
-            .query_opt(
+        let mut conn = self.checkout_guarded_client().await?;
+        conn.arm_for_query("PostgreSQL read")?;
+        let exists_res = run_pg_bounded(
+            "PostgreSQL read",
+            conn.client().query_opt(
                 "SELECT 1 FROM trees WHERE project_id = $1 AND tree_id = $2 AND ready = TRUE",
                 &[&project_id, &tree_id],
-            )
-            .await
-            .map_err(map_pg_err)?;
+            ),
+        )
+        .await?;
+        let exists = match exists_res {
+            Ok(row) => {
+                conn.disarm_cancel_on_drop();
+                row
+            }
+            Err(err) => {
+                conn.mark_clean_if_db_error(&err);
+                return Err(map_pg_err(err));
+            }
+        };
         if exists.is_none() {
+            conn.mark_clean();
             return Ok(None);
         }
 
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
-        let rows = match after_name.filter(|s| !s.is_empty()) {
-            Some(after) => client
-                .query(
-                    "SELECT proto_bytes FROM tree_entries
-                     WHERE project_id = $1 AND tree_id = $2 AND name COLLATE \"C\" > $3 COLLATE \"C\"
-                     ORDER BY name COLLATE \"C\" ASC
-                     LIMIT $4",
-                    &[&project_id, &tree_id, &after, &limit_i64],
+        conn.arm_for_query("PostgreSQL read")?;
+        let res = match after_name.filter(|s| !s.is_empty()) {
+            Some(after) => {
+                run_pg_bounded(
+                    "PostgreSQL read",
+                    conn.client().query(
+                        "SELECT proto_bytes FROM tree_entries
+                         WHERE project_id = $1 AND tree_id = $2 AND name COLLATE \"C\" > $3 COLLATE \"C\"
+                         ORDER BY name COLLATE \"C\" ASC
+                         LIMIT $4",
+                        &[&project_id, &tree_id, &after, &limit_i64],
+                    ),
                 )
-                .await
-                .map_err(map_pg_err)?,
-            None => client
-                .query(
-                    "SELECT proto_bytes FROM tree_entries
-                     WHERE project_id = $1 AND tree_id = $2
-                     ORDER BY name COLLATE \"C\" ASC
-                     LIMIT $3",
-                    &[&project_id, &tree_id, &limit_i64],
+                .await?
+            }
+            None => {
+                run_pg_bounded(
+                    "PostgreSQL read",
+                    conn.client().query(
+                        "SELECT proto_bytes FROM tree_entries
+                         WHERE project_id = $1 AND tree_id = $2
+                         ORDER BY name COLLATE \"C\" ASC
+                         LIMIT $3",
+                        &[&project_id, &tree_id, &limit_i64],
+                    ),
                 )
-                .await
-                .map_err(map_pg_err)?,
+                .await?
+            }
         };
+        conn.mark_clean_if_healthy(&res);
+        let rows = res.map_err(map_pg_err)?;
         let mut entries = Vec::with_capacity(rows.len());
         for row in rows {
             let bytes: Vec<u8> = row.get(0);
@@ -132,18 +172,23 @@ impl PostgresMetadataStore {
         entries: &[TreeEntry],
     ) -> StoreResult<()> {
         // Fast path: trees are content-addressed and immutable once ready.
-        {
-            let client = self.get_client().await?;
-            let ready_row = client
-                .query_opt(
+        let already_ready = {
+            let mut conn = self.checkout_guarded_client().await?;
+            conn.arm_for_query("PostgreSQL read")?;
+            let res = run_pg_bounded(
+                "PostgreSQL read",
+                conn.client().query_opt(
                     "SELECT ready FROM trees WHERE project_id = $1 AND tree_id = $2",
                     &[&project_id, &tree_id],
-                )
-                .await
-                .map_err(map_pg_err)?;
-            if ready_row.is_some_and(|r| r.get::<_, bool>(0)) {
-                return Ok(());
-            }
+                ),
+            )
+            .await?;
+            conn.mark_clean_if_healthy(&res);
+            let ready_row = res.map_err(map_pg_err)?;
+            ready_row.is_some_and(|r| r.get::<_, bool>(0))
+        };
+        if already_ready {
+            return Ok(());
         }
 
         let project_id = project_id.to_string();
@@ -221,21 +266,34 @@ impl PostgresMetadataStore {
         if tree_ids.is_empty() {
             return Ok(HashSet::new());
         }
-        let client = self.get_client().await?;
+        let mut conn = self.checkout_guarded_client().await?;
         let mut found = HashSet::with_capacity(tree_ids.len());
         for chunk in tree_ids.chunks(UNNEST_BATCH_SIZE) {
-            let rows = client
-                .query(
+            conn.arm_for_query("PostgreSQL read")?;
+            let res = run_pg_bounded(
+                "PostgreSQL read",
+                conn.client().query(
                     "SELECT tree_id FROM trees
                      WHERE project_id = $1 AND ready = TRUE AND tree_id = ANY($2)",
                     &[&project_id, &chunk],
-                )
-                .await
-                .map_err(map_pg_err)?;
+                ),
+            )
+            .await?;
+            let rows = match res {
+                Ok(rows) => {
+                    conn.disarm_cancel_on_drop();
+                    rows
+                }
+                Err(err) => {
+                    conn.mark_clean_if_db_error(&err);
+                    return Err(map_pg_err(err));
+                }
+            };
             for row in rows {
                 found.insert(row.get::<_, Vec<u8>>(0));
             }
         }
+        conn.mark_clean();
         Ok(found)
     }
 
@@ -244,14 +302,18 @@ impl PostgresMetadataStore {
         project_id: &str,
         symlink_id: &[u8],
     ) -> StoreResult<Option<String>> {
-        let client = self.get_client().await?;
-        let row = client
-            .query_opt(
+        let mut conn = self.checkout_guarded_client().await?;
+        conn.arm_for_query("PostgreSQL read")?;
+        let res = run_pg_bounded(
+            "PostgreSQL read",
+            conn.client().query_opt(
                 "SELECT target FROM symlinks WHERE project_id = $1 AND symlink_id = $2",
                 &[&project_id, &symlink_id],
-            )
-            .await
-            .map_err(map_pg_err)?;
+            ),
+        )
+        .await?;
+        conn.mark_clean_if_healthy(&res);
+        let row = res.map_err(map_pg_err)?;
         Ok(row.map(|r| r.get(0)))
     }
 
@@ -266,16 +328,20 @@ impl PostgresMetadataStore {
                 "symlink target must not contain NUL bytes".to_string(),
             ));
         }
-        let client = self.get_client().await?;
-        if let Err(err) = client
-            .execute(
+        let mut conn = self.checkout_guarded_client().await?;
+        conn.arm_for_query("PostgreSQL write")?;
+        let res = run_pg_bounded(
+            "PostgreSQL write",
+            conn.client().execute(
                 "INSERT INTO symlinks (project_id, symlink_id, target)
                  VALUES ($1, $2, $3)
                  ON CONFLICT (project_id, symlink_id) DO NOTHING",
                 &[&project_id, &symlink_id, &target],
-            )
-            .await
-        {
+            ),
+        )
+        .await?;
+        conn.mark_clean_if_healthy(&res);
+        if let Err(err) = res {
             if err.code() == Some(&SqlState::FOREIGN_KEY_VIOLATION) {
                 return Err(StoreError::RepoNotFound {
                     repo_id: project_id.to_string(),
@@ -295,21 +361,34 @@ impl PostgresMetadataStore {
         if symlink_ids.is_empty() {
             return Ok(HashSet::new());
         }
-        let client = self.get_client().await?;
+        let mut conn = self.checkout_guarded_client().await?;
         let mut found = HashSet::with_capacity(symlink_ids.len());
         for chunk in symlink_ids.chunks(UNNEST_BATCH_SIZE) {
-            let rows = client
-                .query(
+            conn.arm_for_query("PostgreSQL read")?;
+            let res = run_pg_bounded(
+                "PostgreSQL read",
+                conn.client().query(
                     "SELECT symlink_id FROM symlinks
                      WHERE project_id = $1 AND symlink_id = ANY($2)",
                     &[&project_id, &chunk],
-                )
-                .await
-                .map_err(map_pg_err)?;
+                ),
+            )
+            .await?;
+            let rows = match res {
+                Ok(rows) => {
+                    conn.disarm_cancel_on_drop();
+                    rows
+                }
+                Err(err) => {
+                    conn.mark_clean_if_db_error(&err);
+                    return Err(map_pg_err(err));
+                }
+            };
             for row in rows {
                 found.insert(row.get::<_, Vec<u8>>(0));
             }
         }
+        conn.mark_clean();
         Ok(found)
     }
 
@@ -318,17 +397,21 @@ impl PostgresMetadataStore {
         project_id: &str,
         blob_id: &[u8],
     ) -> StoreResult<Option<BlobRecord>> {
-        let client = self.get_client().await?;
-        let row = client
-            .query_opt(
+        let mut conn = self.checkout_guarded_client().await?;
+        conn.arm_for_query("PostgreSQL read")?;
+        let res = run_pg_bounded(
+            "PostgreSQL read",
+            conn.client().query_opt(
                 "SELECT b.blob_id, b.content_size, b.inline_content, b.primary_location, b.replicated_locations
                  FROM blobs b
                  INNER JOIN project_blobs pb ON pb.blob_id = b.blob_id
                  WHERE pb.project_id = $1 AND b.blob_id = $2",
                 &[&project_id, &blob_id],
-            )
-            .await
-            .map_err(map_pg_err)?;
+            ),
+        )
+        .await?;
+        conn.mark_clean_if_healthy(&res);
+        let row = res.map_err(map_pg_err)?;
         row.as_ref().map(decode_blob_row).transpose()
     }
 
@@ -340,28 +423,44 @@ impl PostgresMetadataStore {
         if blob_ids.is_empty() {
             return Ok(HashMap::new());
         }
-        let client = self.get_client().await?;
+        let mut conn = self.checkout_guarded_client().await?;
         let mut sizes = HashMap::with_capacity(blob_ids.len());
         for chunk in blob_ids.chunks(UNNEST_BATCH_SIZE) {
-            let rows = client
-                .query(
+            conn.arm_for_query("PostgreSQL read")?;
+            let res = run_pg_bounded(
+                "PostgreSQL read",
+                conn.client().query(
                     "SELECT b.blob_id, b.content_size
                      FROM blobs b
                      INNER JOIN project_blobs pb ON pb.blob_id = b.blob_id
                      WHERE pb.project_id = $1 AND pb.blob_id = ANY($2)",
                     &[&project_id, &chunk],
-                )
-                .await
-                .map_err(map_pg_err)?;
+                ),
+            )
+            .await?;
+            let rows = match res {
+                Ok(rows) => {
+                    conn.disarm_cancel_on_drop();
+                    rows
+                }
+                Err(err) => {
+                    conn.mark_clean_if_db_error(&err);
+                    return Err(map_pg_err(err));
+                }
+            };
             for row in rows {
                 let bid: Vec<u8> = row.get(0);
                 let sz: i64 = row.get(1);
-                let size_u64 = u64::try_from(sz).map_err(|_| {
-                    StoreError::Corruption(format!("negative PostgreSQL blob content_size {sz}"))
-                })?;
+                let Ok(size_u64) = u64::try_from(sz) else {
+                    conn.mark_clean();
+                    return Err(StoreError::Corruption(format!(
+                        "negative PostgreSQL blob content_size {sz}"
+                    )));
+                };
                 sizes.insert(bid, size_u64);
             }
         }
+        conn.mark_clean();
         Ok(sizes)
     }
 
@@ -369,15 +468,19 @@ impl PostgresMetadataStore {
         &self,
         blob_id: &[u8],
     ) -> StoreResult<Option<BlobRecord>> {
-        let client = self.get_client().await?;
-        let row = client
-            .query_opt(
+        let mut conn = self.checkout_guarded_client().await?;
+        conn.arm_for_query("PostgreSQL read")?;
+        let res = run_pg_bounded(
+            "PostgreSQL read",
+            conn.client().query_opt(
                 "SELECT blob_id, content_size, inline_content, primary_location, replicated_locations
                  FROM blobs WHERE blob_id = $1",
                 &[&blob_id],
-            )
-            .await
-            .map_err(map_pg_err)?;
+            ),
+        )
+        .await?;
+        conn.mark_clean_if_healthy(&res);
+        let row = res.map_err(map_pg_err)?;
         row.as_ref().map(decode_blob_row).transpose()
     }
 

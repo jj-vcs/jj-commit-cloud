@@ -33,7 +33,8 @@ use super::sigv4::{EMPTY_PAYLOAD_SHA256, sha256_hex};
 use super::{
     MAX_ERROR_BODY_BYTES, MAX_RETRY_ATTEMPTS, S3BlobStore, is_retryable_body_err,
     map_http_status_err, map_reqwest_err, parse_content_length, parse_content_range_start,
-    parse_content_range_total, read_bounded_body, sleep_retry_backoff,
+    parse_content_range_total, read_bounded_body, read_response_bytes_with_deadline,
+    sleep_retry_backoff,
 };
 use crate::store::gcsblob::IMMUTABLE_CACHE_CONTROL;
 use crate::store::{
@@ -72,12 +73,29 @@ impl BlobStore for S3BlobStore {
         let key = Self::object_key(blob_id)?;
         let encoded_path = self.object_path(&key);
         let path_buf = temp_path.to_path_buf();
+        let deadline = crate::resilience::current_rpc_deadline();
+        let metrics = crate::resilience::current_rpc_metrics();
         let (std_file, payload_hash) =
-            tokio::task::spawn_blocking(move || hash_and_rewind_staged_file(&path_buf, size))
+            crate::resilience::run_with_rpc_deadline("S3 staged blob SHA-256", async move {
+                match tokio::task::spawn_blocking(move || {
+                    hash_and_rewind_staged_file(&path_buf, size, deadline)
+                })
                 .await
-                .map_err(|e| {
-                    StoreError::Backend(format!("staged blob SHA-256 task failed: {e}"))
-                })??;
+                {
+                    Ok(res) => res,
+                    Err(join_err) => {
+                        crate::resilience::handle_join_error(
+                            "staged blob SHA-256 task",
+                            join_err,
+                            metrics.as_ref(),
+                        );
+                        Err(StoreError::Backend(
+                            "staged blob SHA-256 task failed".to_string(),
+                        ))
+                    }
+                }
+            })
+            .await?;
 
         let content_len = size.to_string();
         let headers = [
@@ -126,7 +144,7 @@ impl BlobStore for S3BlobStore {
                 )
                 .await?
             else {
-                sleep_retry_backoff(attempt).await;
+                sleep_retry_backoff(attempt).await?;
                 attempt += 1;
                 continue;
             };
@@ -139,10 +157,10 @@ impl BlobStore for S3BlobStore {
                 return Ok(None);
             }
             if status == StatusCode::OK {
-                match resp.bytes().await {
+                match read_response_bytes_with_deadline(resp).await? {
                     Ok(bytes) => return Ok(Some(bytes)),
                     Err(err) if is_retryable_body_err(&err) && retry_allowed => {
-                        sleep_retry_backoff(attempt).await;
+                        sleep_retry_backoff(attempt).await?;
                         attempt += 1;
                         continue;
                     }
@@ -197,7 +215,7 @@ impl BlobStore for S3BlobStore {
                 )
                 .await?
             else {
-                sleep_retry_backoff(attempt).await;
+                sleep_retry_backoff(attempt).await?;
                 attempt += 1;
                 continue;
             };
@@ -213,10 +231,10 @@ impl BlobStore for S3BlobStore {
                             hex::encode(blob_id)
                         )));
                     }
-                    let bytes = match resp.bytes().await {
+                    let bytes = match read_response_bytes_with_deadline(resp).await? {
                         Ok(bytes) => bytes,
                         Err(err) if is_retryable_body_err(&err) && retry_allowed => {
-                            sleep_retry_backoff(attempt).await;
+                            sleep_retry_backoff(attempt).await?;
                             attempt += 1;
                             continue;
                         }
@@ -231,10 +249,10 @@ impl BlobStore for S3BlobStore {
                 }
                 // Some S3-compatible implementations ignore Range headers and return the full body.
                 StatusCode::OK => {
-                    let full = match resp.bytes().await {
+                    let full = match read_response_bytes_with_deadline(resp).await? {
                         Ok(bytes) => bytes,
                         Err(err) if is_retryable_body_err(&err) && retry_allowed => {
-                            sleep_retry_backoff(attempt).await;
+                            sleep_retry_backoff(attempt).await?;
                             attempt += 1;
                             continue;
                         }
@@ -487,55 +505,59 @@ impl BlobStore for S3BlobStore {
                 }
 
                 let (tx, rx) = mpsc::channel(8);
-                tokio::spawn(async move {
-                    let mut resp = resp;
-                    let mut received = 0u64;
-                    loop {
-                        let next_chunk = tokio::select! {
-                            biased;
-                            _ = tx.closed() => return,
-                            res = resp.chunk() => res,
-                        };
-                        match next_chunk {
-                            Ok(Some(chunk)) => {
-                                if chunk.is_empty() {
-                                    continue;
-                                }
-                                let next_received = received.saturating_add(chunk.len() as u64);
-                                if next_received > expected_len {
-                                    let _ = tx
-                                        .send(Err(StoreError::Corruption(format!(
-                                            "blob {blob_id_hex} oversized in S3 at offset {offset}: expected {expected_len} bytes, received at least {next_received} bytes"
-                                        ))))
-                                        .await;
-                                    return;
-                                }
-                                let mut pos = 0usize;
-                                while pos < chunk.len() {
-                                    let end =
-                                        (pos + cc_common::FILE_STREAM_CHUNK_SIZE).min(chunk.len());
-                                    if tx.send(Ok(chunk.slice(pos..end))).await.is_err() {
+                crate::resilience::spawn_blob_stream_producer(
+                    "S3 blob range stream",
+                    tx,
+                    move |tx| async move {
+                        let mut resp = resp;
+                        let mut received = 0u64;
+                        loop {
+                            let next_chunk = tokio::select! {
+                                biased;
+                                _ = tx.closed() => return,
+                                res = resp.chunk() => res,
+                            };
+                            match next_chunk {
+                                Ok(Some(chunk)) => {
+                                    if chunk.is_empty() {
+                                        continue;
+                                    }
+                                    let next_received = received.saturating_add(chunk.len() as u64);
+                                    if next_received > expected_len {
+                                        let _ = tx
+                                            .send(Err(StoreError::Corruption(format!(
+                                                "blob {blob_id_hex} oversized in S3 at offset {offset}: expected {expected_len} bytes, received at least {next_received} bytes"
+                                            ))))
+                                            .await;
                                         return;
                                     }
-                                    pos = end;
+                                    let mut pos = 0usize;
+                                    while pos < chunk.len() {
+                                        let end = (pos + cc_common::FILE_STREAM_CHUNK_SIZE)
+                                            .min(chunk.len());
+                                        if tx.send(Ok(chunk.slice(pos..end))).await.is_err() {
+                                            return;
+                                        }
+                                        pos = end;
+                                    }
+                                    received = next_received;
                                 }
-                                received = next_received;
-                            }
-                            Ok(None) => break,
-                            Err(err) => {
-                                let _ = tx.send(Err(map_reqwest_err(err))).await;
-                                return;
+                                Ok(None) => break,
+                                Err(err) => {
+                                    let _ = tx.send(Err(map_reqwest_err(err))).await;
+                                    return;
+                                }
                             }
                         }
-                    }
-                    if received != expected_len {
-                        let _ = tx
-                            .send(Err(StoreError::Corruption(format!(
-                                "blob {blob_id_hex} truncated in S3 at offset {offset}: expected {expected_len} bytes, got {received} bytes"
-                            ))))
-                            .await;
-                    }
-                });
+                        if received != expected_len {
+                            let _ = tx
+                                .send(Err(StoreError::Corruption(format!(
+                                    "blob {blob_id_hex} truncated in S3 at offset {offset}: expected {expected_len} bytes, got {received} bytes"
+                                ))))
+                                .await;
+                        }
+                    },
+                );
                 Ok(Some(rx))
             }
             StatusCode::OK => {
@@ -550,63 +572,68 @@ impl BlobStore for S3BlobStore {
 
                 let range_end = offset.saturating_add(expected_len);
                 let (tx, rx) = mpsc::channel(8);
-                tokio::spawn(async move {
-                    let mut resp = resp;
-                    let mut total_received = 0u64;
-                    loop {
-                        let next_chunk = tokio::select! {
-                            biased;
-                            _ = tx.closed() => return,
-                            res = resp.chunk() => res,
-                        };
-                        match next_chunk {
-                            Ok(Some(chunk)) => {
-                                if chunk.is_empty() {
-                                    continue;
+                crate::resilience::spawn_blob_stream_producer(
+                    "S3 blob full stream",
+                    tx,
+                    move |tx| async move {
+                        let mut resp = resp;
+                        let mut total_received = 0u64;
+                        loop {
+                            let next_chunk = tokio::select! {
+                                biased;
+                                _ = tx.closed() => return,
+                                res = resp.chunk() => res,
+                            };
+                            match next_chunk {
+                                Ok(Some(chunk)) => {
+                                    if chunk.is_empty() {
+                                        continue;
+                                    }
+                                    let chunk_start = total_received;
+                                    let next_total =
+                                        total_received.saturating_add(chunk.len() as u64);
+                                    if next_total > expected_total {
+                                        let _ = tx
+                                            .send(Err(StoreError::Corruption(format!(
+                                                "blob {blob_id_hex} oversized in S3: expected {expected_total} bytes, received at least {next_total} bytes"
+                                            ))))
+                                            .await;
+                                        return;
+                                    }
+                                    let emit_start = offset.max(chunk_start);
+                                    let emit_end = range_end.min(next_total);
+                                    if emit_start < emit_end {
+                                        let rel_start = (emit_start - chunk_start) as usize;
+                                        let rel_end = (emit_end - chunk_start) as usize;
+                                        let slice = chunk.slice(rel_start..rel_end);
+                                        let mut pos = 0usize;
+                                        while pos < slice.len() {
+                                            let end = (pos + cc_common::FILE_STREAM_CHUNK_SIZE)
+                                                .min(slice.len());
+                                            if tx.send(Ok(slice.slice(pos..end))).await.is_err() {
+                                                return;
+                                            }
+                                            pos = end;
+                                        }
+                                    }
+                                    total_received = next_total;
                                 }
-                                let chunk_start = total_received;
-                                let next_total = total_received.saturating_add(chunk.len() as u64);
-                                if next_total > expected_total {
-                                    let _ = tx
-                                        .send(Err(StoreError::Corruption(format!(
-                                            "blob {blob_id_hex} oversized in S3: expected {expected_total} bytes, received at least {next_total} bytes"
-                                        ))))
-                                        .await;
+                                Ok(None) => break,
+                                Err(err) => {
+                                    let _ = tx.send(Err(map_reqwest_err(err))).await;
                                     return;
                                 }
-                                let emit_start = offset.max(chunk_start);
-                                let emit_end = range_end.min(next_total);
-                                if emit_start < emit_end {
-                                    let rel_start = (emit_start - chunk_start) as usize;
-                                    let rel_end = (emit_end - chunk_start) as usize;
-                                    let slice = chunk.slice(rel_start..rel_end);
-                                    let mut pos = 0usize;
-                                    while pos < slice.len() {
-                                        let end = (pos + cc_common::FILE_STREAM_CHUNK_SIZE)
-                                            .min(slice.len());
-                                        if tx.send(Ok(slice.slice(pos..end))).await.is_err() {
-                                            return;
-                                        }
-                                        pos = end;
-                                    }
-                                }
-                                total_received = next_total;
-                            }
-                            Ok(None) => break,
-                            Err(err) => {
-                                let _ = tx.send(Err(map_reqwest_err(err))).await;
-                                return;
                             }
                         }
-                    }
-                    if total_received != expected_total {
-                        let _ = tx
-                            .send(Err(StoreError::Corruption(format!(
-                                "blob {blob_id_hex} truncated in S3: expected {expected_total} bytes, got {total_received} bytes"
-                            ))))
-                            .await;
-                    }
-                });
+                        if total_received != expected_total {
+                            let _ = tx
+                                .send(Err(StoreError::Corruption(format!(
+                                    "blob {blob_id_hex} truncated in S3: expected {expected_total} bytes, got {total_received} bytes"
+                                ))))
+                                .await;
+                        }
+                    },
+                );
                 Ok(Some(rx))
             }
             _ => {
@@ -658,9 +685,15 @@ fn staged_file_body(async_file: tokio::fs::File, size: u64) -> Body {
 fn hash_and_rewind_staged_file(
     path: &Path,
     expected_size: u64,
+    deadline: Option<std::time::Instant>,
 ) -> StoreResult<(std::fs::File, String)> {
     use std::io::{Read as _, Seek as _, SeekFrom};
 
+    if deadline.is_some_and(|d| d <= std::time::Instant::now()) {
+        return Err(StoreError::DeadlineExceeded(
+            "gRPC deadline expired before hashing staged blob".to_string(),
+        ));
+    }
     let mut file = std::fs::File::open(path).map_err(|e| {
         StoreError::Backend(format!(
             "failed to open staged blob {}: {e}",
@@ -671,6 +704,11 @@ fn hash_and_rewind_staged_file(
     let mut buf = vec![0u8; cc_common::FILE_STREAM_CHUNK_SIZE];
     let mut total = 0u64;
     loop {
+        if deadline.is_some_and(|d| d <= std::time::Instant::now()) {
+            return Err(StoreError::DeadlineExceeded(
+                "gRPC deadline exceeded while hashing staged blob".to_string(),
+            ));
+        }
         let n = file.read(&mut buf).map_err(|e| {
             StoreError::Backend(format!(
                 "failed to read staged blob {}: {e}",

@@ -184,7 +184,16 @@ impl SpannerMetadataStore {
                 && (is_already_exists(&err)
                     || err.status().is_some_and(|s| s.code == RpcCode::Aborted))
             {
-                StoreError::CasConflict(err.to_string())
+                tracing::debug!(
+                    error = %err,
+                    repo_id = %workspace.repo_id,
+                    workspace_name = %workspace.workspace_name,
+                    "Spanner workspace CAS conflict"
+                );
+                StoreError::CasConflict(format!(
+                    "workspace '{}' updated concurrently in repo '{}'",
+                    workspace.workspace_name, workspace.repo_id
+                ))
             } else {
                 map_spanner_err(err)
             }
@@ -196,67 +205,71 @@ impl SpannerMetadataStore {
         repo_id: &str,
         workspace_name: &str,
     ) -> StoreResult<Option<WorkspaceState>> {
-        let stmt = Statement::builder(
-            "SELECT User, CommitId, OperationId, TreeId, TreeIds, ConflictLabels, SparsePatterns
-             FROM Workspaces
-             WHERE RepoId = @repo_id AND WorkspaceName = @ws",
-        )
-        .add_param("repo_id", repo_id)
-        .add_param("ws", workspace_name)
-        .build();
+        crate::resilience::run_with_rpc_deadline("Spanner read", async {
+            let stmt = Statement::builder(
+                "SELECT User, CommitId, OperationId, TreeId, TreeIds, ConflictLabels, SparsePatterns
+                 FROM Workspaces
+                 WHERE RepoId = @repo_id AND WorkspaceName = @ws",
+            )
+            .add_param("repo_id", repo_id)
+            .add_param("ws", workspace_name);
 
-        let tx = self.db_client.single_use().build();
-        let mut rs = tx.execute_query(stmt).await.map_err(map_spanner_err)?;
-        let Some(row) = rs.next().await.transpose().map_err(map_spanner_err)? else {
-            return Ok(None);
-        };
-        let user: String = row.get("User").map_err(map_spanner_err)?;
-        let commit_id: Vec<u8> = row.get("CommitId").map_err(map_spanner_err)?;
-        let operation_id: Vec<u8> = row.get("OperationId").map_err(map_spanner_err)?;
-        let tree_id: Vec<u8> = row.get("TreeId").map_err(map_spanner_err)?;
-        let mut tree_ids: Vec<Vec<u8>> = row.get("TreeIds").map_err(map_spanner_err)?;
-        if tree_ids.is_empty() && !tree_id.is_empty() {
-            tree_ids.push(tree_id.clone());
-        }
-        let conflict_labels: Vec<String> = row.get("ConflictLabels").map_err(map_spanner_err)?;
-        let sparse_patterns: Vec<String> = row.get("SparsePatterns").map_err(map_spanner_err)?;
+            let mut rs = self.single_use_query(stmt).await?;
+            let Some(row) = rs.next().await.transpose().map_err(map_spanner_err)? else {
+                return Ok(None);
+            };
+            let user: String = row.get("User").map_err(map_spanner_err)?;
+            let commit_id: Vec<u8> = row.get("CommitId").map_err(map_spanner_err)?;
+            let operation_id: Vec<u8> = row.get("OperationId").map_err(map_spanner_err)?;
+            let tree_id: Vec<u8> = row.get("TreeId").map_err(map_spanner_err)?;
+            let mut tree_ids: Vec<Vec<u8>> = row.get("TreeIds").map_err(map_spanner_err)?;
+            if tree_ids.is_empty() && !tree_id.is_empty() {
+                tree_ids.push(tree_id.clone());
+            }
+            let conflict_labels: Vec<String> =
+                row.get("ConflictLabels").map_err(map_spanner_err)?;
+            let sparse_patterns: Vec<String> =
+                row.get("SparsePatterns").map_err(map_spanner_err)?;
 
-        #[allow(deprecated)]
-        let ws = WorkspaceState {
-            repo_id: repo_id.to_string(),
-            user,
-            workspace_name: workspace_name.to_string(),
-            commit_id,
-            operation_id,
-            tree_id,
-            sparse_patterns,
-            tree_ids,
-            conflict_labels,
-            sparse_patterns_set: true,
-        };
-        Ok(Some(ws))
+            #[allow(deprecated)]
+            let ws = WorkspaceState {
+                repo_id: repo_id.to_string(),
+                user,
+                workspace_name: workspace_name.to_string(),
+                commit_id,
+                operation_id,
+                tree_id,
+                sparse_patterns,
+                tree_ids,
+                conflict_labels,
+                sparse_patterns_set: true,
+            };
+            Ok(Some(ws))
+        })
+        .await
     }
 
     pub(super) async fn list_workspaces_impl(
         &self,
         repo_id: &str,
     ) -> StoreResult<Vec<WorkspaceState>> {
-        let stmt = Statement::builder(
-            "SELECT User, WorkspaceName, CommitId, OperationId, TreeId, TreeIds, ConflictLabels, SparsePatterns
-             FROM Workspaces
-             WHERE RepoId = @repo_id
-             ORDER BY WorkspaceName ASC",
-        )
-        .add_param("repo_id", repo_id)
-        .build();
+        crate::resilience::run_with_rpc_deadline("Spanner read", async {
+            let stmt = Statement::builder(
+                "SELECT User, WorkspaceName, CommitId, OperationId, TreeId, TreeIds, ConflictLabels, SparsePatterns
+                 FROM Workspaces
+                 WHERE RepoId = @repo_id
+                 ORDER BY WorkspaceName ASC",
+            )
+            .add_param("repo_id", repo_id);
 
-        let tx = self.db_client.single_use().build();
-        let mut rs = tx.execute_query(stmt).await.map_err(map_spanner_err)?;
-        let mut out = Vec::new();
-        while let Some(row) = rs.next().await.transpose().map_err(map_spanner_err)? {
-            out.push(decode_workspace_row(repo_id, &row)?);
-        }
-        Ok(out)
+            let mut rs = self.single_use_query(stmt).await?;
+            let mut out = Vec::new();
+            while let Some(row) = rs.next().await.transpose().map_err(map_spanner_err)? {
+                out.push(decode_workspace_row(repo_id, &row)?);
+            }
+            Ok(out)
+        })
+        .await
     }
 
     pub(super) async fn list_workspaces_page_impl(
@@ -269,52 +282,52 @@ impl SpannerMetadataStore {
         if limit == 0 {
             return Ok((Vec::new(), false));
         }
-        let fetch_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
-        let stmt = match after_workspace_name {
-            Some(after_ws) => Statement::builder(
-                "SELECT User, WorkspaceName, CommitId, OperationId, TreeId, TreeIds, ConflictLabels, SparsePatterns
-                 FROM Workspaces
-                 WHERE RepoId = @repo_id
-                   AND WorkspaceName > @after_ws
-                 ORDER BY WorkspaceName ASC
-                 LIMIT @limit",
-            )
-            .add_param("repo_id", repo_id)
-            .add_param("after_ws", after_ws)
-            .add_param("limit", fetch_limit)
-            .build(),
-            None => Statement::builder(
-                "SELECT User, WorkspaceName, CommitId, OperationId, TreeId, TreeIds, ConflictLabels, SparsePatterns
-                 FROM Workspaces
-                 WHERE RepoId = @repo_id
-                 ORDER BY WorkspaceName ASC
-                 LIMIT @limit",
-            )
-            .add_param("repo_id", repo_id)
-            .add_param("limit", fetch_limit)
-            .build(),
-        };
+        crate::resilience::run_with_rpc_deadline("Spanner read", async {
+            let fetch_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+            let stmt = match after_workspace_name {
+                Some(after_ws) => Statement::builder(
+                    "SELECT User, WorkspaceName, CommitId, OperationId, TreeId, TreeIds, ConflictLabels, SparsePatterns
+                     FROM Workspaces
+                     WHERE RepoId = @repo_id
+                       AND WorkspaceName > @after_ws
+                     ORDER BY WorkspaceName ASC
+                     LIMIT @limit",
+                )
+                .add_param("repo_id", repo_id)
+                .add_param("after_ws", after_ws)
+                .add_param("limit", fetch_limit),
+                None => Statement::builder(
+                    "SELECT User, WorkspaceName, CommitId, OperationId, TreeId, TreeIds, ConflictLabels, SparsePatterns
+                     FROM Workspaces
+                     WHERE RepoId = @repo_id
+                     ORDER BY WorkspaceName ASC
+                     LIMIT @limit",
+                )
+                .add_param("repo_id", repo_id)
+                .add_param("limit", fetch_limit),
+            };
 
-        let tx = self.db_client.single_use().build();
-        let mut rs = tx.execute_query(stmt).await.map_err(map_spanner_err)?;
-        let mut out = Vec::new();
-        let mut response_bytes = 0usize;
-        let mut has_more = false;
-        while let Some(row) = rs.next().await.transpose().map_err(map_spanner_err)? {
-            let ws = decode_workspace_row(repo_id, &row)?;
-            let entry_bytes = crate::store::workspace_list_entry_bytes(&ws);
-            if out.len() >= limit
-                || max_bytes.is_some_and(|cap| {
-                    !out.is_empty() && response_bytes.saturating_add(entry_bytes) > cap
-                })
-            {
-                has_more = true;
-                break;
+            let mut rs = self.single_use_query(stmt).await?;
+            let mut out = Vec::new();
+            let mut response_bytes = 0usize;
+            let mut has_more = false;
+            while let Some(row) = rs.next().await.transpose().map_err(map_spanner_err)? {
+                let ws = decode_workspace_row(repo_id, &row)?;
+                let entry_bytes = crate::store::workspace_list_entry_bytes(&ws);
+                if out.len() >= limit
+                    || max_bytes.is_some_and(|cap| {
+                        !out.is_empty() && response_bytes.saturating_add(entry_bytes) > cap
+                    })
+                {
+                    has_more = true;
+                    break;
+                }
+                response_bytes = response_bytes.saturating_add(entry_bytes);
+                out.push(ws);
             }
-            response_bytes = response_bytes.saturating_add(entry_bytes);
-            out.push(ws);
-        }
-        Ok((out, has_more))
+            Ok((out, has_more))
+        })
+        .await
     }
 
     pub(super) async fn delete_workspace_impl(

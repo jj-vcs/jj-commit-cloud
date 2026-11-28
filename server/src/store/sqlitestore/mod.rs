@@ -37,12 +37,14 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use cc_common::backend::*;
 use cc_common::op_store::*;
 use cc_common::workspace::WorkspaceState;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, InterruptHandle, OpenFlags};
+use tokio::sync::Semaphore;
 
 use super::{BlobRecord, CommitId, MetadataStore, OpId, StoreError, StoreResult};
 use schema::{
@@ -61,10 +63,75 @@ mod workspaces;
 
 const WAL_READER_POOL_SIZE: usize = 8;
 
+const DEFAULT_SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Clamps a positive remaining RPC deadline to a SQLite `busy_timeout` when shorter than
+/// [`DEFAULT_SQLITE_BUSY_TIMEOUT`]. Sub-millisecond positive durations round up to `1ms`
+/// because `rusqlite::Connection::busy_timeout` truncates to integer milliseconds and `0ms`
+/// disables SQLite's busy handler.
+fn clamp_sqlite_busy_timeout(remaining: Duration) -> Option<Duration> {
+    if remaining < DEFAULT_SQLITE_BUSY_TIMEOUT {
+        Some(remaining.max(Duration::from_millis(1)))
+    } else {
+        None
+    }
+}
+
+struct SqliteConnSlot {
+    gate: Arc<Semaphore>,
+    conn: Arc<Mutex<Connection>>,
+    interrupt: Arc<InterruptHandle>,
+}
+
+impl SqliteConnSlot {
+    fn new(conn: Connection) -> Self {
+        let interrupt = Arc::new(conn.get_interrupt_handle());
+        Self {
+            gate: Arc::new(Semaphore::new(1)),
+            conn: Arc::new(Mutex::new(conn)),
+            interrupt,
+        }
+    }
+}
+
+#[derive(Default)]
+struct SqliteExecState {
+    started: bool,
+    finished: bool,
+    cancelled: bool,
+}
+
+struct SqliteInterruptOnDrop {
+    state: Arc<Mutex<SqliteExecState>>,
+    interrupt: Arc<InterruptHandle>,
+    armed: bool,
+}
+
+impl SqliteInterruptOnDrop {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SqliteInterruptOnDrop {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.cancelled = true;
+        if st.started && !st.finished {
+            // Holding `state` while firing `sqlite3_interrupt` guarantees the interrupt completes
+            // before the blocking task can mark `finished = true` and release the slot permit.
+            self.interrupt.interrupt();
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct SqliteMetadataStore {
-    writer: Arc<Mutex<Connection>>,
-    readers: Arc<Vec<Arc<Mutex<Connection>>>>,
+    writer: Arc<SqliteConnSlot>,
+    readers: Arc<Vec<Arc<SqliteConnSlot>>>,
     next_reader: Arc<AtomicUsize>,
 }
 
@@ -115,11 +182,11 @@ impl SqliteMetadataStore {
                 ))
             })?;
             configure_reader_connection(&rconn)?;
-            reader_conns.push(Arc::new(Mutex::new(rconn)));
+            reader_conns.push(Arc::new(SqliteConnSlot::new(rconn)));
         }
 
         Ok(Self {
-            writer: Arc::new(Mutex::new(writer_conn)),
+            writer: Arc::new(SqliteConnSlot::new(writer_conn)),
             readers: Arc::new(reader_conns),
             next_reader: Arc::new(AtomicUsize::new(0)),
         })
@@ -129,7 +196,7 @@ impl SqliteMetadataStore {
         let mut conn = Connection::open_in_memory()
             .map_err(|e| StoreError::Backend(format!("failed to open in-memory SQLite: {e}")))?;
         configure_writer_connection(&mut conn)?;
-        let shared = Arc::new(Mutex::new(conn));
+        let shared = Arc::new(SqliteConnSlot::new(conn));
         Ok(Self {
             writer: Arc::clone(&shared),
             readers: Arc::new(vec![shared]),
@@ -137,20 +204,180 @@ impl SqliteMetadataStore {
         })
     }
 
+    async fn with_conn_slot<F, T>(
+        slot: &Arc<SqliteConnSlot>,
+        role: &'static str,
+        f: F,
+    ) -> StoreResult<T>
+    where
+        F: FnOnce(&mut Connection) -> StoreResult<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let deadline = crate::resilience::current_rpc_deadline();
+        let metrics = crate::resilience::current_rpc_metrics();
+
+        let permit = match crate::resilience::remaining_rpc_deadline() {
+            Some(rem) if rem.is_zero() => {
+                return Err(StoreError::DeadlineExceeded(format!(
+                    "gRPC deadline expired before acquiring SQLite {role} connection"
+                )));
+            }
+            Some(rem) => match tokio::time::timeout(rem, slot.gate.clone().acquire_owned()).await {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(_)) => {
+                    return Err(StoreError::Backend(format!(
+                        "SQLite {role} connection semaphore closed"
+                    )));
+                }
+                Err(_) => {
+                    return Err(StoreError::DeadlineExceeded(format!(
+                        "gRPC deadline exceeded waiting for SQLite {role} connection"
+                    )));
+                }
+            },
+            None => slot.gate.clone().acquire_owned().await.map_err(|_| {
+                StoreError::Backend(format!("SQLite {role} connection semaphore closed"))
+            })?,
+        };
+
+        if crate::resilience::remaining_rpc_deadline().is_some_and(|rem| rem.is_zero()) {
+            return Err(StoreError::DeadlineExceeded(format!(
+                "gRPC deadline expired before running SQLite {role} operation"
+            )));
+        }
+
+        let state = Arc::new(Mutex::new(SqliteExecState::default()));
+        let mut interrupt_guard = SqliteInterruptOnDrop {
+            state: Arc::clone(&state),
+            interrupt: Arc::clone(&slot.interrupt),
+            armed: true,
+        };
+        let conn = Arc::clone(&slot.conn);
+        let state_bg = Arc::clone(&state);
+        let metrics_bg = metrics.clone();
+
+        let handle = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let mut guard = conn
+                .lock()
+                .map_err(|_| StoreError::Backend(format!("SQLite {role} mutex poisoned")))?;
+
+            let mut clamped_busy_timeout = false;
+            if let Some(dl) = deadline {
+                let rem = dl.saturating_duration_since(Instant::now());
+                if rem.is_zero() {
+                    let mut st = state_bg.lock().unwrap_or_else(|e| e.into_inner());
+                    st.finished = true;
+                    return Err(StoreError::DeadlineExceeded(format!(
+                        "gRPC deadline expired before running SQLite {role} query"
+                    )));
+                }
+                if let Some(clamped) = clamp_sqlite_busy_timeout(rem) {
+                    let _ = guard.busy_timeout(clamped);
+                    clamped_busy_timeout = true;
+                }
+            }
+
+            {
+                let mut st = state_bg.lock().unwrap_or_else(|e| e.into_inner());
+                if st.cancelled {
+                    st.finished = true;
+                    drop(st);
+                    if clamped_busy_timeout {
+                        let _ = guard.busy_timeout(DEFAULT_SQLITE_BUSY_TIMEOUT);
+                    }
+                    return Err(StoreError::DeadlineExceeded(format!(
+                        "gRPC deadline exceeded before starting SQLite {role} query"
+                    )));
+                }
+                st.started = true;
+            }
+
+            // Catch panics before unwinding out of the mutex guard so a single panicked
+            // query never permanently poisons the SQLite connection mutex.
+            let call_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut guard)));
+
+            let was_cancelled = {
+                let mut st = state_bg.lock().unwrap_or_else(|e| e.into_inner());
+                st.finished = true;
+                st.cancelled
+            };
+
+            if clamped_busy_timeout {
+                let _ = guard.busy_timeout(DEFAULT_SQLITE_BUSY_TIMEOUT);
+            }
+
+            match call_res {
+                Ok(Ok(val)) => Ok(val),
+                Ok(Err(StoreError::Backend(msg)))
+                    if was_cancelled
+                        || (clamped_busy_timeout
+                            && (msg.contains("database is locked")
+                                || msg.contains("database is busy")))
+                        || (deadline.is_some_and(|dl| dl <= Instant::now())
+                            && (msg.contains("interrupted")
+                                || msg.contains("database is locked")
+                                || msg.contains("database is busy"))) =>
+                {
+                    Err(StoreError::DeadlineExceeded(format!(
+                        "SQLite {role} operation exceeded gRPC deadline: {msg}"
+                    )))
+                }
+                Ok(Err(err)) => Err(err),
+                Err(payload) => {
+                    let panic_msg = crate::resilience::extract_panic_summary(payload.as_ref());
+                    tracing::error!(
+                        role,
+                        panic = %panic_msg,
+                        "SQLite blocking task panicked"
+                    );
+                    crate::resilience::record_panic_with_fallback(metrics_bg.as_ref());
+                    Err(StoreError::Backend(format!(
+                        "SQLite {role} blocking task panicked"
+                    )))
+                }
+            }
+        });
+
+        let join_res = match crate::resilience::remaining_rpc_deadline() {
+            Some(rem) if rem.is_zero() => {
+                return Err(StoreError::DeadlineExceeded(format!(
+                    "gRPC deadline expired during SQLite {role} operation"
+                )));
+            }
+            Some(rem) => match tokio::time::timeout(rem, handle).await {
+                Ok(res) => res,
+                Err(_) => {
+                    return Err(StoreError::DeadlineExceeded(format!(
+                        "gRPC deadline exceeded during SQLite {role} operation"
+                    )));
+                }
+            },
+            None => handle.await,
+        };
+        interrupt_guard.disarm();
+
+        match join_res {
+            Ok(res) => res,
+            Err(join_err) => {
+                crate::resilience::handle_join_error(
+                    "SQLite blocking task",
+                    join_err,
+                    metrics.as_ref(),
+                );
+                Err(StoreError::Backend(format!(
+                    "SQLite {role} blocking task failed"
+                )))
+            }
+        }
+    }
+
     pub(super) async fn with_write_conn<F, T>(&self, f: F) -> StoreResult<T>
     where
         F: FnOnce(&mut Connection) -> StoreResult<T> + Send + 'static,
         T: Send + 'static,
     {
-        let conn = Arc::clone(&self.writer);
-        tokio::task::spawn_blocking(move || {
-            let mut guard = conn
-                .lock()
-                .map_err(|_| StoreError::Backend("SQLite writer mutex poisoned".to_string()))?;
-            f(&mut guard)
-        })
-        .await
-        .map_err(|e| StoreError::Backend(format!("SQLite blocking task panicked: {e}")))?
+        Self::with_conn_slot(&self.writer, "writer", f).await
     }
 
     pub(super) async fn with_read_conn<F, T>(&self, f: F) -> StoreResult<T>
@@ -159,15 +386,7 @@ impl SqliteMetadataStore {
         T: Send + 'static,
     {
         let idx = self.next_reader.fetch_add(1, Ordering::Relaxed) % self.readers.len();
-        let conn = Arc::clone(&self.readers[idx]);
-        tokio::task::spawn_blocking(move || {
-            let mut guard = conn
-                .lock()
-                .map_err(|_| StoreError::Backend("SQLite reader mutex poisoned".to_string()))?;
-            f(&mut guard)
-        })
-        .await
-        .map_err(|e| StoreError::Backend(format!("SQLite blocking task panicked: {e}")))?
+        Self::with_conn_slot(&self.readers[idx], "reader", f).await
     }
 }
 

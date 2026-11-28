@@ -14,6 +14,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use cc_common::op_store::{
     Operation as ProtoOperation, RefTarget, RefTargetTerm, View as ProtoView,
@@ -24,8 +25,13 @@ use jj_lib::object_id::ObjectId as _;
 use jj_lib::op_heads_store::OpHeadsStore;
 use jj_lib::op_store::OperationId;
 
-use super::super::errors::{ReconcileError, find_store_error};
-use super::super::{reconcile_repo_op_heads_proto, run_reconcile_join};
+use super::super::errors::{
+    ReconcileError, find_store_error, is_transient_reconcile_error, is_transient_store_error,
+};
+use super::super::{
+    ServerIndex, collect_exclusive_commits, reconcile_repo_op_heads_proto,
+    run_reconcile_join_with_metrics,
+};
 use super::{make_test_proto_commit, make_test_proto_op, new_commit_predecessors, put_view_and_op};
 use crate::jj_lib_adapters::ServerOpHeadsStore;
 use crate::store::{
@@ -548,10 +554,13 @@ async fn test_reconcile_defers_cross_branch_commit_abandon_to_client() {
 
 #[tokio::test]
 async fn test_run_reconcile_join_catches_worker_panic_as_err() {
+    let metrics = crate::metrics::ServerMetrics::new();
     let handle = tokio::task::spawn_blocking(|| -> Result<Option<Vec<u8>>, ReconcileError> {
         panic!("simulated worker panic");
     });
-    let err = run_reconcile_join(handle).await.unwrap_err();
+    let err = run_reconcile_join_with_metrics(handle, Some(&metrics))
+        .await
+        .unwrap_err();
     assert!(
         !err.transient,
         "worker panic must be treated as non-transient"
@@ -561,16 +570,69 @@ async fn test_run_reconcile_join_catches_worker_panic_as_err() {
             .message()
             .contains("reconciliation worker failed")
     );
+    assert!(
+        !err.status.message().contains("simulated worker panic"),
+        "worker panic payload must not leak to gRPC clients: {:?}",
+        err.status.message()
+    );
+    assert_eq!(
+        metrics.snapshot().panics_total,
+        1,
+        "worker panic must increment panics_total"
+    );
 
     let cancelled_handle = tokio::spawn(async {
         futures::future::pending::<Result<Option<Vec<u8>>, ReconcileError>>().await
     });
     cancelled_handle.abort();
-    let cancel_err = run_reconcile_join(cancelled_handle).await.unwrap_err();
+    let cancel_err = run_reconcile_join_with_metrics(cancelled_handle, Some(&metrics))
+        .await
+        .unwrap_err();
     assert!(
         cancel_err.transient,
         "cancelled worker join error should remain transient"
     );
+    assert_eq!(
+        metrics.snapshot().panics_total,
+        1,
+        "cancelled worker must not increment panics_total"
+    );
+}
+
+#[tokio::test]
+async fn test_reconcile_expired_deadline_returns_deadline_exceeded_not_client_fallback() {
+    let store = Arc::new(CompositeStore::in_memory());
+    let repo_id = "repo-deadline-walk";
+    let project_id = "proj-deadline-walk";
+    store
+        .register_repo_in_project(repo_id, Some(project_id), None)
+        .await
+        .unwrap();
+
+    let c1 = vec![0x91; 20];
+    store
+        .put_commit(
+            project_id,
+            &c1,
+            &make_test_proto_commit(&c1, 0x91, cc_common::ROOT_COMMIT_ID_BYTES.to_vec()),
+        )
+        .await
+        .unwrap();
+    let index =
+        ServerIndex::with_project_id(store.clone(), repo_id.to_string(), project_id.to_string());
+    let wanted = std::collections::HashSet::from([jj_lib::backend::CommitId::from_bytes(&c1)]);
+    let unwanted = std::collections::HashSet::new();
+
+    let expired = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_millis(10))
+        .unwrap_or_else(std::time::Instant::now);
+    let err = crate::resilience::with_rpc_deadline(
+        Some(expired),
+        collect_exclusive_commits(&store, project_id, &index, &wanted, &unwanted),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.status.code(), tonic::Code::DeadlineExceeded);
 }
 
 #[tokio::test]
@@ -1511,4 +1573,31 @@ async fn test_reconcile_preserves_typed_non_transient_status_codes() {
         tonic::Code::DataLoss,
         "corrupt single op_head length must preserve Code::DataLoss, got {bad_single_err:?}"
     );
+}
+
+#[tokio::test]
+async fn deadline_exceeded_is_non_transient_and_fails_fast_in_reconcile() {
+    assert!(!is_transient_store_error(&StoreError::DeadlineExceeded(
+        "expired".into()
+    )));
+    assert!(!is_transient_reconcile_error(
+        "request deadline exceeded: timed out"
+    ));
+
+    let store = Arc::new(CompositeStore::with_config(
+        Arc::new(MemoryMetadataStore::new()),
+        Arc::new(MemoryBlobStore::new()),
+        CompositeStoreConfig::default(),
+    ));
+    store.register_repo("deadline-repo", None).await.unwrap();
+
+    let expired = std::time::Instant::now();
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    let err = crate::resilience::with_rpc_deadline(
+        Some(expired),
+        reconcile_repo_op_heads_proto(store, "deadline-repo"),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::DeadlineExceeded);
 }

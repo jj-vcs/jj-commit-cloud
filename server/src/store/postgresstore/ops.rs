@@ -28,6 +28,7 @@ use tokio_postgres::Transaction;
 use tokio_postgres::error::SqlState;
 
 use super::codec::map_pg_err;
+use super::pool::run_pg_bounded;
 use super::{PostgresMetadataStore, UNNEST_BATCH_SIZE};
 use crate::store::{OpId, StoreError, StoreResult, apply_op_heads_mutation, op_heads_sets_equal};
 
@@ -77,17 +78,21 @@ impl PostgresMetadataStore {
     ) -> StoreResult<()> {
         let proto_bytes = op.encode_to_vec();
         let Some(expected_project_id) = expected_project_id else {
-            let client = self.get_client().await?;
+            let mut conn = self.checkout_guarded_client().await?;
+            conn.arm_for_query("PostgreSQL write")?;
             // Insert-only so re-writing an already-published operation never resets `published`.
-            if let Err(err) = client
-                .execute(
+            let res = run_pg_bounded(
+                "PostgreSQL write",
+                conn.client().execute(
                     "INSERT INTO operations (repo_id, op_id, published, proto_bytes)
                      VALUES ($1, $2, FALSE, $3)
                      ON CONFLICT (repo_id, op_id) DO NOTHING",
                     &[&repo_id, &op_id, &proto_bytes],
-                )
-                .await
-            {
+                ),
+            )
+            .await?;
+            conn.mark_clean_if_healthy(&res);
+            if let Err(err) = res {
                 if err.code() == Some(&SqlState::FOREIGN_KEY_VIOLATION) {
                     return Err(StoreError::RepoNotFound {
                         repo_id: repo_id.to_string(),
@@ -202,16 +207,20 @@ impl PostgresMetadataStore {
     ) -> StoreResult<()> {
         let proto_bytes = view.encode_to_vec();
         let Some(expected_project_id) = expected_project_id else {
-            let client = self.get_client().await?;
-            if let Err(err) = client
-                .execute(
+            let mut conn = self.checkout_guarded_client().await?;
+            conn.arm_for_query("PostgreSQL write")?;
+            let res = run_pg_bounded(
+                "PostgreSQL write",
+                conn.client().execute(
                     "INSERT INTO views (repo_id, view_id, proto_bytes)
                      VALUES ($1, $2, $3)
                      ON CONFLICT (repo_id, view_id) DO NOTHING",
                     &[&repo_id, &view_id, &proto_bytes],
-                )
-                .await
-            {
+                ),
+            )
+            .await?;
+            conn.mark_clean_if_healthy(&res);
+            if let Err(err) = res {
                 if err.code() == Some(&SqlState::FOREIGN_KEY_VIOLATION) {
                     return Err(StoreError::RepoNotFound {
                         repo_id: repo_id.to_string(),
@@ -551,14 +560,18 @@ impl PostgresMetadataStore {
         repo_id: &str,
         op_id: &[u8],
     ) -> StoreResult<Option<Operation>> {
-        let client = self.get_client().await?;
-        let row = client
-            .query_opt(
+        let mut conn = self.checkout_guarded_client().await?;
+        conn.arm_for_query("PostgreSQL read")?;
+        let res = run_pg_bounded(
+            "PostgreSQL read",
+            conn.client().query_opt(
                 "SELECT proto_bytes FROM operations WHERE repo_id = $1 AND op_id = $2",
                 &[&repo_id, &op_id],
-            )
-            .await
-            .map_err(map_pg_err)?;
+            ),
+        )
+        .await?;
+        conn.mark_clean_if_healthy(&res);
+        let row = res.map_err(map_pg_err)?;
         row.map(|r| {
             let bytes: Vec<u8> = r.get(0);
             Operation::decode(bytes.as_slice()).map_err(|e| {
@@ -576,29 +589,37 @@ impl PostgresMetadataStore {
         min_id: &[u8],
         max_id: &[u8],
     ) -> StoreResult<Vec<OpId>> {
-        let client = self.get_client().await?;
-        let rows = client
-            .query(
+        let mut conn = self.checkout_guarded_client().await?;
+        conn.arm_for_query("PostgreSQL read")?;
+        let res = run_pg_bounded(
+            "PostgreSQL read",
+            conn.client().query(
                 "SELECT op_id FROM operations
                  WHERE repo_id = $1 AND op_id >= $2 AND op_id <= $3
                  ORDER BY op_id ASC
                  LIMIT 2",
                 &[&repo_id, &min_id, &max_id],
-            )
-            .await
-            .map_err(map_pg_err)?;
+            ),
+        )
+        .await?;
+        conn.mark_clean_if_healthy(&res);
+        let rows = res.map_err(map_pg_err)?;
         Ok(rows.into_iter().map(|r| r.get::<_, Vec<u8>>(0)).collect())
     }
 
     pub(super) async fn has_view_impl(&self, repo_id: &str, view_id: &[u8]) -> StoreResult<bool> {
-        let client = self.get_client().await?;
-        let row = client
-            .query_opt(
+        let mut conn = self.checkout_guarded_client().await?;
+        conn.arm_for_query("PostgreSQL read")?;
+        let res = run_pg_bounded(
+            "PostgreSQL read",
+            conn.client().query_opt(
                 "SELECT 1 FROM views WHERE repo_id = $1 AND view_id = $2 LIMIT 1",
                 &[&repo_id, &view_id],
-            )
-            .await
-            .map_err(map_pg_err)?;
+            ),
+        )
+        .await?;
+        conn.mark_clean_if_healthy(&res);
+        let row = res.map_err(map_pg_err)?;
         Ok(row.is_some())
     }
 
@@ -607,14 +628,18 @@ impl PostgresMetadataStore {
         repo_id: &str,
         view_id: &[u8],
     ) -> StoreResult<Option<View>> {
-        let client = self.get_client().await?;
-        let row = client
-            .query_opt(
+        let mut conn = self.checkout_guarded_client().await?;
+        conn.arm_for_query("PostgreSQL read")?;
+        let res = run_pg_bounded(
+            "PostgreSQL read",
+            conn.client().query_opt(
                 "SELECT proto_bytes FROM views WHERE repo_id = $1 AND view_id = $2",
                 &[&repo_id, &view_id],
-            )
-            .await
-            .map_err(map_pg_err)?;
+            ),
+        )
+        .await?;
+        conn.mark_clean_if_healthy(&res);
+        let row = res.map_err(map_pg_err)?;
         row.map(|r| {
             let bytes: Vec<u8> = r.get(0);
             View::decode(bytes.as_slice()).map_err(|e| {
@@ -625,18 +650,22 @@ impl PostgresMetadataStore {
     }
 
     pub(super) async fn get_op_heads_impl(&self, repo_id: &str) -> StoreResult<Option<Vec<OpId>>> {
-        let client = self.get_client().await?;
-        let rows = client
-            .query(
+        let mut conn = self.checkout_guarded_client().await?;
+        conn.arm_for_query("PostgreSQL read")?;
+        let res = run_pg_bounded(
+            "PostgreSQL read",
+            conn.client().query(
                 "SELECT oh.op_id
                  FROM repositories r
                  LEFT JOIN op_heads oh ON oh.repo_id = r.repo_id
                  WHERE r.repo_id = $1
                  ORDER BY oh.added_seq ASC, oh.op_id ASC",
                 &[&repo_id],
-            )
-            .await
-            .map_err(map_pg_err)?;
+            ),
+        )
+        .await?;
+        conn.mark_clean_if_healthy(&res);
+        let rows = res.map_err(map_pg_err)?;
         if rows.is_empty() {
             return Ok(None);
         }

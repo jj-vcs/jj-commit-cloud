@@ -38,8 +38,8 @@ use tokio::io::AsyncReadExt as _;
 use super::bearer::{MAX_TOKEN_FILE_BYTES, ScrubbedToken, scrub_bytes};
 use super::{
     CallerIdentity, CallerKind, HTTP_REQUEST_TIMEOUT, MAX_AUTH_TOKEN_BYTES, MAX_HTTP_BODY_BYTES,
-    VerifyError, build_http_client, read_bounded_json, validate_endpoint_url,
-    validate_identity_text,
+    VerifyError, build_http_client, effective_http_timeout, read_bounded_json,
+    validate_endpoint_url, validate_identity_text,
 };
 
 const DEFAULT_TOKENREVIEW_CACHE_TTL: Duration = Duration::from_secs(30);
@@ -396,7 +396,24 @@ impl K8sTokenReviewValidator {
             }
         }
 
-        let _reload_guard = self.sa_token_reload_lock.lock().await;
+        let _reload_guard = match crate::resilience::remaining_rpc_deadline() {
+            Some(rem) if rem.is_zero() => {
+                return Err(VerifyError::DeadlineExceeded(
+                    "gRPC deadline expired waiting for ServiceAccount token reload lock"
+                        .to_string(),
+                ));
+            }
+            Some(rem) => match tokio::time::timeout(rem, self.sa_token_reload_lock.lock()).await {
+                Ok(guard) => guard,
+                Err(_) => {
+                    return Err(VerifyError::DeadlineExceeded(
+                        "gRPC deadline exceeded waiting for ServiceAccount token reload lock"
+                            .to_string(),
+                    ));
+                }
+            },
+            None => self.sa_token_reload_lock.lock().await,
+        };
         {
             let cache = self
                 .sa_token_cache
@@ -415,7 +432,24 @@ impl K8sTokenReviewValidator {
             }
         }
 
-        match read_sa_token_file_async(sa_path).await {
+        let read_res = match crate::resilience::remaining_rpc_deadline() {
+            Some(rem) if rem.is_zero() => {
+                return Err(VerifyError::DeadlineExceeded(
+                    "gRPC deadline expired reading ServiceAccount token file".to_string(),
+                ));
+            }
+            Some(rem) => match tokio::time::timeout(rem, read_sa_token_file_async(sa_path)).await {
+                Ok(res) => res,
+                Err(_) => {
+                    return Err(VerifyError::DeadlineExceeded(
+                        "gRPC deadline exceeded reading ServiceAccount token file".to_string(),
+                    ));
+                }
+            },
+            None => read_sa_token_file_async(sa_path).await,
+        };
+
+        match read_res {
             Ok(fresh_raw) => {
                 let token = Arc::new(ScrubbedToken::new(fresh_raw));
                 let mut cache = self
@@ -451,12 +485,39 @@ impl K8sTokenReviewValidator {
         payload: &TokenReviewRequest<'_>,
         sa_token: Option<&ScrubbedToken>,
     ) -> Result<reqwest::Response, VerifyError> {
-        let mut req = self.client.post(&self.endpoint_url).json(payload);
+        let timeout = effective_http_timeout(HTTP_REQUEST_TIMEOUT)?;
+        let mut req = self
+            .client
+            .post(&self.endpoint_url)
+            .timeout(timeout)
+            .json(payload);
         if let Some(sa_token) = sa_token {
             req = req.bearer_auth(sa_token.as_str());
         }
-        req.send().await.map_err(|e| {
-            VerifyError::Backend(format!("Kubernetes TokenReview request failed: {e}"))
+        let res = match tokio::time::timeout(timeout, req.send()).await {
+            Ok(res) => res,
+            Err(_) => {
+                return if crate::resilience::remaining_rpc_deadline().is_some_and(|r| r.is_zero()) {
+                    Err(VerifyError::DeadlineExceeded(
+                        "gRPC deadline exceeded during Kubernetes TokenReview request".to_string(),
+                    ))
+                } else {
+                    Err(VerifyError::Backend(
+                        "Kubernetes TokenReview request timed out".to_string(),
+                    ))
+                };
+            }
+        };
+        res.map_err(|e| {
+            if e.is_timeout()
+                && crate::resilience::remaining_rpc_deadline().is_some_and(|r| r.is_zero())
+            {
+                VerifyError::DeadlineExceeded(
+                    "gRPC deadline exceeded during Kubernetes TokenReview request".to_string(),
+                )
+            } else {
+                VerifyError::Backend(format!("Kubernetes TokenReview request failed: {e}"))
+            }
         })
     }
 
@@ -498,9 +559,7 @@ impl K8sTokenReviewValidator {
         }
 
         let review: TokenReviewResponse =
-            read_bounded_json(resp, MAX_HTTP_BODY_BYTES, "Kubernetes TokenReview")
-                .await
-                .map_err(VerifyError::Backend)?;
+            read_bounded_json(resp, MAX_HTTP_BODY_BYTES, "Kubernetes TokenReview").await?;
         let status = review.status.ok_or_else(|| {
             VerifyError::Backend("Kubernetes TokenReview response missing status".to_string())
         })?;
@@ -561,6 +620,11 @@ impl K8sTokenReviewValidator {
     pub(super) async fn verify_detailed(&self, token: &str) -> Result<CallerIdentity, VerifyError> {
         let token_digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
         loop {
+            if crate::resilience::remaining_rpc_deadline().is_some_and(|r| r.is_zero()) {
+                return Err(VerifyError::DeadlineExceeded(
+                    "gRPC deadline expired before Kubernetes TokenReview".to_string(),
+                ));
+            }
             if let Some(identity) = self.lookup_cached(&token_digest) {
                 return Ok(identity);
             }
@@ -593,7 +657,25 @@ impl K8sTokenReviewValidator {
                         if let Some(res) = rx.borrow_and_update().clone() {
                             break Some(res);
                         }
-                        if rx.changed().await.is_err() {
+                        let changed = match crate::resilience::remaining_rpc_deadline() {
+                            Some(rem) if rem.is_zero() => {
+                                return Err(VerifyError::DeadlineExceeded(
+                                    "gRPC deadline expired waiting for coalesced TokenReview"
+                                        .to_string(),
+                                ));
+                            }
+                            Some(rem) => match tokio::time::timeout(rem, rx.changed()).await {
+                                Ok(res) => res,
+                                Err(_) => {
+                                    return Err(VerifyError::DeadlineExceeded(
+                                        "gRPC deadline exceeded waiting for coalesced TokenReview"
+                                            .to_string(),
+                                    ));
+                                }
+                            },
+                            None => rx.changed().await,
+                        };
+                        if changed.is_err() {
                             break rx.borrow_and_update().clone();
                         }
                     };
@@ -611,8 +693,17 @@ impl K8sTokenReviewValidator {
                         return Ok(identity);
                     }
 
+                    let permit_timeout = match effective_http_timeout(self.permit_acquire_timeout) {
+                        Ok(t) => t,
+                        Err(err) => {
+                            // Drop guard without completing so coalesced waiters with larger
+                            // deadlines promote a new leader instead of inheriting our deadline.
+                            drop(guard);
+                            return Err(err);
+                        }
+                    };
                     let result = match tokio::time::timeout(
-                        self.permit_acquire_timeout,
+                        permit_timeout,
                         self.in_flight_semaphore.acquire(),
                     )
                     .await
@@ -621,10 +712,29 @@ impl K8sTokenReviewValidator {
                         Ok(Err(_)) => Err(VerifyError::Backend(
                             "Kubernetes TokenReview concurrency semaphore closed".to_string(),
                         )),
-                        Err(_) => Err(VerifyError::Backend(
-                            "Kubernetes TokenReview concurrency queue timed out".to_string(),
-                        )),
+                        Err(_) => {
+                            if crate::resilience::remaining_rpc_deadline()
+                                .is_some_and(|r| r.is_zero())
+                            {
+                                Err(VerifyError::DeadlineExceeded(
+                                    "gRPC deadline exceeded waiting for TokenReview concurrency permit"
+                                        .to_string(),
+                                ))
+                            } else {
+                                Err(VerifyError::Backend(
+                                    "Kubernetes TokenReview concurrency queue timed out"
+                                        .to_string(),
+                                ))
+                            }
+                        }
                     };
+
+                    if matches!(result, Err(VerifyError::DeadlineExceeded(_))) {
+                        // Drop guard without publishing a local deadline error to coalesced
+                        // waiters so they can elect a fresh leader under their own budgets.
+                        drop(guard);
+                        return result;
+                    }
 
                     if let Ok(identity) = &result
                         && !self.cache_ttl.is_zero()

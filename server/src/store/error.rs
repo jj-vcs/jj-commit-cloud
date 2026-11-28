@@ -18,7 +18,8 @@
 //! Storage implementations return [`StoreError`] variants rather than raw `tonic::Status`
 //! values so error mapping stays consistent across `MetadataStore`, `BlobStore`, and
 //! `CompositeStore` callers (`NOT_FOUND`, `ALREADY_EXISTS`, `ABORTED`, `FAILED_PRECONDITION`,
-//! `INVALID_ARGUMENT`, `OUT_OF_RANGE`, `RESOURCE_EXHAUSTED`, `UNAVAILABLE`).
+//! `INVALID_ARGUMENT`, `OUT_OF_RANGE`, `DEADLINE_EXCEEDED`, `RESOURCE_EXHAUSTED`,
+//! `UNAVAILABLE`), with outgoing error messages sanitized and length-bounded for HTTP/2.
 
 use thiserror::Error;
 
@@ -60,6 +61,9 @@ pub enum StoreError {
     #[error("corrupt persisted metadata: {0}")]
     Corruption(String),
 
+    #[error("request deadline exceeded: {0}")]
+    DeadlineExceeded(String),
+
     #[error("storage backend unavailable: {0}")]
     Unavailable(String),
 
@@ -79,24 +83,64 @@ pub enum StoreError {
 impl From<StoreError> for tonic::Status {
     fn from(err: StoreError) -> Self {
         match err {
-            StoreError::RepoNotFound { .. } | StoreError::ObjectNotFound { .. } => {
-                tonic::Status::not_found(err.to_string())
+            // Client-actionable errors preserve sanitized, wire-length-bounded messages.
+            err @ (StoreError::RepoNotFound { .. } | StoreError::ObjectNotFound { .. }) => {
+                tonic::Status::not_found(crate::resilience::sanitize_grpc_error_message(
+                    &err.to_string(),
+                ))
             }
-            StoreError::RepoAlreadyExists(_) | StoreError::ProjectAlreadyExists(_) => {
-                tonic::Status::already_exists(err.to_string())
+            err @ (StoreError::RepoAlreadyExists(_) | StoreError::ProjectAlreadyExists(_)) => {
+                tonic::Status::already_exists(crate::resilience::sanitize_grpc_error_message(
+                    &err.to_string(),
+                ))
             }
-            StoreError::CasConflict(_) => tonic::Status::aborted(err.to_string()),
-            StoreError::MissingDependency { .. } | StoreError::FailedPrecondition(_) => {
-                tonic::Status::failed_precondition(err.to_string())
+            err @ StoreError::CasConflict(_) => tonic::Status::aborted(
+                crate::resilience::sanitize_grpc_error_message(&err.to_string()),
+            ),
+            err @ (StoreError::MissingDependency { .. } | StoreError::FailedPrecondition(_)) => {
+                tonic::Status::failed_precondition(crate::resilience::sanitize_grpc_error_message(
+                    &err.to_string(),
+                ))
             }
-            StoreError::InvalidArgument(_) => tonic::Status::invalid_argument(err.to_string()),
-            StoreError::OutOfRange(_) => tonic::Status::out_of_range(err.to_string()),
-            StoreError::Corruption(_) => tonic::Status::data_loss(err.to_string()),
-            StoreError::Unavailable(_) => tonic::Status::unavailable(err.to_string()),
-            StoreError::ResourceExhausted(_) => tonic::Status::resource_exhausted(err.to_string()),
-            StoreError::PermissionDenied(_) => tonic::Status::permission_denied(err.to_string()),
-            StoreError::Unauthenticated(_) => tonic::Status::unauthenticated(err.to_string()),
-            StoreError::Backend(_) => tonic::Status::internal(err.to_string()),
+            err @ StoreError::InvalidArgument(_) => tonic::Status::invalid_argument(
+                crate::resilience::sanitize_grpc_error_message(&err.to_string()),
+            ),
+            err @ StoreError::OutOfRange(_) => tonic::Status::out_of_range(
+                crate::resilience::sanitize_grpc_error_message(&err.to_string()),
+            ),
+            // Infrastructure/backend errors log full details server-side and return generic
+            // messages so SQLSTATEs, schema details, filesystem paths, and URLs never leak.
+            StoreError::Corruption(detail) => {
+                tracing::error!(error = %detail, "Storage corruption detected");
+                tonic::Status::data_loss("corrupt persisted metadata")
+            }
+            StoreError::DeadlineExceeded(detail) => {
+                tracing::warn!(error = %detail, "Storage operation exceeded deadline");
+                tonic::Status::deadline_exceeded("request deadline exceeded")
+            }
+            StoreError::Unavailable(detail) => {
+                tracing::warn!(error = %detail, "Storage backend unavailable");
+                tonic::Status::unavailable("storage backend unavailable")
+            }
+            StoreError::ResourceExhausted(detail) => {
+                tracing::warn!(error = %detail, "Storage backend resource exhausted");
+                tonic::Status::resource_exhausted("storage backend resource exhausted")
+            }
+            StoreError::PermissionDenied(detail) => {
+                tracing::error!(error = %detail, "Storage backend permission denied");
+                tonic::Status::permission_denied("storage backend permission denied")
+            }
+            StoreError::Unauthenticated(detail) => {
+                // Server-side storage credential failures must not emit client-facing
+                // `UNAUTHENTICATED` (`grpc-status: 16`), which misleads callers about their
+                // own token and suppresses `MetricsLayer` latency recording.
+                tracing::error!(error = %detail, "Storage backend authentication failed");
+                tonic::Status::internal("storage backend error")
+            }
+            StoreError::Backend(detail) => {
+                tracing::error!(error = %detail, "Storage backend error");
+                tonic::Status::internal("storage backend error")
+            }
         }
     }
 }
@@ -104,11 +148,16 @@ impl From<StoreError> for tonic::Status {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resilience::MAX_GRPC_ERROR_MESSAGE_BYTES;
     use tonic::Code;
 
     #[test]
     fn backend_failure_classes_keep_distinct_status_codes() {
         let cases = [
+            (
+                StoreError::DeadlineExceeded("x".into()),
+                Code::DeadlineExceeded,
+            ),
             (StoreError::Unavailable("x".into()), Code::Unavailable),
             (
                 StoreError::ResourceExhausted("x".into()),
@@ -118,10 +167,9 @@ mod tests {
                 StoreError::PermissionDenied("x".into()),
                 Code::PermissionDenied,
             ),
-            (
-                StoreError::Unauthenticated("x".into()),
-                Code::Unauthenticated,
-            ),
+            // Backend auth errors map to INTERNAL so clients do not misread them as caller
+            // token rejections and `MetricsLayer` still records RPC latency.
+            (StoreError::Unauthenticated("x".into()), Code::Internal),
             (StoreError::CasConflict("x".into()), Code::Aborted),
             (
                 StoreError::FailedPrecondition("x".into()),
@@ -131,6 +179,57 @@ mod tests {
         ];
         for (err, code) in cases {
             assert_eq!(tonic::Status::from(err.clone()).code(), code, "{err:?}");
+        }
+    }
+
+    #[test]
+    fn status_conversion_sanitizes_client_errors_and_redacts_internal_storage_errors() {
+        let raw = format!("bad input\r\nwith\0controls {}", "x".repeat(4000));
+        let client_status = tonic::Status::from(StoreError::InvalidArgument(raw));
+        assert_eq!(client_status.code(), Code::InvalidArgument);
+        assert!(client_status.message().len() <= MAX_GRPC_ERROR_MESSAGE_BYTES);
+        assert!(
+            !client_status
+                .message()
+                .bytes()
+                .any(|b| b.is_ascii_control())
+        );
+        assert!(client_status.message().ends_with("..."));
+
+        let secret_detail = "SQLSTATE 42P01 relation \"secret_tbl\" at /var/lib/pg/data https://internal.bucket/xml";
+        for (err, expected_code) in [
+            (StoreError::Backend(secret_detail.into()), Code::Internal),
+            (
+                StoreError::Unavailable(secret_detail.into()),
+                Code::Unavailable,
+            ),
+            (StoreError::Corruption(secret_detail.into()), Code::DataLoss),
+            (
+                StoreError::ResourceExhausted(secret_detail.into()),
+                Code::ResourceExhausted,
+            ),
+            (
+                StoreError::PermissionDenied(secret_detail.into()),
+                Code::PermissionDenied,
+            ),
+            (
+                StoreError::Unauthenticated(secret_detail.into()),
+                Code::Internal,
+            ),
+            (
+                StoreError::DeadlineExceeded(secret_detail.into()),
+                Code::DeadlineExceeded,
+            ),
+        ] {
+            let status = tonic::Status::from(err);
+            assert_eq!(status.code(), expected_code);
+            assert!(
+                !status.message().contains("secret_tbl")
+                    && !status.message().contains("/var/lib/pg")
+                    && !status.message().contains("internal.bucket")
+                    && !status.message().contains("SQLSTATE"),
+                "leaked internal storage detail in {status:?}"
+            );
         }
     }
 }

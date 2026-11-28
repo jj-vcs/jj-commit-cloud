@@ -549,22 +549,23 @@ impl SpannerMetadataStore {
         repo_id: &str,
         op_id: &[u8],
     ) -> StoreResult<Option<Operation>> {
-        let stmt = Statement::builder(
-            "SELECT ProtoBytes FROM Operations WHERE RepoId = @repo_id AND OperationId = @op_id",
-        )
-        .add_param("repo_id", repo_id)
-        .add_param("op_id", op_id)
-        .build();
-        let tx = self.db_client.single_use().build();
-        let mut rs = tx.execute_query(stmt).await.map_err(map_spanner_err)?;
-        let Some(row) = rs.next().await.transpose().map_err(map_spanner_err)? else {
-            return Ok(None);
-        };
-        let proto_bytes: Vec<u8> = row.get("ProtoBytes").map_err(map_spanner_err)?;
-        let op = Operation::decode(proto_bytes.as_slice()).map_err(|e| {
-            StoreError::Corruption(format!("failed to decode Spanner Operation: {e}"))
-        })?;
-        Ok(Some(op))
+        crate::resilience::run_with_rpc_deadline("Spanner read", async {
+            let stmt = Statement::builder(
+                "SELECT ProtoBytes FROM Operations WHERE RepoId = @repo_id AND OperationId = @op_id",
+            )
+            .add_param("repo_id", repo_id)
+            .add_param("op_id", op_id);
+            let mut rs = self.single_use_query(stmt).await?;
+            let Some(row) = rs.next().await.transpose().map_err(map_spanner_err)? else {
+                return Ok(None);
+            };
+            let proto_bytes: Vec<u8> = row.get("ProtoBytes").map_err(map_spanner_err)?;
+            let op = Operation::decode(proto_bytes.as_slice()).map_err(|e| {
+                StoreError::Corruption(format!("failed to decode Spanner Operation: {e}"))
+            })?;
+            Ok(Some(op))
+        })
+        .await
     }
 
     pub(super) async fn resolve_operation_id_prefix_impl(
@@ -573,25 +574,26 @@ impl SpannerMetadataStore {
         min_id: &[u8],
         max_id: &[u8],
     ) -> StoreResult<Vec<OpId>> {
-        let stmt = Statement::builder(
-            "SELECT OperationId FROM Operations
-             WHERE RepoId = @repo_id AND OperationId >= @min_id AND OperationId <= @max_id
-             ORDER BY OperationId ASC
-             LIMIT 2",
-        )
-        .add_param("repo_id", repo_id)
-        .add_param("min_id", min_id)
-        .add_param("max_id", max_id)
-        .build();
+        crate::resilience::run_with_rpc_deadline("Spanner read", async {
+            let stmt = Statement::builder(
+                "SELECT OperationId FROM Operations
+                 WHERE RepoId = @repo_id AND OperationId >= @min_id AND OperationId <= @max_id
+                 ORDER BY OperationId ASC
+                 LIMIT 2",
+            )
+            .add_param("repo_id", repo_id)
+            .add_param("min_id", min_id)
+            .add_param("max_id", max_id);
 
-        let tx = self.db_client.single_use().build();
-        let mut rs = tx.execute_query(stmt).await.map_err(map_spanner_err)?;
-        let mut matches = Vec::new();
-        while let Some(row) = rs.next().await.transpose().map_err(map_spanner_err)? {
-            let op_id: Vec<u8> = row.get("OperationId").map_err(map_spanner_err)?;
-            matches.push(op_id);
-        }
-        Ok(matches)
+            let mut rs = self.single_use_query(stmt).await?;
+            let mut matches = Vec::new();
+            while let Some(row) = rs.next().await.transpose().map_err(map_spanner_err)? {
+                let op_id: Vec<u8> = row.get("OperationId").map_err(map_spanner_err)?;
+                matches.push(op_id);
+            }
+            Ok(matches)
+        })
+        .await
     }
 
     pub(super) async fn get_view_impl(
@@ -599,50 +601,55 @@ impl SpannerMetadataStore {
         repo_id: &str,
         view_id: &[u8],
     ) -> StoreResult<Option<View>> {
-        let stmt = Statement::builder(
-            "SELECT ProtoBytes FROM Views WHERE RepoId = @repo_id AND ViewId = @view_id",
-        )
-        .add_param("repo_id", repo_id)
-        .add_param("view_id", view_id)
-        .build();
-        let tx = self.db_client.single_use().build();
-        let mut rs = tx.execute_query(stmt).await.map_err(map_spanner_err)?;
-        let Some(row) = rs.next().await.transpose().map_err(map_spanner_err)? else {
-            return Ok(None);
-        };
-        let proto_bytes: Vec<u8> = row.get("ProtoBytes").map_err(map_spanner_err)?;
-        let view = View::decode(proto_bytes.as_slice())
-            .map_err(|e| StoreError::Corruption(format!("failed to decode Spanner View: {e}")))?;
-        Ok(Some(view))
+        crate::resilience::run_with_rpc_deadline("Spanner read", async {
+            let stmt = Statement::builder(
+                "SELECT ProtoBytes FROM Views WHERE RepoId = @repo_id AND ViewId = @view_id",
+            )
+            .add_param("repo_id", repo_id)
+            .add_param("view_id", view_id);
+            let mut rs = self.single_use_query(stmt).await?;
+            let Some(row) = rs.next().await.transpose().map_err(map_spanner_err)? else {
+                return Ok(None);
+            };
+            let proto_bytes: Vec<u8> = row.get("ProtoBytes").map_err(map_spanner_err)?;
+            let view = View::decode(proto_bytes.as_slice()).map_err(|e| {
+                StoreError::Corruption(format!("failed to decode Spanner View: {e}"))
+            })?;
+            Ok(Some(view))
+        })
+        .await
     }
 
     pub(super) async fn has_view_impl(&self, repo_id: &str, view_id: &[u8]) -> StoreResult<bool> {
-        let stmt = Statement::builder(
-            "SELECT 1 FROM Views WHERE RepoId = @repo_id AND ViewId = @view_id LIMIT 1",
-        )
-        .add_param("repo_id", repo_id)
-        .add_param("view_id", view_id)
-        .build();
-        let tx = self.db_client.single_use().build();
-        let mut rs = tx.execute_query(stmt).await.map_err(map_spanner_err)?;
-        Ok(rs
-            .next()
-            .await
-            .transpose()
-            .map_err(map_spanner_err)?
-            .is_some())
+        crate::resilience::run_with_rpc_deadline("Spanner read", async {
+            let stmt = Statement::builder(
+                "SELECT 1 FROM Views WHERE RepoId = @repo_id AND ViewId = @view_id LIMIT 1",
+            )
+            .add_param("repo_id", repo_id)
+            .add_param("view_id", view_id);
+            let mut rs = self.single_use_query(stmt).await?;
+            Ok(rs
+                .next()
+                .await
+                .transpose()
+                .map_err(map_spanner_err)?
+                .is_some())
+        })
+        .await
     }
 
     pub(super) async fn get_op_heads_impl(&self, repo_id: &str) -> StoreResult<Option<Vec<OpId>>> {
-        let stmt = Statement::builder("SELECT OpHeads FROM Repositories WHERE RepoId = @repo_id")
-            .add_param("repo_id", repo_id)
-            .build();
-        let tx = self.db_client.single_use().build();
-        let mut rs = tx.execute_query(stmt).await.map_err(map_spanner_err)?;
-        let Some(row) = rs.next().await.transpose().map_err(map_spanner_err)? else {
-            return Ok(None);
-        };
-        let heads: Vec<Vec<u8>> = row.get("OpHeads").map_err(map_spanner_err)?;
-        Ok(Some(heads))
+        crate::resilience::run_with_rpc_deadline("Spanner read", async {
+            let stmt =
+                Statement::builder("SELECT OpHeads FROM Repositories WHERE RepoId = @repo_id")
+                    .add_param("repo_id", repo_id);
+            let mut rs = self.single_use_query(stmt).await?;
+            let Some(row) = rs.next().await.transpose().map_err(map_spanner_err)? else {
+                return Ok(None);
+            };
+            let heads: Vec<Vec<u8>> = row.get("OpHeads").map_err(map_spanner_err)?;
+            Ok(Some(heads))
+        })
+        .await
     }
 }

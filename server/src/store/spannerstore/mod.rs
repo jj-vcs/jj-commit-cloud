@@ -32,7 +32,8 @@
 //!
 //! # Cross-Process and RPC Boundaries
 //! Supports Cloud Spanner via ADC, Spanner Omni via custom endpoints and CA/mTLS, and the
-//! Cloud Spanner Emulator (`--spanner-emulator` or `SPANNER_EMULATOR_HOST`).
+//! Cloud Spanner Emulator (`--spanner-emulator` or `SPANNER_EMULATOR_HOST`). Honors active
+//! gRPC request deadlines across read-write transactions, read-only queries, and writes.
 
 mod codec;
 mod objects;
@@ -57,14 +58,19 @@ use async_trait::async_trait;
 use cc_common::backend::{Commit, TreeEntry};
 use cc_common::op_store::{Operation, View};
 use cc_common::workspace::WorkspaceState;
-use google_cloud_spanner::builder::TransactionRunnerBuilder;
+use google_cloud_spanner::builder::{
+    MultiUseReadOnlyTransactionBuilder, TransactionRunnerBuilder, WriteOnlyTransactionBuilder,
+};
 use google_cloud_spanner::channel_pool::StaticChannelPoolConfig;
 use google_cloud_spanner::client::{DatabaseClient, Spanner, SpannerBuilderExt};
 use google_cloud_spanner::model::transaction_options::IsolationLevel;
 use google_cloud_spanner::omni::{InstanceType, TlsConfig};
+use google_cloud_spanner::result::ResultSet;
+use google_cloud_spanner::statement::StatementBuilder;
 use google_cloud_spanner::transaction::ReadWriteTransaction;
 
 use super::{BlobRecord, CommitId, MetadataStore, OpId, StoreError, StoreResult};
+use codec::{build_statement_with_deadline, effective_rw_tx_timeout, map_spanner_err};
 use repo::{clamp_delete_batch_limit, clamp_max_delete_batch_iterations};
 use schema::ensure_database_and_schema;
 
@@ -224,11 +230,43 @@ impl SpannerMetadataStore {
         }
     }
 
-    fn rw_transaction(&self) -> TransactionRunnerBuilder {
+    fn rw_transaction(&self, timeout: Duration) -> TransactionRunnerBuilder {
         self.db_client
             .read_write_transaction()
             .set_isolation_level(IsolationLevel::Serializable)
-            .with_transaction_timeout(RW_TRANSACTION_TIMEOUT)
+            .with_transaction_timeout(timeout)
+            .with_begin_attempt_timeout(timeout)
+            .with_commit_attempt_timeout(timeout)
+    }
+
+    fn ro_transaction(&self) -> StoreResult<MultiUseReadOnlyTransactionBuilder> {
+        let builder = self.db_client.read_only_transaction();
+        match crate::resilience::remaining_rpc_deadline() {
+            Some(rem) if rem.is_zero() => Err(StoreError::DeadlineExceeded(
+                "gRPC deadline expired before starting Spanner read-only transaction".to_string(),
+            )),
+            Some(rem) => Ok(builder.with_begin_attempt_timeout(rem)),
+            None => Ok(builder),
+        }
+    }
+
+    fn wo_transaction(&self) -> StoreResult<WriteOnlyTransactionBuilder> {
+        let builder = self.db_client.write_only_transaction();
+        match crate::resilience::remaining_rpc_deadline() {
+            Some(rem) if rem.is_zero() => Err(StoreError::DeadlineExceeded(
+                "gRPC deadline expired before starting Spanner write-only transaction".to_string(),
+            )),
+            Some(rem) => Ok(builder
+                .with_begin_attempt_timeout(rem)
+                .with_commit_attempt_timeout(rem)),
+            None => Ok(builder),
+        }
+    }
+
+    async fn single_use_query(&self, builder: StatementBuilder) -> StoreResult<ResultSet> {
+        let stmt = build_statement_with_deadline(builder)?;
+        let tx = self.db_client.single_use().build();
+        tx.execute_query(stmt).await.map_err(map_spanner_err)
     }
 
     /// Runs a serializable read-write transaction where conflict or no-op branches can return
@@ -240,26 +278,50 @@ impl SpannerMetadataStore {
     where
         F: AsyncFnMut(ReadWriteTransaction) -> google_cloud_spanner::Result<TxAction<T>>,
     {
+        let rem = crate::resilience::remaining_rpc_deadline();
+        let tx_timeout = match effective_rw_tx_timeout(rem) {
+            Ok(t) => t,
+            Err(err) => return Ok(Err(err)),
+        };
+
         let early_exit: Arc<std::sync::Mutex<Option<StoreResult<T>>>> =
             Arc::new(std::sync::Mutex::new(None));
         let early_exit_cb = Arc::clone(&early_exit);
         let retry_tracker = self.new_retry_tracker();
-        let runner = self.rw_transaction().build();
-        let res = runner
-            .run(async move |tx| {
-                retry_tracker.record_attempt();
-                *early_exit_cb.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                match work(tx).await? {
-                    TxAction::Commit(val) => Ok(val),
-                    TxAction::Rollback(outcome) => {
-                        *early_exit_cb.lock().unwrap_or_else(|e| e.into_inner()) = Some(outcome);
-                        // Non-status `deser` error triggers `transaction.rollback()` without
-                        // matching `is_aborted` / emulator retry checks.
-                        Err(google_cloud_spanner::Error::deser(TxRollbackSentinel))
-                    }
+        let runner = self.rw_transaction(tx_timeout).build();
+        let run_fut = runner.run(async move |tx| {
+            if let Some(rem) = crate::resilience::remaining_rpc_deadline()
+                && rem.is_zero()
+            {
+                *early_exit_cb.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(Err(StoreError::DeadlineExceeded(
+                        "gRPC deadline expired during Spanner read-write transaction".to_string(),
+                    )));
+                return Err(google_cloud_spanner::Error::deser(TxRollbackSentinel));
+            }
+            retry_tracker.record_attempt();
+            *early_exit_cb.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            match work(tx).await? {
+                TxAction::Commit(val) => Ok(val),
+                TxAction::Rollback(outcome) => {
+                    *early_exit_cb.lock().unwrap_or_else(|e| e.into_inner()) = Some(outcome);
+                    // Non-status `deser` error triggers `transaction.rollback()` without
+                    // matching `is_aborted` / emulator retry checks.
+                    Err(google_cloud_spanner::Error::deser(TxRollbackSentinel))
                 }
-            })
-            .await;
+            }
+        });
+        let res = match rem {
+            Some(rem) => match tokio::time::timeout(rem, run_fut).await {
+                Ok(res) => res,
+                Err(_) => {
+                    return Ok(Err(StoreError::DeadlineExceeded(
+                        "gRPC deadline exceeded during Spanner read-write transaction".to_string(),
+                    )));
+                }
+            },
+            None => run_fut.await,
+        };
         match res {
             Ok(committed) => Ok(Ok(committed.into_inner())),
             Err(err) => {

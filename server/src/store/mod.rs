@@ -512,16 +512,20 @@ pub(crate) fn stream_inline_blob(
     let slice = slice_blob_range(&inline, offset, length)?;
     let (tx, rx) = mpsc::channel(8);
     if !slice.is_empty() {
-        tokio::spawn(async move {
-            let mut pos = 0usize;
-            while pos < slice.len() {
-                let end = (pos + cc_common::FILE_STREAM_CHUNK_SIZE).min(slice.len());
-                if tx.send(Ok(slice.slice(pos..end))).await.is_err() {
-                    return;
+        crate::resilience::spawn_blob_stream_producer(
+            "inline blob stream",
+            tx,
+            move |tx| async move {
+                let mut pos = 0usize;
+                while pos < slice.len() {
+                    let end = (pos + cc_common::FILE_STREAM_CHUNK_SIZE).min(slice.len());
+                    if tx.send(Ok(slice.slice(pos..end))).await.is_err() {
+                        return;
+                    }
+                    pos = end;
                 }
-                pos = end;
-            }
-        });
+            },
+        );
     }
     Ok(Some(rx))
 }
@@ -585,12 +589,20 @@ pub trait BlobStore: Send + Sync + 'static {
                 "blob size {size} exceeds permit budget capacity"
             ))
         })?;
-        let _permit = FALLBACK_BLOB_UPLOAD_BUDGET
-            .clone()
-            .acquire_many_owned(permits)
-            .await
-            .map_err(|_| StoreError::ResourceExhausted("upload budget closed".to_string()))?;
-        let data = read_bounded_file(temp_path, size).await?;
+        let _permit =
+            crate::resilience::run_with_rpc_deadline("blob upload staging permit", async move {
+                FALLBACK_BLOB_UPLOAD_BUDGET
+                    .clone()
+                    .acquire_many_owned(permits)
+                    .await
+                    .map_err(|_| StoreError::ResourceExhausted("upload budget closed".to_string()))
+            })
+            .await?;
+        let data = crate::resilience::run_with_rpc_deadline(
+            "blob upload staging read",
+            read_bounded_file(temp_path, size),
+        )
+        .await?;
         self.put_blob(blob_id, data).await
     }
 
@@ -697,76 +709,80 @@ pub trait BlobStore: Send + Sync + 'static {
             return Ok(Some(rx));
         }
 
-        tokio::spawn(async move {
-            let mut pos = 0usize;
-            while pos < first_bytes.len() {
-                let end = (pos + cc_common::FILE_STREAM_CHUNK_SIZE).min(first_bytes.len());
-                if tx.send(Ok(first_bytes.slice(pos..end))).await.is_err() {
-                    return;
+        crate::resilience::spawn_blob_stream_producer(
+            "blob range stream",
+            tx,
+            move |tx| async move {
+                let mut pos = 0usize;
+                while pos < first_bytes.len() {
+                    let end = (pos + cc_common::FILE_STREAM_CHUNK_SIZE).min(first_bytes.len());
+                    if tx.send(Ok(first_bytes.slice(pos..end))).await.is_err() {
+                        return;
+                    }
+                    pos = end;
                 }
-                pos = end;
-            }
 
-            let mut cur_offset = offset + first_window_expected;
-            let mut remaining = expected_len - first_window_expected;
-            while remaining > 0 {
-                let win_expected = remaining.min(BLOB_READ_WINDOW_BYTES);
-                let is_final_eof_window = win_expected == remaining && reading_to_eof;
-                let req_len = if is_final_eof_window {
-                    Some(win_expected.saturating_add(1))
-                } else {
-                    Some(win_expected)
-                };
-                let window = match self
-                    .get_blob_range_with_record(&record, cur_offset, req_len)
-                    .await
-                {
-                    Ok(Some(bytes)) => bytes,
-                    Ok(None) => {
+                let mut cur_offset = offset + first_window_expected;
+                let mut remaining = expected_len - first_window_expected;
+                while remaining > 0 {
+                    let win_expected = remaining.min(BLOB_READ_WINDOW_BYTES);
+                    let is_final_eof_window = win_expected == remaining && reading_to_eof;
+                    let req_len = if is_final_eof_window {
+                        Some(win_expected.saturating_add(1))
+                    } else {
+                        Some(win_expected)
+                    };
+                    let window = match self
+                        .get_blob_range_with_record(&record, cur_offset, req_len)
+                        .await
+                    {
+                        Ok(Some(bytes)) => bytes,
+                        Ok(None) => {
+                            let _ = tx
+                                .send(Err(StoreError::Corruption(format!(
+                                    "blob payload missing in object store mid-stream for file {}",
+                                    hex::encode(&record.blob_id)
+                                ))))
+                                .await;
+                            return;
+                        }
+                        Err(StoreError::OutOfRange(msg)) => {
+                            let _ = tx
+                                .send(Err(StoreError::Corruption(format!(
+                                    "blob payload truncated in object store mid-stream for file {}: {msg}",
+                                    hex::encode(&record.blob_id)
+                                ))))
+                                .await;
+                            return;
+                        }
+                        Err(err) => {
+                            let _ = tx.send(Err(err)).await;
+                            return;
+                        }
+                    };
+                    if window.len() as u64 != win_expected {
                         let _ = tx
                             .send(Err(StoreError::Corruption(format!(
-                                "blob payload missing in object store mid-stream for file {}",
-                                hex::encode(&record.blob_id)
+                                "blob payload length mismatch mid-stream for file {}: expected {win_expected} bytes at offset {cur_offset}, got {} bytes",
+                                hex::encode(&record.blob_id),
+                                window.len()
                             ))))
                             .await;
                         return;
                     }
-                    Err(StoreError::OutOfRange(msg)) => {
-                        let _ = tx
-                            .send(Err(StoreError::Corruption(format!(
-                                "blob payload truncated in object store mid-stream for file {}: {msg}",
-                                hex::encode(&record.blob_id)
-                            ))))
-                            .await;
-                        return;
+                    let mut wpos = 0usize;
+                    while wpos < window.len() {
+                        let end = (wpos + cc_common::FILE_STREAM_CHUNK_SIZE).min(window.len());
+                        if tx.send(Ok(window.slice(wpos..end))).await.is_err() {
+                            return;
+                        }
+                        wpos = end;
                     }
-                    Err(err) => {
-                        let _ = tx.send(Err(err)).await;
-                        return;
-                    }
-                };
-                if window.len() as u64 != win_expected {
-                    let _ = tx
-                        .send(Err(StoreError::Corruption(format!(
-                            "blob payload length mismatch mid-stream for file {}: expected {win_expected} bytes at offset {cur_offset}, got {} bytes",
-                            hex::encode(&record.blob_id),
-                            window.len()
-                        ))))
-                        .await;
-                    return;
+                    cur_offset += win_expected;
+                    remaining -= win_expected;
                 }
-                let mut wpos = 0usize;
-                while wpos < window.len() {
-                    let end = (wpos + cc_common::FILE_STREAM_CHUNK_SIZE).min(window.len());
-                    if tx.send(Ok(window.slice(wpos..end))).await.is_err() {
-                        return;
-                    }
-                    wpos = end;
-                }
-                cur_offset += win_expected;
-                remaining -= win_expected;
-            }
-        });
+            },
+        );
 
         Ok(Some(rx))
     }

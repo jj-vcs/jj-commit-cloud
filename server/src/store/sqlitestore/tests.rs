@@ -939,3 +939,179 @@ async fn test_sqlite_corrupt_tree_ids_json_reports_field_and_repo_name_normalize
         }
     }
 }
+
+#[tokio::test]
+async fn test_sqlite_enforces_rpc_deadline_interrupts_slow_query_and_catches_panic() {
+    use std::time::{Duration, Instant};
+
+    let meta = SqliteMetadataStore::in_memory().unwrap();
+    meta.register_project("proj-dl", None).await.unwrap();
+
+    // Expired deadline fails fast without running the query.
+    let expired = Instant::now()
+        .checked_sub(Duration::from_millis(10))
+        .unwrap_or_else(Instant::now);
+    let expired_err =
+        crate::resilience::with_rpc_deadline(Some(expired), meta.is_project_registered("proj-dl"))
+            .await
+            .unwrap_err();
+    assert!(matches!(expired_err, StoreError::DeadlineExceeded(_)));
+
+    // Long-running SQLite query is actively interrupted via InterruptHandle on short deadline.
+    let short = Instant::now() + Duration::from_millis(40);
+    let start = Instant::now();
+    let slow_err = crate::resilience::with_rpc_deadline(
+        Some(short),
+        meta.with_read_conn(|conn| {
+            let _: i64 = conn
+                .query_row(
+                    "WITH RECURSIVE cnt(x) AS (
+                         SELECT 1
+                         UNION ALL
+                         SELECT x + 1 FROM cnt WHERE x < 50000000
+                     )
+                     SELECT SUM(x) FROM cnt",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| StoreError::Backend(format!("slow query failed: {e}")))?;
+            Ok(())
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(slow_err, StoreError::DeadlineExceeded(_)),
+        "expected DeadlineExceeded, got {slow_err:?}"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "SQLite InterruptHandle must abort long-running query promptly"
+    );
+
+    // Subsequent query on the same connection succeeds after interrupt.
+    assert!(meta.is_project_registered("proj-dl").await.unwrap());
+
+    // Panic inside blocking SQLite closure does not poison the connection mutex, increments
+    // panics_total, and does not leak panic text through tonic::Status.
+    let metrics = crate::metrics::ServerMetrics::new();
+    let panic_err = crate::resilience::with_rpc_context(
+        None,
+        Some(metrics.clone()),
+        meta.with_read_conn(|_conn| -> StoreResult<()> {
+            panic!("secret sqlite panic payload");
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(panic_err, StoreError::Backend(_)));
+    let status = tonic::Status::from(panic_err);
+    assert_eq!(status.code(), tonic::Code::Internal);
+    assert!(!status.message().contains("secret sqlite panic payload"));
+    assert_eq!(metrics.snapshot().panics_total, 1);
+
+    // Store remains usable after catching the panic.
+    assert!(meta.is_project_registered("proj-dl").await.unwrap());
+}
+
+#[tokio::test]
+async fn test_sqlite_clamped_busy_timeout_maps_busy_to_deadline_exceeded_and_restores_default() {
+    use std::time::{Duration, Instant};
+
+    // Sub-millisecond positive deadlines round up to 1ms so `sqlite3_busy_timeout` is never
+    // cleared to 0ms; deadlines >= DEFAULT_SQLITE_BUSY_TIMEOUT do not clamp.
+    assert_eq!(
+        clamp_sqlite_busy_timeout(Duration::from_nanos(1)),
+        Some(Duration::from_millis(1))
+    );
+    assert_eq!(
+        clamp_sqlite_busy_timeout(Duration::from_micros(999)),
+        Some(Duration::from_millis(1))
+    );
+    assert_eq!(
+        clamp_sqlite_busy_timeout(Duration::from_millis(40)),
+        Some(Duration::from_millis(40))
+    );
+    assert_eq!(clamp_sqlite_busy_timeout(DEFAULT_SQLITE_BUSY_TIMEOUT), None);
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("busy_deadline.db");
+    let meta = SqliteMetadataStore::open(&db_path).unwrap();
+
+    // Hold an exclusive write lock on a separate connection to force real SQLITE_BUSY.
+    let locker = Connection::open(&db_path).unwrap();
+    locker.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+
+    // Short clamped deadline on a real write maps lock contention to DeadlineExceeded.
+    let short_dl = Instant::now() + Duration::from_millis(40);
+    let short_err = crate::resilience::with_rpc_deadline(
+        Some(short_dl),
+        meta.register_project("proj-busy-short", None),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(short_err, StoreError::DeadlineExceeded(_)),
+        "expected DeadlineExceeded under short clamped deadline, got {short_err:?}"
+    );
+    assert_eq!(
+        tonic::Status::from(short_err).code(),
+        tonic::Code::DeadlineExceeded
+    );
+
+    // When SQLITE_BUSY returns slightly before `dl` under a clamped busy_timeout (e.g.
+    // due to sub-millisecond truncation or SQLite's stepped busy handler), `with_conn_slot`
+    // still maps it to DeadlineExceeded rather than Backend/Internal.
+    let clamped_dl = Instant::now() + Duration::from_secs(2);
+    let early_busy_err = crate::resilience::with_rpc_deadline(
+        Some(clamped_dl),
+        meta.with_write_conn(|conn| {
+            let active_busy_ms: i64 = conn
+                .query_row("PRAGMA busy_timeout;", [], |row| row.get(0))
+                .map_err(|e| StoreError::Backend(format!("pragma read failed: {e}")))?;
+            assert!(
+                (1..=2000).contains(&active_busy_ms),
+                "expected clamped busy_timeout in 1..=2000ms, got {active_busy_ms}"
+            );
+            // Force immediate SQLITE_BUSY while `Instant::now() < clamped_dl`.
+            conn.busy_timeout(Duration::ZERO)
+                .map_err(|e| StoreError::Backend(format!("set busy_timeout failed: {e}")))?;
+            conn.execute_batch("BEGIN IMMEDIATE;")
+                .map_err(|e| StoreError::Backend(format!("SQLite begin failed: {e}")))?;
+            Ok(())
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        Instant::now() < clamped_dl,
+        "test expected SQLITE_BUSY before outer deadline elapsed"
+    );
+    assert!(
+        matches!(early_busy_err, StoreError::DeadlineExceeded(_)),
+        "clamped SQLITE_BUSY before deadline must map to DeadlineExceeded, got {early_busy_err:?}"
+    );
+    assert_eq!(
+        tonic::Status::from(early_busy_err).code(),
+        tonic::Code::DeadlineExceeded
+    );
+
+    locker.execute_batch("ROLLBACK;").unwrap();
+    drop(locker);
+
+    // After clamped calls complete, the 5s default `busy_timeout` is restored and writes work.
+    let restored_busy_ms: i64 = meta
+        .with_write_conn(|conn| {
+            conn.query_row("PRAGMA busy_timeout;", [], |row| row.get(0))
+                .map_err(|e| StoreError::Backend(format!("pragma read failed: {e}")))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        restored_busy_ms,
+        DEFAULT_SQLITE_BUSY_TIMEOUT.as_millis() as i64
+    );
+    meta.register_project("proj-after-busy", None)
+        .await
+        .unwrap();
+}

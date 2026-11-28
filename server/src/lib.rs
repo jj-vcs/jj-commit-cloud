@@ -40,5 +40,6 @@ pub mod jj_lib_adapters;
 pub mod metrics;
 pub mod op_store;
 pub mod reconcile_op_heads;
+pub mod resilience;
 pub mod store;
 pub mod workspace;

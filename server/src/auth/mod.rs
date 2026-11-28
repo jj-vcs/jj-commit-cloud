@@ -122,13 +122,24 @@ impl ServerAuthConfig {
 enum VerifyError {
     InvalidCredential(String),
     Backend(String),
+    DeadlineExceeded(String),
 }
 
 impl VerifyError {
     fn into_message(self) -> String {
         match self {
-            Self::InvalidCredential(msg) | Self::Backend(msg) => msg,
+            Self::InvalidCredential(msg) | Self::Backend(msg) | Self::DeadlineExceeded(msg) => msg,
         }
+    }
+}
+
+fn effective_http_timeout(default_timeout: Duration) -> Result<Duration, VerifyError> {
+    match crate::resilience::remaining_rpc_deadline() {
+        Some(rem) if rem.is_zero() => Err(VerifyError::DeadlineExceeded(
+            "gRPC deadline expired before outbound auth request".to_string(),
+        )),
+        Some(rem) => Ok(default_timeout.min(rem)),
+        None => Ok(default_timeout),
     }
 }
 
@@ -227,28 +238,57 @@ async fn read_bounded_json<T: DeserializeOwned>(
     mut resp: reqwest::Response,
     max_bytes: usize,
     label: &str,
-) -> Result<T, String> {
+) -> Result<T, VerifyError> {
     if let Some(len) = resp.content_length()
         && len > max_bytes as u64
     {
-        return Err(format!(
+        return Err(VerifyError::Backend(format!(
             "{label} response exceeds maximum size of {max_bytes} bytes"
-        ));
+        )));
     }
     let mut buf = Vec::new();
-    while let Some(chunk) = resp
-        .chunk()
-        .await
-        .map_err(|e| format!("failed to read {label} response body: {e}"))?
-    {
+    loop {
+        let next = match crate::resilience::remaining_rpc_deadline() {
+            Some(rem) if rem.is_zero() => {
+                return Err(VerifyError::DeadlineExceeded(format!(
+                    "gRPC deadline expired while reading {label} response body"
+                )));
+            }
+            Some(rem) => match tokio::time::timeout(rem, resp.chunk()).await {
+                Ok(res) => res,
+                Err(_) => {
+                    return Err(VerifyError::DeadlineExceeded(format!(
+                        "gRPC deadline exceeded while reading {label} response body"
+                    )));
+                }
+            },
+            None => resp.chunk().await,
+        };
+        let chunk = match next {
+            Ok(Some(c)) => c,
+            Ok(None) => break,
+            Err(e) => {
+                if e.is_timeout()
+                    && crate::resilience::remaining_rpc_deadline().is_some_and(|r| r.is_zero())
+                {
+                    return Err(VerifyError::DeadlineExceeded(format!(
+                        "gRPC deadline exceeded while reading {label} response body"
+                    )));
+                }
+                return Err(VerifyError::Backend(format!(
+                    "failed to read {label} response body: {e}"
+                )));
+            }
+        };
         if buf.len().saturating_add(chunk.len()) > max_bytes {
-            return Err(format!(
+            return Err(VerifyError::Backend(format!(
                 "{label} response exceeds maximum size of {max_bytes} bytes"
-            ));
+            )));
         }
         buf.extend_from_slice(&chunk);
     }
-    serde_json::from_slice(&buf).map_err(|e| format!("failed to parse {label} JSON: {e}"))
+    serde_json::from_slice(&buf)
+        .map_err(|e| VerifyError::Backend(format!("failed to parse {label} JSON: {e}")))
 }
 
 fn validate_identity_text(value: &str, field: &str) -> Result<String, String> {
@@ -438,6 +478,9 @@ impl ServerAuthState {
     }
 
     async fn authenticate_bearer_token(&self, token: &str) -> Result<CallerIdentity, Status> {
+        if crate::resilience::remaining_rpc_deadline().is_some_and(|r| r.is_zero()) {
+            return Err(Status::deadline_exceeded("request deadline exceeded"));
+        }
         if self.static_tokens.verify_token_str(token) {
             return Ok(CallerIdentity {
                 subject: "static-bearer-token".to_string(),
@@ -457,6 +500,10 @@ impl ServerAuthState {
             // not parse Substrate actor or worker-for-actor claims).
             return match oidc.verify_detailed(token).await {
                 Ok(identity) => Ok(identity),
+                Err(VerifyError::DeadlineExceeded(reason)) => {
+                    debug!("OIDC JWT verification exceeded RPC deadline: {reason}");
+                    Err(Status::deadline_exceeded("request deadline exceeded"))
+                }
                 Err(VerifyError::Backend(reason)) => {
                     warn!("OIDC JWT verification backend failure: {reason}");
                     Err(Status::unauthenticated("invalid bearer token"))
@@ -471,6 +518,10 @@ impl ServerAuthState {
         if let Some(k8s) = &self.k8s_tokenreview {
             match k8s.verify_detailed(token).await {
                 Ok(identity) => return Ok(identity),
+                Err(VerifyError::DeadlineExceeded(reason)) => {
+                    debug!("Kubernetes TokenReview exceeded RPC deadline: {reason}");
+                    return Err(Status::deadline_exceeded("request deadline exceeded"));
+                }
                 Err(VerifyError::Backend(reason)) => {
                     warn!("Kubernetes TokenReview backend failure: {reason}");
                 }

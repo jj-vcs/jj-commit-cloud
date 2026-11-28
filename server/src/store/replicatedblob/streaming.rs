@@ -69,16 +69,20 @@ async fn verify_eof_on_store(store: &dyn BlobStore, record: &BlobRecord) -> Stor
 fn stream_bytes(bytes: Bytes) -> mpsc::Receiver<StoreResult<Bytes>> {
     let (tx, rx) = mpsc::channel(8);
     if !bytes.is_empty() {
-        tokio::spawn(async move {
-            let mut pos = 0usize;
-            while pos < bytes.len() {
-                let end = (pos + cc_common::FILE_STREAM_CHUNK_SIZE).min(bytes.len());
-                if tx.send(Ok(bytes.slice(pos..end))).await.is_err() {
-                    return;
+        crate::resilience::spawn_blob_stream_producer(
+            "replicated blob stream",
+            tx,
+            move |tx| async move {
+                let mut pos = 0usize;
+                while pos < bytes.len() {
+                    let end = (pos + cc_common::FILE_STREAM_CHUNK_SIZE).min(bytes.len());
+                    if tx.send(Ok(bytes.slice(pos..end))).await.is_err() {
+                        return;
+                    }
+                    pos = end;
                 }
-                pos = end;
-            }
-        });
+            },
+        );
     }
     rx
 }
@@ -123,7 +127,7 @@ impl ReplicatedBlobStore {
         let Some(mut retry) = VisibilityRetry::start(&self.inner.config, &record.blob_id) else {
             return errors.into_error().map_or(Ok(false), Err);
         };
-        while retry.sleep_next(&self.inner.stats).await {
+        while retry.sleep_next(&self.inner.stats).await? {
             errors.clear();
             if self.inner.verify_eof_local(record, &mut errors).await? {
                 return Ok(true);
@@ -205,11 +209,16 @@ impl ReplicatedInner {
         offset: u64,
         length: Option<u64>,
         errors: &mut AttemptErrors,
-    ) -> Option<mpsc::Receiver<StoreResult<Bytes>>> {
+    ) -> StoreResult<Option<mpsc::Receiver<StoreResult<Bytes>>>> {
         if self.peers.is_empty() {
-            return None;
+            return Ok(None);
         }
         for loc in self.peer_candidate_locations(record) {
+            if crate::resilience::remaining_rpc_deadline().is_some_and(|r| r.is_zero()) {
+                return Err(StoreError::DeadlineExceeded(
+                    "gRPC deadline expired during peer blob stream fallback".to_string(),
+                ));
+            }
             let Some(peer_store) = self.peers.get(loc) else {
                 warn!(
                     "BlobRecord for {} lists peer location '{}' not configured in ReplicatedBlobStore",
@@ -225,9 +234,10 @@ impl ReplicatedInner {
             {
                 Ok(Some(rx)) => {
                     self.stats.origin_fallbacks.fetch_add(1, Ordering::Relaxed);
-                    return Some(rx);
+                    return Ok(Some(rx));
                 }
                 Ok(None) => continue,
+                Err(err @ StoreError::DeadlineExceeded(_)) => return Err(err),
                 Err(StoreError::OutOfRange(msg)) => {
                     let err = StoreError::Corruption(format!(
                         "blob {} truncated in {} at offset {offset} (expected {} bytes): {msg}",
@@ -254,7 +264,7 @@ impl ReplicatedInner {
                 }
             }
         }
-        None
+        Ok(None)
     }
 
     async fn verify_eof_local(
@@ -295,6 +305,11 @@ impl ReplicatedInner {
             return Ok(false);
         }
         for loc in self.peer_candidate_locations(record) {
+            if crate::resilience::remaining_rpc_deadline().is_some_and(|r| r.is_zero()) {
+                return Err(StoreError::DeadlineExceeded(
+                    "gRPC deadline expired during peer EOF check".to_string(),
+                ));
+            }
             let Some(peer_store) = self.peers.get(loc) else {
                 warn!(
                     "BlobRecord for {} lists peer location '{}' not configured in ReplicatedBlobStore",
@@ -306,6 +321,7 @@ impl ReplicatedInner {
             match verify_eof_on_store(peer_store.as_ref(), record).await {
                 Ok(true) => return Ok(true),
                 Ok(false) => continue,
+                Err(err @ StoreError::DeadlineExceeded(_)) => return Err(err),
                 Err(err) => {
                     warn!(
                         "Peer EOF check on {} failed for {}: {}",
@@ -347,11 +363,16 @@ impl ReplicatedInner {
         blob_id: &[u8],
         record: &BlobRecord,
         errors: &mut AttemptErrors,
-    ) -> bool {
+    ) -> StoreResult<bool> {
         if self.peers.is_empty() {
-            return false;
+            return Ok(false);
         }
         for loc in self.peer_candidate_locations(record) {
+            if crate::resilience::remaining_rpc_deadline().is_some_and(|r| r.is_zero()) {
+                return Err(StoreError::DeadlineExceeded(
+                    "gRPC deadline expired during peer has_blob check".to_string(),
+                ));
+            }
             let Some(peer_store) = self.peers.get(loc) else {
                 warn!(
                     "BlobRecord for {} lists peer location '{}' not configured in ReplicatedBlobStore",
@@ -361,8 +382,9 @@ impl ReplicatedInner {
                 continue;
             };
             match peer_store.has_blob(blob_id).await {
-                Ok(true) => return true,
+                Ok(true) => return Ok(true),
                 Ok(false) => continue,
+                Err(err @ StoreError::DeadlineExceeded(_)) => return Err(err),
                 Err(err) => {
                     warn!(
                         "Peer has_blob on {} failed for {}: {}",
@@ -374,7 +396,7 @@ impl ReplicatedInner {
                 }
             }
         }
-        false
+        Ok(false)
     }
 }
 
@@ -622,7 +644,7 @@ impl BlobStore for ReplicatedBlobStore {
         if let Some(rx) = self
             .inner
             .open_peer_stream(&record, offset, length, &mut errors)
-            .await
+            .await?
         {
             return Ok(Some(rx));
         }
@@ -633,7 +655,7 @@ impl BlobStore for ReplicatedBlobStore {
         let Some(mut retry) = VisibilityRetry::start(&self.inner.config, &record.blob_id) else {
             return errors.into_error().map_or(Ok(None), Err);
         };
-        while retry.sleep_next(&self.inner.stats).await {
+        while retry.sleep_next(&self.inner.stats).await? {
             errors.clear();
             if let Some(rx) = self
                 .inner
@@ -645,7 +667,7 @@ impl BlobStore for ReplicatedBlobStore {
             if let Some(rx) = self
                 .inner
                 .open_peer_stream(&record, offset, length, &mut errors)
-                .await
+                .await?
             {
                 return Ok(Some(rx));
             }
@@ -684,7 +706,7 @@ impl BlobStore for ReplicatedBlobStore {
         if self
             .inner
             .has_blob_in_peers(blob_id, &record, &mut errors)
-            .await
+            .await?
         {
             return Ok(true);
         }
@@ -695,7 +717,7 @@ impl BlobStore for ReplicatedBlobStore {
         let Some(mut retry) = VisibilityRetry::start(&self.inner.config, blob_id) else {
             return errors.into_error().map_or(Ok(false), Err);
         };
-        while retry.sleep_next(&self.inner.stats).await {
+        while retry.sleep_next(&self.inner.stats).await? {
             errors.clear();
             if self.inner.has_blob_local(blob_id, &mut errors).await? {
                 return Ok(true);
@@ -703,7 +725,7 @@ impl BlobStore for ReplicatedBlobStore {
             if self
                 .inner
                 .has_blob_in_peers(blob_id, &record, &mut errors)
-                .await
+                .await?
             {
                 return Ok(true);
             }

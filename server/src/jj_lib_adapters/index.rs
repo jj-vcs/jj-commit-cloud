@@ -310,7 +310,20 @@ impl ServerIndex {
         &self.budget
     }
 
+    fn check_rpc_deadline() -> IndexResult<()> {
+        if crate::resilience::remaining_rpc_deadline().is_some_and(|r| r.is_zero()) {
+            return Err(IndexError::Other(
+                StoreError::DeadlineExceeded(
+                    "gRPC deadline expired during server index traversal".to_string(),
+                )
+                .into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn record_walk_visit(&self, walk_visits: &mut usize) -> IndexResult<()> {
+        Self::check_rpc_deadline()?;
         self.budget
             .record_walk_visit(walk_visits)
             .map_err(|e| IndexError::Other(Box::new(e)))
@@ -329,6 +342,7 @@ impl ServerIndex {
     }
 
     async fn commit_node(&self, commit_id: &CommitId) -> IndexResult<(u64, Vec<CommitId>)> {
+        Self::check_rpc_deadline()?;
         if commit_id.as_bytes() == cc_common::ROOT_COMMIT_ID_BYTES {
             return Ok((0, Vec::new()));
         }
@@ -514,6 +528,7 @@ impl Index for ServerIndex {
         let walk_visits = Arc::new(AtomicUsize::new(0));
         let record_ca_visit =
             |budget: &IndexWalkBudget, counter: &AtomicUsize| -> IndexResult<()> {
+                Self::check_rpc_deadline()?;
                 let prev = counter.fetch_add(1, AtomicOrdering::Relaxed);
                 budget
                     .check_walk_count(prev.saturating_add(1))
@@ -560,6 +575,7 @@ impl Index for ServerIndex {
                     }
                     let mut out = Vec::with_capacity(parents.len());
                     for p in parents {
+                        Self::check_rpc_deadline()?;
                         if p != root_id {
                             let prev = walk_visits.fetch_add(1, AtomicOrdering::Relaxed);
                             this.budget
@@ -605,6 +621,7 @@ impl Index for ServerIndex {
 
         let mut cand_nodes = Vec::with_capacity(unique.len());
         for c in unique {
+            Self::check_rpc_deadline()?;
             self.budget
                 .record_aggregate_visit()
                 .map_err(|e| IndexError::Other(Box::new(e)))?;
@@ -620,10 +637,12 @@ impl Index for ServerIndex {
         let mut walk_visits = 0usize;
 
         for GenCommitNode(cand_gen, cand_id) in cand_nodes {
+            Self::check_rpc_deadline()?;
             while frontier
                 .peek()
                 .is_some_and(|top| top.0 > cand_gen || top.0 == u64::MAX)
             {
+                Self::check_rpc_deadline()?;
                 let GenCommitNode(curr_gen, curr_id) = frontier.pop().unwrap();
                 if curr_gen > min_gen || curr_gen == u64::MAX {
                     self.enqueue_parents(
@@ -640,6 +659,7 @@ impl Index for ServerIndex {
                 continue;
             }
             if cand_gen > min_gen || cand_gen == u64::MAX {
+                Self::check_rpc_deadline()?;
                 walk_visits = walk_visits.saturating_add(1);
                 self.budget
                     .check_walk_count(walk_visits)
@@ -659,6 +679,7 @@ impl Index for ServerIndex {
         // Drain any remaining unknown-generation (`u64::MAX`) ancestors and drop candidates
         // discovered to be proper ancestors of another candidate processed later.
         while frontier.peek().is_some_and(|top| top.0 == u64::MAX) {
+            Self::check_rpc_deadline()?;
             let GenCommitNode(_, curr_id) = frontier.pop().unwrap();
             self.enqueue_parents(
                 &curr_id,

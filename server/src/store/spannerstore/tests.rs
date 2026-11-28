@@ -25,6 +25,7 @@ use google_cloud_spanner::mutation::Mutation;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 fn service_error(code: RpcCode) -> google_cloud_spanner::Error {
     google_cloud_gax::error::Error::service(
@@ -37,10 +38,12 @@ fn spanner_errors_map_to_retryable_and_specific_codes() {
     let cases = [
         (RpcCode::Aborted, tonic::Code::Unavailable),
         (RpcCode::Unavailable, tonic::Code::Unavailable),
-        (RpcCode::DeadlineExceeded, tonic::Code::Unavailable),
+        (RpcCode::DeadlineExceeded, tonic::Code::DeadlineExceeded),
         (RpcCode::ResourceExhausted, tonic::Code::ResourceExhausted),
         (RpcCode::PermissionDenied, tonic::Code::PermissionDenied),
-        (RpcCode::Unauthenticated, tonic::Code::Unauthenticated),
+        // Backend storage auth failures map to Internal so clients are not misled about their
+        // own bearer token and server metrics still record request latency.
+        (RpcCode::Unauthenticated, tonic::Code::Internal),
         (RpcCode::InvalidArgument, tonic::Code::InvalidArgument),
         (RpcCode::Internal, tonic::Code::Internal),
     ];
@@ -51,7 +54,56 @@ fn spanner_errors_map_to_retryable_and_specific_codes() {
             grpc_code,
             "Spanner {spanner_code:?}: {status:?}"
         );
+        assert!(
+            !status.message().contains("injected"),
+            "Spanner {spanner_code:?} leaked raw backend detail: {:?}",
+            status.message()
+        );
     }
+}
+
+#[tokio::test]
+async fn build_statement_with_deadline_fails_fast_when_expired() {
+    let builder = google_cloud_spanner::statement::Statement::builder("SELECT 1");
+    assert!(build_statement_with_deadline(builder).is_ok());
+
+    let expired = std::time::Instant::now()
+        .checked_sub(Duration::from_millis(10))
+        .unwrap_or_else(std::time::Instant::now);
+    let res = crate::resilience::with_rpc_deadline(Some(expired), async {
+        build_statement_with_deadline(google_cloud_spanner::statement::Statement::builder(
+            "SELECT 1",
+        ))
+    })
+    .await;
+    assert!(matches!(res, Err(StoreError::DeadlineExceeded(_))));
+}
+
+#[test]
+fn spanner_local_timeout_error_maps_to_deadline_exceeded() {
+    let timeout_err = google_cloud_gax::error::Error::timeout("local attempt timeout");
+    let status = tonic::Status::from(map_spanner_err(timeout_err));
+    assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+}
+
+#[test]
+fn effective_rw_tx_timeout_clamps_to_rpc_deadline_and_fails_fast_when_expired() {
+    assert_eq!(
+        effective_rw_tx_timeout(None).unwrap(),
+        RW_TRANSACTION_TIMEOUT
+    );
+    assert_eq!(
+        effective_rw_tx_timeout(Some(Duration::from_secs(60))).unwrap(),
+        RW_TRANSACTION_TIMEOUT
+    );
+    assert_eq!(
+        effective_rw_tx_timeout(Some(Duration::from_millis(250))).unwrap(),
+        Duration::from_millis(250)
+    );
+    assert!(matches!(
+        effective_rw_tx_timeout(Some(Duration::ZERO)),
+        Err(StoreError::DeadlineExceeded(_))
+    ));
 }
 
 #[test]

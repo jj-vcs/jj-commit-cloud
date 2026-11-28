@@ -31,9 +31,10 @@
 //! store reads with non-retryable `FAILED_PRECONDITION` to shed load during merge storms.
 //!
 //! # Cross-Process and RPC Boundaries
-//! Runs `RepoLoader::load_at_head()` (`!Send` due to `dyn Repo`) on Tokio's `spawn_blocking`
-//! pool via `pollster::block_on`, preserving typed [`StoreError`] gRPC status codes and
-//! retrying transient failures with bounded exponential backoff.
+//! Runs `RepoLoader::load_at_head()` (`!Send` due to `dyn Repo`) on Tokio's
+//! `spawn_blocking` pool via `pollster::block_on`, propagating [`crate::resilience::current_rpc_deadline`]
+//! into adapters, preserving typed [`StoreError`] gRPC status codes, and retrying transient
+//! failures with bounded exponential backoff without sleeping past the caller's deadline.
 
 #![allow(elided_lifetimes_in_paths)]
 
@@ -185,7 +186,14 @@ pub async fn reconcile_repo_op_heads_proto_with_policy_and_metrics(
     kill_switch: Option<&ReconcileKillSwitch>,
     metrics: Option<&crate::metrics::ServerMetrics>,
 ) -> Result<cc_common::op_store::ReconcileOpHeadsResponse, tonic::Status> {
-    let response = reconcile_repo_op_heads_proto_with_policy(store, repo_id, kill_switch).await?;
+    let response = reconcile_repo_op_heads_with_policy_and_limits(
+        store,
+        repo_id,
+        kill_switch,
+        IndexWalkLimits::default(),
+        metrics,
+    )
+    .await?;
     if let Some(m) = metrics {
         m.record_reconcile_op_heads(response.client_resolution_required);
     }
@@ -211,6 +219,7 @@ pub async fn reconcile_repo_op_heads_proto_with_policy(
         repo_id,
         kill_switch,
         IndexWalkLimits::default(),
+        None,
     )
     .await
 }
@@ -221,7 +230,7 @@ pub(crate) async fn reconcile_repo_op_heads_with_limits(
     repo_id: &str,
     walk_limits: IndexWalkLimits,
 ) -> Result<cc_common::op_store::ReconcileOpHeadsResponse, tonic::Status> {
-    reconcile_repo_op_heads_with_policy_and_limits(store, repo_id, None, walk_limits).await
+    reconcile_repo_op_heads_with_policy_and_limits(store, repo_id, None, walk_limits, None).await
 }
 
 async fn reconcile_repo_op_heads_with_policy_and_limits(
@@ -229,6 +238,7 @@ async fn reconcile_repo_op_heads_with_policy_and_limits(
     repo_id: &str,
     kill_switch: Option<&ReconcileKillSwitch>,
     walk_limits: IndexWalkLimits,
+    metrics: Option<&crate::metrics::ServerMetrics>,
 ) -> Result<cc_common::op_store::ReconcileOpHeadsResponse, tonic::Status> {
     const MAX_RETRIES: usize = 6;
     const BASE_BACKOFF_MS: u64 = 20;
@@ -243,6 +253,12 @@ async fn reconcile_repo_op_heads_with_policy_and_limits(
         return Err(quarantine_status(repo_id));
     }
 
+    if crate::resilience::remaining_rpc_deadline().is_some_and(|rem| rem.is_zero()) {
+        return Err(StoreError::DeadlineExceeded(
+            "gRPC deadline expired before op-head reconciliation".to_string(),
+        )
+        .into());
+    }
     store
         .ensure_repo_registered(repo_id, "reconciling op heads")
         .await?;
@@ -270,7 +286,24 @@ async fn reconcile_repo_op_heads_with_policy_and_limits(
 
     // Coalesce concurrent in-process reconcile calls for the same `repo_id`.
     let repo_lock = repo_reconcile_mutex(repo_id);
-    let _guard = repo_lock.lock().await;
+    let _guard = match crate::resilience::remaining_rpc_deadline() {
+        Some(rem) if rem.is_zero() => {
+            return Err(StoreError::DeadlineExceeded(
+                "gRPC deadline expired waiting for reconciliation lock".to_string(),
+            )
+            .into());
+        }
+        Some(rem) => match tokio::time::timeout(rem, repo_lock.lock()).await {
+            Ok(guard) => guard,
+            Err(_) => {
+                return Err(StoreError::DeadlineExceeded(
+                    "gRPC deadline exceeded waiting for reconciliation lock".to_string(),
+                )
+                .into());
+            }
+        },
+        None => repo_lock.lock().await,
+    };
 
     let mut attempt = 0usize;
     loop {
@@ -283,6 +316,12 @@ async fn reconcile_repo_op_heads_with_policy_and_limits(
             return Err(quarantine_status(repo_id));
         }
 
+        if crate::resilience::remaining_rpc_deadline().is_some_and(|rem| rem.is_zero()) {
+            return Err(StoreError::DeadlineExceeded(
+                "gRPC deadline expired before op-head reconciliation attempt".to_string(),
+            )
+            .into());
+        }
         let project_id = store
             .resolve_repo_project(repo_id, "reconciling op heads")
             .await?;
@@ -311,83 +350,124 @@ async fn reconcile_repo_op_heads_with_policy_and_limits(
         let store_clone = store.clone();
         let repo_id_owned = repo_id.to_string();
         let project_id_owned = project_id.clone();
+        // Propagate the caller's `RPC_DEADLINE` and `RPC_METRICS` across `spawn_blocking` so
+        // Spanner/PostgreSQL/SQLite calls inside `ServerOpStore`/`ServerBackend`/`ServerOpHeadsStore`
+        // inherit them.
+        let rpc_deadline = crate::resilience::current_rpc_deadline();
+        let rpc_metrics = metrics
+            .cloned()
+            .or_else(crate::resilience::current_rpc_metrics);
 
         let handle = tokio::task::spawn_blocking(move || {
-            pollster::block_on(async move {
-                let op_store: Arc<dyn OpStore> = Arc::new(ServerOpStore::with_project_id(
-                    store_clone.clone(),
-                    repo_id_owned.clone(),
-                    project_id_owned.clone(),
-                ));
-                let walk_budget = IndexWalkBudget::new(walk_limits);
-                let index = ServerIndex::with_project_id_and_budget(
-                    store_clone.clone(),
-                    repo_id_owned.clone(),
-                    project_id_owned.clone(),
-                    walk_budget.clone(),
-                );
-                if requires_client_rewrite_resolution(
-                    &store_clone,
-                    &repo_id_owned,
-                    &project_id_owned,
-                    &op_store,
-                    &index,
-                    &heads,
-                )
-                .await?
-                {
-                    return Ok(None);
-                }
+            pollster::block_on(crate::resilience::with_rpc_context(
+                rpc_deadline,
+                rpc_metrics,
+                async move {
+                    let work = async move {
+                        let op_store: Arc<dyn OpStore> = Arc::new(ServerOpStore::with_project_id(
+                            store_clone.clone(),
+                            repo_id_owned.clone(),
+                            project_id_owned.clone(),
+                        ));
+                        let walk_budget = IndexWalkBudget::new(walk_limits);
+                        let index = ServerIndex::with_project_id_and_budget(
+                            store_clone.clone(),
+                            repo_id_owned.clone(),
+                            project_id_owned.clone(),
+                            walk_budget.clone(),
+                        );
+                        if requires_client_rewrite_resolution(
+                            &store_clone,
+                            &repo_id_owned,
+                            &project_id_owned,
+                            &op_store,
+                            &index,
+                            &heads,
+                        )
+                        .await?
+                        {
+                            return Ok(None);
+                        }
 
-                let (ref user_settings, ref merge_options) = *RECONCILER_ENV;
-                let signer = signer_from_settings(user_settings).map_err(|e| ReconcileError {
-                    status: tonic::Status::internal(format!("failed to initialize signer: {e}")),
-                    transient: false,
-                })?;
-                let index_store = Arc::new(ServerIndexStore::with_project_id_and_budget(
-                    store_clone.clone(),
-                    repo_id_owned.clone(),
-                    project_id_owned.clone(),
-                    walk_budget,
-                ));
-                let submodule_store = Arc::new(ServerSubmoduleStore);
+                        let (ref user_settings, ref merge_options) = *RECONCILER_ENV;
+                        let signer = signer_from_settings(user_settings).map_err(|e| {
+                            tracing::error!(
+                                error = %e,
+                                "Failed to initialize op-head reconciliation signer"
+                            );
+                            ReconcileError {
+                                status: tonic::Status::internal("internal server error"),
+                                transient: false,
+                            }
+                        })?;
+                        let index_store = Arc::new(ServerIndexStore::with_project_id_and_budget(
+                            store_clone.clone(),
+                            repo_id_owned.clone(),
+                            project_id_owned.clone(),
+                            walk_budget,
+                        ));
+                        let submodule_store = Arc::new(ServerSubmoduleStore);
 
-                let server_backend = Box::new(ServerBackend::with_project_id(
-                    store_clone.clone(),
-                    repo_id_owned.clone(),
-                    project_id_owned.clone(),
-                ));
-                let jj_store = JjStore::new(server_backend, signer, merge_options.clone());
-                // Pin both `project_id` and the validated `heads` snapshot so
-                // `RepoLoader::load_at_head()` merges strictly within `project_id` and atomically
-                // CAS-swaps the full snapshot via `compare_and_swap_op_heads_for_project`.
-                let op_heads_store: Arc<dyn OpHeadsStore> =
-                    Arc::new(ServerOpHeadsStore::with_expected_heads_for_project(
-                        store_clone,
-                        repo_id_owned,
-                        project_id_owned,
-                        heads,
-                    ));
+                        let server_backend = Box::new(ServerBackend::with_project_id(
+                            store_clone.clone(),
+                            repo_id_owned.clone(),
+                            project_id_owned.clone(),
+                        ));
+                        let jj_store = JjStore::new(server_backend, signer, merge_options.clone());
+                        // Pin both `project_id` and the validated `heads` snapshot so
+                        // `RepoLoader::load_at_head()` merges strictly within `project_id` and
+                        // atomically CAS-swaps the full snapshot via
+                        // `compare_and_swap_op_heads_for_project`.
+                        let op_heads_store: Arc<dyn OpHeadsStore> =
+                            Arc::new(ServerOpHeadsStore::with_expected_heads_for_project(
+                                store_clone,
+                                repo_id_owned,
+                                project_id_owned,
+                                heads,
+                            ));
 
-                let repo_loader = RepoLoader::new(
-                    user_settings.clone(),
-                    jj_store,
-                    Arc::new(ServerWorkspaceStore),
-                    op_store,
-                    op_heads_store,
-                    index_store,
-                    submodule_store,
-                );
+                        let repo_loader = RepoLoader::new(
+                            user_settings.clone(),
+                            jj_store,
+                            Arc::new(ServerWorkspaceStore),
+                            op_store,
+                            op_heads_store,
+                            index_store,
+                            submodule_store,
+                        );
 
-                match repo_loader.load_at_head(None).await {
-                    Ok(repo) => Ok(Some(repo.op_id().as_bytes().to_vec())),
-                    Err(err) if is_walk_budget_exceeded_in_repo_loader(&err) => Ok(None),
-                    Err(err) => Err(ReconcileError::from_repo_loader(err)),
-                }
-            })
+                        match repo_loader.load_at_head(None).await {
+                            Ok(repo) => Ok(Some(repo.op_id().as_bytes().to_vec())),
+                            Err(err) if is_walk_budget_exceeded_in_repo_loader(&err) => Ok(None),
+                            Err(err) => Err(ReconcileError::from_repo_loader(err)),
+                        }
+                    };
+
+                    // Bound the worker future itself by the active RPC deadline so CPU-heavy or
+                    // Memory/SQLite walks also abort promptly when the caller's budget elapses.
+                    match crate::resilience::remaining_rpc_deadline() {
+                        Some(rem) if rem.is_zero() => {
+                            Err(ReconcileError::from_store(StoreError::DeadlineExceeded(
+                                "gRPC deadline expired before op-head reconciliation worker"
+                                    .to_string(),
+                            )))
+                        }
+                        Some(rem) => match tokio::time::timeout(rem, work).await {
+                            Ok(res) => res,
+                            Err(_) => {
+                                Err(ReconcileError::from_store(StoreError::DeadlineExceeded(
+                                    "gRPC deadline exceeded during op-head reconciliation"
+                                        .to_string(),
+                                )))
+                            }
+                        },
+                        None => work.await,
+                    }
+                },
+            ))
         });
 
-        let reconcile_result = run_reconcile_join(handle).await;
+        let reconcile_result = run_reconcile_join_with_metrics(handle, metrics).await;
 
         match reconcile_result {
             Ok(Some(op_id)) => {
@@ -444,15 +524,25 @@ async fn reconcile_repo_op_heads_with_policy_and_limits(
                     }
                 }
                 if attempt + 1 < MAX_RETRIES && err.transient {
+                    let jitter = rand::random::<u64>() % MAX_JITTER_MS;
+                    let sleep_ms = (BASE_BACKOFF_MS << attempt.min(5)) + jitter;
+                    let sleep_dur = Duration::from_millis(sleep_ms);
+                    if let Some(rem) = crate::resilience::remaining_rpc_deadline()
+                        && rem <= sleep_dur
+                    {
+                        return Err(StoreError::DeadlineExceeded(
+                            "gRPC deadline insufficient for op-head reconciliation retry backoff"
+                                .to_string(),
+                        )
+                        .into());
+                    }
                     tracing::warn!(
                         repo_id = %repo_id,
                         attempt = attempt + 1,
                         error = %err.status,
                         "Transient op-head reconciliation failure; retrying"
                     );
-                    let jitter = rand::random::<u64>() % MAX_JITTER_MS;
-                    let sleep_ms = (BASE_BACKOFF_MS << attempt.min(5)) + jitter;
-                    tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                    tokio::time::sleep(sleep_dur).await;
                     attempt += 1;
                 } else {
                     return Err(err.status);
@@ -462,15 +552,20 @@ async fn reconcile_repo_op_heads_with_policy_and_limits(
     }
 }
 
-async fn run_reconcile_join<T>(
+async fn run_reconcile_join_with_metrics<T>(
     handle: tokio::task::JoinHandle<Result<T, ReconcileError>>,
+    metrics: Option<&crate::metrics::ServerMetrics>,
 ) -> Result<T, ReconcileError> {
     match handle.await {
         Ok(res) => res,
-        Err(join_err) => Err(ReconcileError {
-            transient: !join_err.is_panic(),
-            status: tonic::Status::internal(format!("reconciliation worker failed: {join_err}")),
-        }),
+        Err(join_err) => {
+            let is_panic =
+                crate::resilience::handle_join_error("reconciliation worker", join_err, metrics);
+            Err(ReconcileError {
+                transient: !is_panic,
+                status: tonic::Status::internal("reconciliation worker failed"),
+            })
+        }
     }
 }
 
@@ -498,6 +593,11 @@ async fn collect_exclusive_commits(
     let mut visited = HashSet::new();
     let mut exclusive = HashMap::new();
     while let Some(cid) = stack.pop() {
+        if crate::resilience::remaining_rpc_deadline().is_some_and(|r| r.is_zero()) {
+            return Err(ReconcileError::from_store(StoreError::DeadlineExceeded(
+                "gRPC deadline expired during op-head commit ancestry walk".to_string(),
+            )));
+        }
         if !visited.insert(cid.clone()) {
             continue;
         }
@@ -509,6 +609,11 @@ async fn collect_exclusive_commits(
         }
         let mut in_unwanted = false;
         for u in newly_added_unwanted.iter().chain(unchanged_unwanted.iter()) {
+            if crate::resilience::remaining_rpc_deadline().is_some_and(|r| r.is_zero()) {
+                return Err(ReconcileError::from_store(StoreError::DeadlineExceeded(
+                    "gRPC deadline expired during op-head commit ancestry walk".to_string(),
+                )));
+            }
             match index.is_ancestor(&cid, u).await {
                 Ok(true) => {
                     in_unwanted = true;
@@ -606,6 +711,11 @@ async fn requires_client_rewrite_resolution(
             if i == j {
                 continue;
             }
+            if crate::resilience::remaining_rpc_deadline().is_some_and(|r| r.is_zero()) {
+                return Err(ReconcileError::from_store(StoreError::DeadlineExceeded(
+                    "gRPC deadline expired during op-head rewrite analysis".to_string(),
+                )));
+            }
 
             // Evaluate operations exclusive to branch `i` relative to branch `j` (`::H_i ~ ::H_j`)
             // so intermediate ancestors shared by `(H_i, H_j)` in 3+ head merges are never masked.
@@ -620,6 +730,11 @@ async fn requires_client_rewrite_resolution(
                 .await
                 .map_err(ReconcileError::from_op_store)?
             {
+                if crate::resilience::remaining_rpc_deadline().is_some_and(|r| r.is_zero()) {
+                    return Err(ReconcileError::from_store(StoreError::DeadlineExceeded(
+                        "gRPC deadline expired during op-head operation walk".to_string(),
+                    )));
+                }
                 exclusive_ops.push(op);
                 if exclusive_ops.len() > MAX_OP_WALK_VISITED {
                     return Ok(true);

@@ -59,8 +59,13 @@ impl ReconcileError {
             other => {
                 let msg = other.to_string();
                 let transient = is_transient_reconcile_error(&msg);
+                tracing::error!(
+                    error = %msg,
+                    transient,
+                    "Op-head reconciliation op-store error"
+                );
                 Self {
-                    status: tonic::Status::internal(msg),
+                    status: tonic::Status::internal("internal server error"),
                     transient,
                 }
             }
@@ -79,8 +84,13 @@ impl ReconcileError {
         }
         let msg = err.to_string();
         let transient = is_transient_reconcile_error(&msg);
+        tracing::error!(
+            error = %msg,
+            transient,
+            "Op-head reconciliation index error"
+        );
         Self {
-            status: tonic::Status::internal(msg),
+            status: tonic::Status::internal("internal server error"),
             transient,
         }
     }
@@ -111,8 +121,13 @@ impl ReconcileError {
             _ => {
                 let msg = err.to_string();
                 let transient = is_transient_reconcile_error(&msg);
+                tracing::error!(
+                    error = %msg,
+                    transient,
+                    "Op-head reconciliation repo-loader error"
+                );
                 Self {
-                    status: tonic::Status::internal(msg),
+                    status: tonic::Status::internal("internal server error"),
                     transient,
                 }
             }
@@ -252,6 +267,7 @@ pub(super) fn is_transient_store_error(err: &StoreError) -> bool {
         | StoreError::InvalidArgument(_)
         | StoreError::OutOfRange(_)
         | StoreError::Corruption(_)
+        | StoreError::DeadlineExceeded(_)
         | StoreError::ResourceExhausted(_)
         | StoreError::PermissionDenied(_)
         | StoreError::Unauthenticated(_) => false,
@@ -269,6 +285,7 @@ pub(super) fn is_transient_reconcile_error(err: &str) -> bool {
         || lower.contains("corrupt")
         || lower.contains("unsupported")
         || lower.contains("missing")
+        || lower.contains("deadline exceeded")
         || lower.contains("permission denied")
         || lower.contains("authentication failed")
         || lower.contains("unauthenticated"))

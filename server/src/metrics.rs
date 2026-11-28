@@ -91,6 +91,8 @@ pub struct StatzSnapshot {
     pub reconcile_client_fallback_total: u64,
     pub blob_cache_hits: u64,
     pub blob_cache_misses: u64,
+    #[serde(default)]
+    pub panics_total: u64,
 }
 
 #[derive(Default)]
@@ -194,6 +196,7 @@ struct ServerMetricsInner {
     latency_ring: Mutex<LatencyRing>,
     histogram_buckets: [AtomicU64; HISTOGRAM_BUCKET_COUNT],
     histogram_sum_micros: AtomicU64,
+    panics_total: AtomicU64,
 }
 
 /// Shared, cheaply clonable telemetry sink attached to gRPC services, stores, and the
@@ -225,6 +228,7 @@ impl ServerMetrics {
                 latency_ring: Mutex::new(LatencyRing::default()),
                 histogram_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
                 histogram_sum_micros: AtomicU64::new(0),
+                panics_total: AtomicU64::new(0),
             }),
         }
     }
@@ -335,6 +339,10 @@ impl ServerMetrics {
         }
     }
 
+    pub fn record_panic(&self) {
+        self.inner.panics_total.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn record_rpc_duration(&self, duration: Duration) {
         let secs = duration.as_secs_f64();
         let ms = secs * 1000.0;
@@ -406,6 +414,7 @@ impl ServerMetrics {
             reconcile_client_fallback_total: reconcile_fallback,
             blob_cache_hits,
             blob_cache_misses,
+            panics_total: self.inner.panics_total.load(Ordering::Relaxed),
         }
     }
 
@@ -427,6 +436,7 @@ impl ServerMetrics {
             .reconcile_client_fallback_total
             .load(Ordering::Relaxed);
         let (blob_hits, blob_misses) = self.blob_cache_counts();
+        let panics_total = self.inner.panics_total.load(Ordering::Relaxed);
 
         let sum_secs = self.inner.histogram_sum_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0;
         let raw_buckets: [u64; HISTOGRAM_BUCKET_COUNT] =
@@ -509,6 +519,13 @@ impl ServerMetrics {
             out,
             "cloudjj_blob_cache_requests_total{{result=\"miss\"}} {blob_misses}"
         );
+
+        let _ = writeln!(
+            out,
+            "# HELP cloudjj_panics_total Total number of caught panics in gRPC request handlers."
+        );
+        let _ = writeln!(out, "# TYPE cloudjj_panics_total counter");
+        let _ = writeln!(out, "cloudjj_panics_total {panics_total}");
 
         out
     }
@@ -814,6 +831,26 @@ mod tests {
                 .render_prometheus()
                 .contains("cloudjj_rpc_duration_seconds_count 3\n"),
             "authenticated Commit Cloud service responses must be recorded"
+        );
+    }
+
+    #[test]
+    fn record_panic_updates_statz_and_prometheus() {
+        let metrics = ServerMetrics::new();
+        assert_eq!(metrics.snapshot().panics_total, 0);
+        assert!(
+            metrics
+                .render_prometheus()
+                .contains("cloudjj_panics_total 0\n")
+        );
+
+        metrics.record_panic();
+        metrics.record_panic();
+        assert_eq!(metrics.snapshot().panics_total, 2);
+        assert!(
+            metrics
+                .render_prometheus()
+                .contains("cloudjj_panics_total 2\n")
         );
     }
 }

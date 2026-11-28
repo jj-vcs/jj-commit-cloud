@@ -30,7 +30,9 @@ use google_cloud_spanner::result::{ResultSet, Row};
 use google_cloud_spanner::statement::{Statement, StatementBuilder};
 use google_cloud_spanner::types as spanner_types;
 use prost::Message;
+use std::time::Duration;
 
+use super::RW_TRANSACTION_TIMEOUT;
 use super::schema::commit_inserted_at_shards;
 use crate::store::{BlobRecord, StoreError, StoreResult};
 
@@ -62,20 +64,52 @@ pub(super) fn is_already_exists(err: &google_cloud_gax::error::Error) -> bool {
         || err.http_status_code().is_some_and(|c| c == 409)
 }
 
+pub(super) fn build_statement_with_deadline(builder: StatementBuilder) -> StoreResult<Statement> {
+    match crate::resilience::remaining_rpc_deadline() {
+        Some(rem) if rem.is_zero() => Err(StoreError::DeadlineExceeded(
+            "gRPC deadline expired before building Spanner statement".to_string(),
+        )),
+        Some(rem) => Ok(builder.with_attempt_timeout(rem).build()),
+        None => Ok(builder.build()),
+    }
+}
+
+pub(super) fn effective_rw_tx_timeout(remaining: Option<Duration>) -> StoreResult<Duration> {
+    match remaining {
+        Some(rem) if rem.is_zero() => Err(StoreError::DeadlineExceeded(
+            "gRPC deadline expired before starting Spanner read-write transaction".to_string(),
+        )),
+        Some(rem) => Ok(RW_TRANSACTION_TIMEOUT.min(rem)),
+        None => Ok(RW_TRANSACTION_TIMEOUT),
+    }
+}
+
 pub(super) fn map_spanner_admin_err(err: google_cloud_gax::error::Error) -> StoreError {
     map_spanner_err(err)
 }
 
 pub(super) fn map_spanner_err(err: google_cloud_spanner::Error) -> StoreError {
+    if err.is_timeout() {
+        return StoreError::DeadlineExceeded(err.to_string());
+    }
     if let Some(status) = err.status() {
         match status.code {
-            RpcCode::InvalidArgument => StoreError::InvalidArgument(err.to_string()),
-            RpcCode::OutOfRange => StoreError::OutOfRange(err.to_string()),
+            RpcCode::InvalidArgument => {
+                tracing::warn!(error = %err, "Spanner rejected request with INVALID_ARGUMENT");
+                StoreError::InvalidArgument(
+                    "invalid request argument rejected by storage backend".to_string(),
+                )
+            }
+            RpcCode::OutOfRange => {
+                tracing::warn!(error = %err, "Spanner rejected request with OUT_OF_RANGE");
+                StoreError::OutOfRange(
+                    "requested range out of bounds in storage backend".to_string(),
+                )
+            }
+            RpcCode::DeadlineExceeded => StoreError::DeadlineExceeded(err.to_string()),
             // An ABORTED transaction that reaches this point can be retried as a whole call,
             // which is what UNAVAILABLE tells gRPC clients.
-            RpcCode::Unavailable | RpcCode::DeadlineExceeded | RpcCode::Aborted => {
-                StoreError::Unavailable(err.to_string())
-            }
+            RpcCode::Unavailable | RpcCode::Aborted => StoreError::Unavailable(err.to_string()),
             RpcCode::ResourceExhausted => StoreError::ResourceExhausted(err.to_string()),
             RpcCode::PermissionDenied => StoreError::PermissionDenied(err.to_string()),
             RpcCode::Unauthenticated => StoreError::Unauthenticated(err.to_string()),

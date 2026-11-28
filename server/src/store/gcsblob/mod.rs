@@ -288,20 +288,35 @@ fn map_gcs_err(err: google_cloud_gax::error::Error) -> StoreError {
         return StoreError::Corruption(format!("Cloud Storage checksum mismatch: {err}"));
     }
     if is_out_of_range(&err) {
-        return StoreError::OutOfRange(err.to_string());
+        tracing::warn!(error = %err, "Cloud Storage rejected request with out-of-range");
+        return StoreError::OutOfRange("requested range out of bounds in object store".to_string());
     }
     if err.is_authentication() {
         return StoreError::Unauthenticated(err.to_string());
+    }
+    if err.is_timeout() && crate::resilience::remaining_rpc_deadline().is_some_and(|r| r.is_zero())
+    {
+        return StoreError::DeadlineExceeded(err.to_string());
     }
     if err.is_connect() || err.is_timeout() || err.is_io() || err.is_exhausted() {
         return StoreError::Unavailable(err.to_string());
     }
     if let Some(status) = err.status() {
         match status.code {
-            RpcCode::InvalidArgument => return StoreError::InvalidArgument(err.to_string()),
+            RpcCode::InvalidArgument => {
+                tracing::warn!(error = %err, "Cloud Storage rejected request with INVALID_ARGUMENT");
+                return StoreError::InvalidArgument(
+                    "invalid request argument rejected by object store".to_string(),
+                );
+            }
             RpcCode::ResourceExhausted => return StoreError::ResourceExhausted(err.to_string()),
             RpcCode::Unauthenticated => return StoreError::Unauthenticated(err.to_string()),
             RpcCode::PermissionDenied => return StoreError::PermissionDenied(err.to_string()),
+            RpcCode::DeadlineExceeded
+                if crate::resilience::remaining_rpc_deadline().is_some_and(|r| r.is_zero()) =>
+            {
+                return StoreError::DeadlineExceeded(err.to_string());
+            }
             RpcCode::Unavailable | RpcCode::DeadlineExceeded => {
                 return StoreError::Unavailable(err.to_string());
             }
@@ -310,7 +325,12 @@ fn map_gcs_err(err: google_cloud_gax::error::Error) -> StoreError {
     }
     if let Some(code) = err.http_status_code() {
         match code {
-            400 => return StoreError::InvalidArgument(err.to_string()),
+            400 => {
+                tracing::warn!(error = %err, "Cloud Storage rejected request with HTTP 400");
+                return StoreError::InvalidArgument(
+                    "invalid request argument rejected by object store".to_string(),
+                );
+            }
             401 => return StoreError::Unauthenticated(err.to_string()),
             403 => return StoreError::PermissionDenied(err.to_string()),
             408 | 500 | 502..=504 => return StoreError::Unavailable(err.to_string()),

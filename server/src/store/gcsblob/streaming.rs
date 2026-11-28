@@ -308,21 +308,24 @@ where
 
     async fn put_blob(&self, blob_id: &[u8], data: Bytes) -> StoreResult<()> {
         let key = Self::object_key(blob_id)?;
-        let res = self
-            .client
-            .write_object(&self.bucket_resource, key, data)
-            .set_if_generation_match(0)
-            .set_cache_control(IMMUTABLE_CACHE_CONTROL)
-            .set_content_type("application/octet-stream")
-            .send_buffered()
-            .await;
+        crate::resilience::run_with_rpc_deadline("Cloud Storage write", async {
+            let res = self
+                .client
+                .write_object(&self.bucket_resource, key, data)
+                .set_if_generation_match(0)
+                .set_cache_control(IMMUTABLE_CACHE_CONTROL)
+                .set_content_type("application/octet-stream")
+                .send_buffered()
+                .await;
 
-        match res {
-            Ok(_) => Ok(()),
-            // Object already exists with identical content-addressed digest.
-            Err(err) if is_precondition_failed(&err) => Ok(()),
-            Err(err) => Err(map_gcs_err(err)),
-        }
+            match res {
+                Ok(_) => Ok(()),
+                // Object already exists with identical content-addressed digest.
+                Err(err) if is_precondition_failed(&err) => Ok(()),
+                Err(err) => Err(map_gcs_err(err)),
+            }
+        })
+        .await
     }
 
     async fn put_blob_from_file(
@@ -332,48 +335,55 @@ where
         size: u64,
     ) -> StoreResult<()> {
         let key = Self::object_key(blob_id)?;
-        let file = tokio::fs::File::open(temp_path).await.map_err(|e| {
-            StoreError::Backend(format!(
-                "failed to open staged blob {}: {e}",
-                temp_path.display()
-            ))
-        })?;
-        let actual_size = file
-            .metadata()
-            .await
-            .map_err(|e| {
+        crate::resilience::run_with_rpc_deadline("Cloud Storage file write", async {
+            let file = tokio::fs::File::open(temp_path).await.map_err(|e| {
                 StoreError::Backend(format!(
-                    "failed to stat staged blob {}: {e}",
+                    "failed to open staged blob {}: {e}",
                     temp_path.display()
                 ))
-            })?
-            .len();
-        if actual_size != size {
-            return Err(StoreError::Backend(format!(
-                "staged blob {} has {actual_size} bytes, expected {size}",
-                temp_path.display()
-            )));
-        }
+            })?;
+            let actual_size = file
+                .metadata()
+                .await
+                .map_err(|e| {
+                    StoreError::Backend(format!(
+                        "failed to stat staged blob {}: {e}",
+                        temp_path.display()
+                    ))
+                })?
+                .len();
+            if actual_size != size {
+                return Err(StoreError::Backend(format!(
+                    "staged blob {} has {actual_size} bytes, expected {size}",
+                    temp_path.display()
+                )));
+            }
 
-        let res = self
-            .client
-            .write_object(&self.bucket_resource, key, file)
-            .set_if_generation_match(0)
-            .set_cache_control(IMMUTABLE_CACHE_CONTROL)
-            .set_content_type("application/octet-stream")
-            .send_unbuffered()
-            .await;
+            let res = self
+                .client
+                .write_object(&self.bucket_resource, key, file)
+                .set_if_generation_match(0)
+                .set_cache_control(IMMUTABLE_CACHE_CONTROL)
+                .set_content_type("application/octet-stream")
+                .send_unbuffered()
+                .await;
 
-        match res {
-            Ok(_) => Ok(()),
-            // Object already exists with identical content-addressed digest.
-            Err(err) if is_precondition_failed(&err) => Ok(()),
-            Err(err) => Err(map_gcs_err(err)),
-        }
+            match res {
+                Ok(_) => Ok(()),
+                // Object already exists with identical content-addressed digest.
+                Err(err) if is_precondition_failed(&err) => Ok(()),
+                Err(err) => Err(map_gcs_err(err)),
+            }
+        })
+        .await
     }
 
     async fn get_blob(&self, blob_id: &[u8]) -> StoreResult<Option<Bytes>> {
-        self.read_full_checked(blob_id, None).await
+        crate::resilience::run_with_rpc_deadline(
+            "Cloud Storage read",
+            self.read_full_checked(blob_id, None),
+        )
+        .await
     }
 
     async fn get_blob_range(
@@ -382,7 +392,11 @@ where
         offset: u64,
         length: Option<u64>,
     ) -> StoreResult<Option<Bytes>> {
-        self.read_range_checked(blob_id, offset, length, None).await
+        crate::resilience::run_with_rpc_deadline(
+            "Cloud Storage range read",
+            self.read_range_checked(blob_id, offset, length, None),
+        )
+        .await
     }
 
     async fn get_blob_range_with_record(
@@ -397,74 +411,77 @@ where
                 record.content_size
             )));
         }
-        let key = Self::object_key(&record.blob_id)?;
-        if offset == record.content_size {
-            return match self
-                .verify_exact_eof(&record.blob_id, &key, record.content_size)
-                .await?
-            {
-                Some(()) => Ok(Some(Bytes::new())),
-                None => Ok(None),
-            };
-        }
-
-        let remaining = record.content_size - offset;
-        let expected_len = expected_range_len(record.content_size, offset, length);
-        // Full-object reads avoid Range requests so Cloud Storage returns HTTP 200 OK and the
-        // client validates the object's CRC32C checksum automatically.
-        if offset == 0 && expected_len == record.content_size {
-            let Some(bytes) = self
-                .read_full_checked(&record.blob_id, Some(record.content_size))
-                .await?
-            else {
-                return Ok(None);
-            };
-            if bytes.len() as u64 != record.content_size {
-                return Err(StoreError::Corruption(format!(
-                    "blob {} has {} bytes in Cloud Storage, expected {} bytes",
-                    hex::encode(&record.blob_id),
-                    bytes.len(),
-                    record.content_size
-                )));
+        crate::resilience::run_with_rpc_deadline("Cloud Storage range read", async {
+            let key = Self::object_key(&record.blob_id)?;
+            if offset == record.content_size {
+                return match self
+                    .verify_exact_eof(&record.blob_id, &key, record.content_size)
+                    .await?
+                {
+                    Some(()) => Ok(Some(Bytes::new())),
+                    None => Ok(None),
+                };
             }
-            return Ok(Some(bytes));
-        }
 
-        // Probe +1 byte whenever reading through EOF so oversized objects are detected rather
-        // than silently truncated to `remaining`, adding zero extra wire bytes on healthy objects.
-        let probe_eof = expected_len == remaining;
-        let req_len = if probe_eof {
-            if offset.saturating_add(remaining) < i64::MAX as u64 {
-                Some(remaining + 1)
+            let remaining = record.content_size - offset;
+            let expected_len = expected_range_len(record.content_size, offset, length);
+            // Full-object reads avoid Range requests so Cloud Storage returns HTTP 200 OK and the
+            // client validates the object's CRC32C checksum automatically.
+            if offset == 0 && expected_len == record.content_size {
+                let Some(bytes) = self
+                    .read_full_checked(&record.blob_id, Some(record.content_size))
+                    .await?
+                else {
+                    return Ok(None);
+                };
+                if bytes.len() as u64 != record.content_size {
+                    return Err(StoreError::Corruption(format!(
+                        "blob {} has {} bytes in Cloud Storage, expected {} bytes",
+                        hex::encode(&record.blob_id),
+                        bytes.len(),
+                        record.content_size
+                    )));
+                }
+                return Ok(Some(bytes));
+            }
+
+            // Probe +1 byte whenever reading through EOF so oversized objects are detected rather
+            // than silently truncated to `remaining`, adding zero extra wire bytes on healthy objects.
+            let probe_eof = expected_len == remaining;
+            let req_len = if probe_eof {
+                if offset.saturating_add(remaining) < i64::MAX as u64 {
+                    Some(remaining + 1)
+                } else {
+                    None
+                }
             } else {
-                None
-            }
-        } else {
-            Some(expected_len)
-        };
-        let bytes = match self
-            .read_range_checked(&record.blob_id, offset, req_len, Some(record.content_size))
-            .await
-        {
-            Ok(Some(bytes)) => bytes,
-            Ok(None) => return Ok(None),
-            Err(StoreError::OutOfRange(msg)) => {
+                Some(expected_len)
+            };
+            let bytes = match self
+                .read_range_checked(&record.blob_id, offset, req_len, Some(record.content_size))
+                .await
+            {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => return Ok(None),
+                Err(StoreError::OutOfRange(msg)) => {
+                    return Err(StoreError::Corruption(format!(
+                        "blob {} truncated in Cloud Storage at offset {offset} (expected {} bytes): {msg}",
+                        hex::encode(&record.blob_id),
+                        record.content_size
+                    )));
+                }
+                Err(err) => return Err(err),
+            };
+            if bytes.len() as u64 != expected_len {
                 return Err(StoreError::Corruption(format!(
-                    "blob {} truncated in Cloud Storage at offset {offset} (expected {} bytes): {msg}",
+                    "blob {} length mismatch in Cloud Storage at offset {offset}: expected {expected_len} bytes, got {} bytes",
                     hex::encode(&record.blob_id),
-                    record.content_size
+                    bytes.len()
                 )));
             }
-            Err(err) => return Err(err),
-        };
-        if bytes.len() as u64 != expected_len {
-            return Err(StoreError::Corruption(format!(
-                "blob {} length mismatch in Cloud Storage at offset {offset}: expected {expected_len} bytes, got {} bytes",
-                hex::encode(&record.blob_id),
-                bytes.len()
-            )));
-        }
-        Ok(Some(bytes))
+            Ok(Some(bytes))
+        })
+        .await
     }
 
     async fn get_blob_range_stream(
@@ -491,144 +508,170 @@ where
 
         let key = Self::object_key(&record.blob_id)?;
         if offset == record.content_size {
-            return match self
-                .verify_exact_eof(&record.blob_id, &key, record.content_size)
-                .await?
-            {
-                Some(()) => {
-                    let (_tx, rx) = mpsc::channel(1);
-                    Ok(Some(rx))
+            return crate::resilience::run_with_rpc_deadline("Cloud Storage EOF check", async {
+                match self
+                    .verify_exact_eof(&record.blob_id, &key, record.content_size)
+                    .await?
+                {
+                    Some(()) => {
+                        let (_tx, rx) = mpsc::channel(1);
+                        Ok(Some(rx))
+                    }
+                    None => Ok(None),
                 }
-                None => Ok(None),
-            };
+            })
+            .await;
         }
 
         let remaining = record.content_size - offset;
         let expected_len = expected_range_len(record.content_size, offset, length);
         debug_assert!(expected_len > 0);
         let is_full_read = offset == 0 && expected_len == record.content_size;
-
-        let mut req = self.client.read_object(&self.bucket_resource, &key);
-        if !is_full_read {
-            // Probe +1 byte whenever streaming through EOF so oversized objects surface as
-            // Corruption without adding extra wire bytes on healthy objects.
-            let probe_eof = offset.saturating_add(expected_len) == record.content_size;
-            let range = if probe_eof {
-                if offset.saturating_add(remaining) < i64::MAX as u64 {
-                    ReadRange::segment(offset, remaining + 1)
-                } else {
-                    ReadRange::offset(offset)
-                }
-            } else if offset.saturating_add(expected_len) <= i64::MAX as u64 {
-                ReadRange::segment(offset, expected_len)
-            } else {
-                ReadRange::offset(offset)
-            };
-            req = req.set_read_range(range);
-        }
-
-        let mut reader = match req.send().await {
-            Ok(r) => r,
-            Err(err) if is_not_found(&err) => return Ok(None),
-            Err(err) if is_out_of_range(&err) => {
-                return Err(StoreError::Corruption(format!(
-                    "blob {} truncated in Cloud Storage at offset {offset} (expected {} bytes): {err}",
-                    hex::encode(&record.blob_id),
-                    record.content_size
-                )));
-            }
-            Err(err) => return Err(map_gcs_err(err)),
-        };
-
-        check_reported_object_size(&record.blob_id, reader.object().size, record.content_size)?;
-
-        // Validate the first non-empty chunk before returning `Ok(Some(rx))` so 0-byte truncated
-        // objects, immediate stream errors, and single-chunk overflows fail synchronously and
-        // allow `ReplicatedBlobStore` to fail over to peers before response headers are committed.
         let blob_id_hex = hex::encode(&record.blob_id);
-        let first_chunk = loop {
-            match reader.next().await {
-                Some(Ok(chunk)) if chunk.is_empty() => continue,
-                Some(Ok(chunk)) => break chunk,
-                Some(Err(err)) => return Err(map_gcs_err(err)),
-                None => {
-                    return Err(StoreError::Corruption(format!(
-                        "blob {blob_id_hex} truncated in Cloud Storage at offset {offset}: expected {expected_len} bytes, got 0 bytes"
-                    )));
-                }
-            }
-        };
-        let first_len = first_chunk.len() as u64;
-        if first_len > expected_len {
-            return Err(StoreError::Corruption(format!(
-                "blob {blob_id_hex} oversized in Cloud Storage at offset {offset}: expected {expected_len} bytes, received at least {first_len} bytes"
-            )));
-        }
 
-        let (tx, rx) = mpsc::channel(8);
-        tokio::spawn(async move {
-            if !send_stream_chunk(&tx, first_chunk).await {
-                return;
-            }
-            let mut received = first_len;
-            // Always drain until `reader.next()` returns `None` so full HTTP 200 streams execute
-            // end-of-stream CRC32C verification and trailing bytes past `expected_len` are caught.
-            while let Some(item) = reader.next().await {
-                let chunk = match item {
-                    Ok(c) => c,
-                    Err(err) => {
-                        let _ = tx.send(Err(map_gcs_err(err))).await;
-                        return;
+        let initial = crate::resilience::run_with_rpc_deadline(
+            "Cloud Storage stream open",
+            async {
+                let mut req = self.client.read_object(&self.bucket_resource, &key);
+                if !is_full_read {
+                    // Probe +1 byte whenever streaming through EOF so oversized objects surface as
+                    // Corruption without adding extra wire bytes on healthy objects.
+                    let probe_eof = offset.saturating_add(expected_len) == record.content_size;
+                    let range = if probe_eof {
+                        if offset.saturating_add(remaining) < i64::MAX as u64 {
+                            ReadRange::segment(offset, remaining + 1)
+                        } else {
+                            ReadRange::offset(offset)
+                        }
+                    } else if offset.saturating_add(expected_len) <= i64::MAX as u64 {
+                        ReadRange::segment(offset, expected_len)
+                    } else {
+                        ReadRange::offset(offset)
+                    };
+                    req = req.set_read_range(range);
+                }
+
+                let mut reader = match req.send().await {
+                    Ok(r) => r,
+                    Err(err) if is_not_found(&err) => return Ok(None),
+                    Err(err) if is_out_of_range(&err) => {
+                        return Err(StoreError::Corruption(format!(
+                            "blob {} truncated in Cloud Storage at offset {offset} (expected {} bytes): {err}",
+                            hex::encode(&record.blob_id),
+                            record.content_size
+                        )));
+                    }
+                    Err(err) => return Err(map_gcs_err(err)),
+                };
+
+                check_reported_object_size(
+                    &record.blob_id,
+                    reader.object().size,
+                    record.content_size,
+                )?;
+
+                // Validate the first non-empty chunk before returning `Ok(Some(rx))` so 0-byte
+                // truncated objects, immediate stream errors, and single-chunk overflows fail
+                // synchronously and allow `ReplicatedBlobStore` to fail over to peers before
+                // response headers are committed.
+                let first_chunk = loop {
+                    match reader.next().await {
+                        Some(Ok(chunk)) if chunk.is_empty() => continue,
+                        Some(Ok(chunk)) => break chunk,
+                        Some(Err(err)) => return Err(map_gcs_err(err)),
+                        None => {
+                            return Err(StoreError::Corruption(format!(
+                                "blob {blob_id_hex} truncated in Cloud Storage at offset {offset}: expected {expected_len} bytes, got 0 bytes"
+                            )));
+                        }
                     }
                 };
-                if chunk.is_empty() {
-                    continue;
+                let first_len = first_chunk.len() as u64;
+                if first_len > expected_len {
+                    return Err(StoreError::Corruption(format!(
+                        "blob {blob_id_hex} oversized in Cloud Storage at offset {offset}: expected {expected_len} bytes, received at least {first_len} bytes"
+                    )));
                 }
-                let next_received = received.saturating_add(chunk.len() as u64);
-                if next_received > expected_len {
+                Ok(Some((reader, first_chunk, first_len)))
+            },
+        )
+        .await?;
+
+        let Some((mut reader, first_chunk, first_len)) = initial else {
+            return Ok(None);
+        };
+
+        let (tx, rx) = mpsc::channel(8);
+        crate::resilience::spawn_blob_stream_producer(
+            "Cloud Storage blob stream",
+            tx,
+            move |tx| async move {
+                if !send_stream_chunk(&tx, first_chunk).await {
+                    return;
+                }
+                let mut received = first_len;
+                // Always drain until `reader.next()` returns `None` so full HTTP 200 streams execute
+                // end-of-stream CRC32C verification and trailing bytes past `expected_len` are caught.
+                while let Some(item) = reader.next().await {
+                    let chunk = match item {
+                        Ok(c) => c,
+                        Err(err) => {
+                            let _ = tx.send(Err(map_gcs_err(err))).await;
+                            return;
+                        }
+                    };
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    let next_received = received.saturating_add(chunk.len() as u64);
+                    if next_received > expected_len {
+                        let _ = tx
+                            .send(Err(StoreError::Corruption(format!(
+                                "blob {blob_id_hex} oversized in Cloud Storage at offset {offset}: expected {expected_len} bytes, received at least {next_received} bytes"
+                            ))))
+                            .await;
+                        return;
+                    }
+                    if !send_stream_chunk(&tx, chunk).await {
+                        return;
+                    }
+                    received = next_received;
+                }
+                if received != expected_len {
                     let _ = tx
                         .send(Err(StoreError::Corruption(format!(
-                            "blob {blob_id_hex} oversized in Cloud Storage at offset {offset}: expected {expected_len} bytes, received at least {next_received} bytes"
+                            "blob {blob_id_hex} truncated in Cloud Storage at offset {offset}: expected {expected_len} bytes, got {received} bytes"
                         ))))
                         .await;
-                    return;
                 }
-                if !send_stream_chunk(&tx, chunk).await {
-                    return;
-                }
-                received = next_received;
-            }
-            if received != expected_len {
-                let _ = tx
-                    .send(Err(StoreError::Corruption(format!(
-                        "blob {blob_id_hex} truncated in Cloud Storage at offset {offset}: expected {expected_len} bytes, got {received} bytes"
-                    ))))
-                    .await;
-            }
-        });
+            },
+        );
 
         Ok(Some(rx))
     }
 
     async fn has_blob(&self, blob_id: &[u8]) -> StoreResult<bool> {
         let key = Self::object_key(blob_id)?;
-        match self
-            .client
-            .read_object(&self.bucket_resource, key)
-            .set_read_range(ReadRange::segment(0, 1))
-            .send()
-            .await
-        {
-            Ok(mut reader) => {
-                // Drain the 1-byte body so HTTP/1.1 keep-alive connections return cleanly to the
-                // pool instead of being dropped mid-stream.
-                while let Some(Ok(_)) = reader.next().await {}
-                Ok(true)
+        crate::resilience::run_with_rpc_deadline("Cloud Storage stat", async {
+            match self
+                .client
+                .read_object(&self.bucket_resource, key)
+                .set_read_range(ReadRange::segment(0, 1))
+                .send()
+                .await
+            {
+                Ok(mut reader) => {
+                    // Drain the 1-byte body so HTTP/1.1 keep-alive connections return to the
+                    // pool instead of being dropped mid-stream.
+                    while let Some(Ok(_)) = reader.next().await {}
+                    Ok(true)
+                }
+                Err(err) if is_not_found(&err) => Ok(false),
+                // A 0-byte object exists but has no byte at offset 0.
+                Err(err) if is_out_of_range(&err) => Ok(true),
+                Err(err) => Err(map_gcs_err(err)),
             }
-            Err(err) if is_not_found(&err) => Ok(false),
-            // A 0-byte object exists but has no byte at offset 0.
-            Err(err) if is_out_of_range(&err) => Ok(true),
-            Err(err) => Err(map_gcs_err(err)),
-        }
+        })
+        .await
     }
 }

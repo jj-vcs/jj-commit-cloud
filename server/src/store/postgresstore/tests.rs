@@ -1063,6 +1063,36 @@ fn retryable_sqlstate_detects_serialization_and_deadlock_only() {
     assert!(!is_retryable_sqlstate(&SqlState::UNIQUE_VIOLATION));
     assert!(!is_retryable_sqlstate(&SqlState::FOREIGN_KEY_VIOLATION));
     assert!(!is_retryable_sqlstate(&SqlState::INVALID_PASSWORD));
+    assert!(!is_retryable_sqlstate(&SqlState::QUERY_CANCELED));
+}
+
+#[test]
+fn pg_statement_timeout_ms_clamps_submillisecond_and_upper_bounds() {
+    assert_eq!(pg_statement_timeout_ms(Duration::from_nanos(1)), 1);
+    assert_eq!(pg_statement_timeout_ms(Duration::from_micros(999)), 1);
+    assert_eq!(pg_statement_timeout_ms(Duration::from_millis(1)), 1);
+    assert_eq!(pg_statement_timeout_ms(Duration::from_millis(2500)), 2500);
+    assert_eq!(
+        pg_statement_timeout_ms(Duration::from_secs(60 * 60 * 24 * 365)),
+        i32::MAX as u64
+    );
+}
+
+#[test]
+fn classify_query_canceled_maps_statement_timeout_and_expired_deadline_to_deadline_exceeded() {
+    assert!(matches!(
+        classify_query_canceled("canceling statement due to statement timeout".into(), false),
+        StoreError::DeadlineExceeded(_)
+    ));
+    assert!(matches!(
+        classify_query_canceled("canceling statement due to user request".into(), true),
+        StoreError::DeadlineExceeded(_)
+    ));
+    // An operator cancel while the RPC deadline is absent or still active stays Unavailable.
+    assert!(matches!(
+        classify_query_canceled("canceling statement due to user request".into(), false),
+        StoreError::Unavailable(_)
+    ));
 }
 
 #[test]
@@ -1633,5 +1663,44 @@ fn verify_ca_server_verifier_enforces_ca_and_validity_while_skipping_hostname() 
             )
         ),
         "expected NotValidYet error, got {not_yet_err:?}"
+    );
+}
+
+#[tokio::test]
+async fn tx_retry_backoff_increments_counter_once_and_skips_when_deadline_aborts() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // When remaining deadline is shorter than the backoff delay, return DeadlineExceeded and
+    // leave the retry counter untouched.
+    let counter = AtomicU64::new(0);
+    let tight_deadline = std::time::Instant::now() + Duration::from_millis(1);
+    let err = crate::resilience::with_rpc_deadline(
+        Some(tight_deadline),
+        sleep_tx_retry_backoff(Some(&counter), 0),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, StoreError::DeadlineExceeded(_)),
+        "expected DeadlineExceeded when backoff exceeds remaining deadline, got {err:?}"
+    );
+    assert_eq!(
+        counter.load(Ordering::Relaxed),
+        0,
+        "deadline-aborted retry must not increment tx_retries"
+    );
+
+    // When sufficient deadline budget remains, sleep proceeds and increments tx_retries exactly once.
+    let ample_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    crate::resilience::with_rpc_deadline(
+        Some(ample_deadline),
+        sleep_tx_retry_backoff(Some(&counter), 0),
+    )
+    .await
+    .expect("retry backoff should succeed within ample deadline");
+    assert_eq!(
+        counter.load(Ordering::Relaxed),
+        1,
+        "successful retry backoff must increment tx_retries exactly once"
     );
 }

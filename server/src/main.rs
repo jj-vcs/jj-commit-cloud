@@ -22,13 +22,12 @@
 //! never outlives throwaway in-memory blobs.
 //!
 //! # Security and Network Boundaries
-//! Wires [`ServerAuthLayer`] from optional static Bearer tokens (`--auth-token` /
-//! `--auth-token-file`, scrubbed after building [`BearerAuthInterceptor`]), OIDC JWT
-//! verification (`--auth-oidc-*`, with optional `--auth-enforce-actor-repo-suffix`), and
-//! Kubernetes `TokenReview` (`--auth-k8s-*`). Fails closed on empty or partial auth specs
-//! and unauthenticated non-loopback binds (unless `--allow-unauthenticated`), while keeping
-//! gRPC health probes and optional HTTP `--metrics-listen` (`/healthz`, `/statz`, `/metrics`)
-//! open for readiness checks and telemetry scraping.
+//! Wires [`ResilienceLayer`] outermost (panic unwind, `grpc-message` sanitization,
+//! `grpc-timeout` deadline propagation) outside [`MetricsLayer`] and [`ServerAuthLayer`]
+//! (static Bearer tokens, OIDC JWT verification, Kubernetes `TokenReview`). Fails closed on
+//! empty or partial auth specs and unauthenticated non-loopback binds (unless
+//! `--allow-unauthenticated`), while keeping gRPC health probes and optional HTTP
+//! `--metrics-listen` (`/healthz`, `/statz`, `/metrics`) open for readiness and scraping.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -53,6 +52,7 @@ use jj_commit_cloud_server::backend::{
 use jj_commit_cloud_server::metrics::{MetricsLayer, ServerMetrics, bind_and_serve_metrics};
 use jj_commit_cloud_server::op_store::CommitCloudOpStoreService;
 use jj_commit_cloud_server::reconcile_op_heads::ReconcileKillSwitch;
+use jj_commit_cloud_server::resilience::ResilienceLayer;
 use jj_commit_cloud_server::store::gcsblob::{normalize_bucket_identifiers, validate_gcs_endpoint};
 use jj_commit_cloud_server::store::s3blob::{
     DEFAULT_S3_REGION, normalize_s3_bucket, parse_s3_peer_spec, redact_s3_peer_spec,
@@ -1112,8 +1112,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let workspace_service = CommitCloudWorkspaceService::with_metrics(store, metrics.clone())
         .with_actor_repo_suffix_enforcement(enforce_actor_repo_suffix);
 
+    // Layer ordering (outermost -> innermost):
+    // 1. `ResilienceLayer`: catches panics across metrics, auth, and handlers, propagates
+    //    `grpc-timeout` deadlines into `RPC_DEADLINE`, fails fast on already-expired deadlines
+    //    before auth/DB work, and sanitizes every outgoing `grpc-message` header.
+    // 2. `MetricsLayer`: measures authenticated RPC latency while ignoring health probes and
+    //    `UNAUTHENTICATED` rejections returned by `ServerAuthLayer`.
+    // 3. `ServerAuthLayer`: validates credentials and injects `CallerIdentity` before services.
     Server::builder()
         .http2_max_header_list_size(64 * 1024)
+        .layer(ResilienceLayer::new(metrics.clone()))
         .layer(MetricsLayer::new(metrics))
         .layer(auth_layer)
         .add_service(health_service)

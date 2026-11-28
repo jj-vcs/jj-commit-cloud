@@ -380,10 +380,10 @@ impl VisibilityRetry {
         })
     }
 
-    async fn sleep_next(&mut self, stats: &ReplicationStats) -> bool {
+    async fn sleep_next(&mut self, stats: &ReplicationStats) -> StoreResult<bool> {
         let now = Instant::now();
         if now >= self.deadline {
-            return false;
+            return Ok(false);
         }
         let remaining = self.deadline.saturating_duration_since(now);
         // Deterministic per-blob + per-attempt jitter in [0ms, 7ms] avoids retry thundering herds.
@@ -391,13 +391,20 @@ impl VisibilityRetry {
             Duration::from_millis(self.jitter_seed.wrapping_add(self.attempt.wrapping_mul(13)) % 8);
         let sleep_dur = self.delay.saturating_add(jitter).min(remaining);
         if sleep_dur.is_zero() {
-            return false;
+            return Ok(false);
+        }
+        if let Some(rpc_rem) = crate::resilience::remaining_rpc_deadline()
+            && rpc_rem <= sleep_dur
+        {
+            return Err(StoreError::DeadlineExceeded(
+                "gRPC deadline insufficient for blob visibility retry backoff".to_string(),
+            ));
         }
         tokio::time::sleep(sleep_dur).await;
         self.attempt = self.attempt.wrapping_add(1);
         stats.visibility_lag_retries.fetch_add(1, Ordering::Relaxed);
         self.delay = self.delay.saturating_mul(2).min(MAX_RETRY_BACKOFF);
-        true
+        Ok(true)
     }
 }
 
@@ -458,6 +465,11 @@ impl ReplicatedBlobStore {
         blob_id: &[u8],
         known_record: Option<&BlobRecord>,
     ) -> StoreResult<Option<Bytes>> {
+        if crate::resilience::remaining_rpc_deadline().is_some_and(|r| r.is_zero()) {
+            return Err(StoreError::DeadlineExceeded(
+                "gRPC deadline expired before fetching replicated blob".to_string(),
+            ));
+        }
         let cacheable = match known_record {
             Some(record) => self.inner.can_cache_blob(blob_id, record.content_size),
             None => self.inner.config.cache_capacity_bytes > 0,
@@ -526,6 +538,7 @@ impl ReplicatedBlobStore {
         if let Some((tx, blob_id_owned)) = leader_task {
             let inner = self.inner.clone();
             let record_owned = known_record.cloned();
+            let metrics = crate::resilience::current_rpc_metrics();
             // Construct the guard after releasing `inflight` and before spawning so dropping
             // an unpolled task (or a spawn failure) still clears the inflight entry safely.
             let guard = InflightGuard {
@@ -533,23 +546,46 @@ impl ReplicatedBlobStore {
                 blob_id: blob_id_owned.clone(),
                 tx: Some(tx),
             };
-            // Run the leader fetch in a detached task so cancelling one caller's RPC
-            // future does not abort the download for coalesced waiters.
+            // Run the leader fetch in a detached task (without inheriting a single caller's
+            // tight deadline) so cancelling one caller's RPC future does not abort the download
+            // for coalesced waiters; catch panics so waiters never stall or silently drop.
             tokio::spawn(async move {
-                let res = inner
-                    .fetch_uncached(&blob_id_owned, record_owned.as_ref(), ReadSpan::Full)
-                    .await;
+                use futures::FutureExt as _;
+                let res = match std::panic::AssertUnwindSafe(inner.fetch_uncached(
+                    &blob_id_owned,
+                    record_owned.as_ref(),
+                    ReadSpan::Full,
+                ))
+                .catch_unwind()
+                .await
+                {
+                    Ok(res) => res,
+                    Err(payload) => {
+                        let panic_msg = crate::resilience::extract_panic_summary(payload.as_ref());
+                        tracing::error!(
+                            panic = %panic_msg,
+                            "Singleflight blob fetch task panicked"
+                        );
+                        crate::resilience::record_panic_with_fallback(metrics.as_ref());
+                        Err(StoreError::Backend(
+                            "singleflight blob fetch task panicked".to_string(),
+                        ))
+                    }
+                };
                 guard.complete(res);
             });
         }
 
-        let _ = rx.wait_for(Option::is_some).await;
-        let outcome = rx.borrow().clone();
-        outcome.unwrap_or_else(|| {
-            Err(StoreError::Unavailable(
-                "singleflight leader channel closed without publishing blob state".to_string(),
-            ))
+        crate::resilience::run_with_rpc_deadline("replicated blob singleflight wait", async {
+            let _ = rx.wait_for(Option::is_some).await;
+            let outcome = rx.borrow().clone();
+            outcome.unwrap_or_else(|| {
+                Err(StoreError::Unavailable(
+                    "singleflight leader channel closed without publishing blob state".to_string(),
+                ))
+            })
         })
+        .await
     }
 }
 
@@ -636,7 +672,7 @@ impl ReplicatedInner {
         let Some(mut retry) = VisibilityRetry::start(&self.config, blob_id) else {
             return errors.into_error().map_or(Ok(None), Err);
         };
-        while retry.sleep_next(&self.stats).await {
+        while retry.sleep_next(&self.stats).await? {
             errors.clear();
             let allow_read_repair = match self
                 .read_local(blob_id, Some(record), span, &mut errors)
@@ -768,6 +804,11 @@ impl ReplicatedInner {
         }
 
         for loc in self.peer_candidate_locations(record) {
+            if crate::resilience::remaining_rpc_deadline().is_some_and(|r| r.is_zero()) {
+                return Err(StoreError::DeadlineExceeded(
+                    "gRPC deadline expired during peer blob fallback".to_string(),
+                ));
+            }
             let Some(peer_store) = self.peers.get(loc) else {
                 warn!(
                     "BlobRecord for {} lists peer location '{}' not configured in ReplicatedBlobStore",
@@ -801,6 +842,7 @@ impl ReplicatedInner {
                     return Ok(Some(bytes));
                 }
                 Ok(None) => continue,
+                Err(err @ StoreError::DeadlineExceeded(_)) => return Err(err),
                 Err(StoreError::OutOfRange(msg)) => {
                     let err = StoreError::Corruption(format!(
                         "blob {} truncated in {} before expected size {}: {msg}",

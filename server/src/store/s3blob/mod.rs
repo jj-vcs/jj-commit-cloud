@@ -234,7 +234,7 @@ impl S3BlobStore {
             {
                 return Ok(resp);
             }
-            sleep_retry_backoff(attempt).await;
+            sleep_retry_backoff(attempt).await?;
             attempt += 1;
         }
     }
@@ -256,8 +256,10 @@ impl S3BlobStore {
         {
             Ok(resp) => {
                 let status = resp.status();
+                let can_retry = retry_allowed
+                    && !crate::resilience::remaining_rpc_deadline().is_some_and(|r| r.is_zero());
                 if is_retryable_http_status(status) {
-                    if retry_allowed {
+                    if can_retry {
                         drop(resp);
                         return Ok(None);
                     }
@@ -266,14 +268,29 @@ impl S3BlobStore {
                 }
                 if status == StatusCode::BAD_REQUEST {
                     let err_body = read_bounded_body(resp, MAX_ERROR_BODY_BYTES).await;
-                    if is_s3_request_timeout(&err_body) && retry_allowed {
+                    if is_s3_request_timeout(&err_body) && can_retry {
                         return Ok(None);
                     }
                     return Err(map_http_status_err(status, op, &err_body));
                 }
                 Ok(Some(resp))
             }
-            Err(err) if is_retryable_reqwest_err(&err) && retry_allowed => Ok(None),
+            Err(err)
+                if err.is_timeout()
+                    && crate::resilience::remaining_rpc_deadline().is_some_and(|r| r.is_zero()) =>
+            {
+                Err(StoreError::DeadlineExceeded(format!(
+                    "gRPC deadline exceeded during S3 {op}"
+                )))
+            }
+            Err(err)
+                if is_retryable_reqwest_err(&err)
+                    && retry_allowed
+                    && !crate::resilience::remaining_rpc_deadline()
+                        .is_some_and(|r| r.is_zero()) =>
+            {
+                Ok(None)
+            }
             Err(err) => Err(map_reqwest_err(err)),
         }
     }
@@ -355,7 +372,21 @@ impl S3BlobStore {
             req = req.body(body);
         }
 
-        Ok(req.send().await)
+        match crate::resilience::remaining_rpc_deadline() {
+            Some(rem) if rem.is_zero() => Err(StoreError::DeadlineExceeded(
+                "gRPC deadline expired before sending S3 HTTP request".to_string(),
+            )),
+            Some(rem) => {
+                req = req.timeout(rem);
+                match tokio::time::timeout(rem, req.send()).await {
+                    Ok(res) => Ok(res),
+                    Err(_) => Err(StoreError::DeadlineExceeded(
+                        "gRPC deadline exceeded during S3 HTTP request".to_string(),
+                    )),
+                }
+            }
+            None => Ok(req.send().await),
+        }
     }
 
     async fn send_put_blob_with_retry<F, Fut>(
@@ -386,7 +417,7 @@ impl S3BlobStore {
                 )
                 .await?
             else {
-                sleep_retry_backoff(attempt).await;
+                sleep_retry_backoff(attempt).await?;
                 attempt += 1;
                 continue;
             };
@@ -407,7 +438,7 @@ impl S3BlobStore {
                         return Ok(());
                     }
                     if retry_allowed {
-                        sleep_retry_backoff(attempt).await;
+                        sleep_retry_backoff(attempt).await?;
                         attempt += 1;
                         continue;
                     }
@@ -552,7 +583,18 @@ fn parse_content_length(headers: &HeaderMap) -> Option<u64> {
 
 async fn read_bounded_body(mut resp: Response, limit: usize) -> Vec<u8> {
     let mut out = Vec::new();
-    while let Ok(Some(chunk)) = resp.chunk().await {
+    loop {
+        let next = match crate::resilience::remaining_rpc_deadline() {
+            Some(rem) if rem.is_zero() => break,
+            Some(rem) => match tokio::time::timeout(rem, resp.chunk()).await {
+                Ok(res) => res,
+                Err(_) => break,
+            },
+            None => resp.chunk().await,
+        };
+        let Ok(Some(chunk)) = next else {
+            break;
+        };
         let remaining = limit.saturating_sub(out.len());
         if remaining == 0 {
             break;
@@ -564,6 +606,23 @@ async fn read_bounded_body(mut resp: Response, limit: usize) -> Vec<u8> {
         }
     }
     out
+}
+
+async fn read_response_bytes_with_deadline(
+    resp: Response,
+) -> StoreResult<Result<Bytes, reqwest::Error>> {
+    match crate::resilience::remaining_rpc_deadline() {
+        Some(rem) if rem.is_zero() => Err(StoreError::DeadlineExceeded(
+            "gRPC deadline expired before reading S3 response body".to_string(),
+        )),
+        Some(rem) => match tokio::time::timeout(rem, resp.bytes()).await {
+            Ok(res) => Ok(res),
+            Err(_) => Err(StoreError::DeadlineExceeded(
+                "gRPC deadline exceeded while reading S3 response body".to_string(),
+            )),
+        },
+        None => Ok(resp.bytes().await),
+    }
 }
 
 fn sanitize_error_snippet(body: &[u8]) -> String {
@@ -600,14 +659,26 @@ fn is_s3_request_timeout(body: &[u8]) -> bool {
     String::from_utf8_lossy(body).contains("<Code>RequestTimeout</Code>")
 }
 
-async fn sleep_retry_backoff(attempt: usize) {
+async fn sleep_retry_backoff(attempt: usize) -> StoreResult<()> {
     let base_ms = RETRY_BASE_DELAY_MS.saturating_mul(1u64 << attempt.min(6));
     let jitter_ms = rand::random::<u64>() % base_ms.max(1);
-    tokio::time::sleep(Duration::from_millis(base_ms + jitter_ms)).await;
+    let delay = Duration::from_millis(base_ms + jitter_ms);
+    if let Some(rem) = crate::resilience::remaining_rpc_deadline()
+        && rem <= delay
+    {
+        return Err(StoreError::DeadlineExceeded(
+            "gRPC deadline insufficient for S3 retry backoff".to_string(),
+        ));
+    }
+    tokio::time::sleep(delay).await;
+    Ok(())
 }
 
 fn map_reqwest_err(err: reqwest::Error) -> StoreError {
-    if err.is_timeout() || err.is_connect() || err.is_body() || err.is_request() {
+    if err.is_timeout() && crate::resilience::remaining_rpc_deadline().is_some_and(|r| r.is_zero())
+    {
+        StoreError::DeadlineExceeded(format!("S3 request timed out: {err}"))
+    } else if err.is_timeout() || err.is_connect() || err.is_body() || err.is_request() {
         StoreError::Unavailable(format!("S3 transport error: {err}"))
     } else {
         StoreError::Backend(format!("S3 HTTP client error: {err}"))
@@ -642,7 +713,10 @@ fn map_http_status_err(status: StatusCode, op: &str, body: &[u8]) -> StoreError 
             } else if raw_text.contains("<Code>RequestTimeout</Code>") {
                 StoreError::Unavailable(detail)
             } else {
-                StoreError::InvalidArgument(detail)
+                tracing::warn!(status = %status, op, detail = %detail, "S3 rejected request");
+                StoreError::InvalidArgument(
+                    "invalid request argument rejected by object store".to_string(),
+                )
             }
         }
         401 => StoreError::Unauthenticated(detail),
@@ -654,7 +728,10 @@ fn map_http_status_err(status: StatusCode, op: &str, body: &[u8]) -> StoreError 
             }
         }
         408 | 500 | 502..=504 => StoreError::Unavailable(detail),
-        416 => StoreError::OutOfRange(detail),
+        416 => {
+            tracing::warn!(status = %status, op, detail = %detail, "S3 rejected range request");
+            StoreError::OutOfRange("requested range out of bounds in object store".to_string())
+        }
         429 => StoreError::ResourceExhausted(detail),
         300..=399 => StoreError::Backend(format!(
             "S3 {op} received unexpected HTTP redirect {status} (check S3 endpoint and region)"

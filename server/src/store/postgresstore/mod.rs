@@ -30,11 +30,10 @@
 //! `workspaces` keys use `COLLATE "C"` for UTF-8 byte order.
 //!
 //! # Cross-Process and RPC Boundaries
-//! Honors PostgreSQL `sslmode` (`disable` uses `NoTls`; `prefer`/`require`/`verify-ca`/
-//! `verify-full` follow libpq TLS semantics over `rustls` with `sslrootcert`; explicit
-//! `--postgres-ca-cert` fails closed to TLS `verify-full` unless `sslmode=verify-ca`/`require`
-//! and rejects `disable`/`prefer` or Unix-domain sockets), redacts credentials from all logs
-//! and errors, and maps `SQLSTATE` codes deterministically into [`StoreError`].
+//! Honors PostgreSQL `sslmode` (`disable`/`prefer`/`require`/`verify-ca`/`verify-full` over
+//! `rustls`, with `--postgres-ca-cert` failing closed), redacts credentials from logs and
+//! errors, propagates active gRPC request deadlines into pool checkout, `SET LOCAL
+//! statement_timeout`, and retry backoff, and maps `SQLSTATE` codes into [`StoreError`].
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -50,6 +49,7 @@ use cc_common::workspace::WorkspaceState;
 use deadpool_postgres::{Manager, ManagerConfig, Object, Pool, RecyclingMethod, Runtime};
 use tokio_postgres::NoTls;
 use tokio_postgres::config::{SslMode as PgSslMode, SslNegotiation as PgSslNegotiation};
+use tokio_postgres_rustls::MakeRustlsConnect;
 use tracing::info;
 
 use super::{BlobRecord, CommitId, MetadataStore, OpId, StoreError, StoreResult};
@@ -123,8 +123,15 @@ impl Default for PostgresConnectConfig {
 }
 
 #[derive(Clone)]
+pub(super) enum PgCancelTls {
+    NoTls,
+    Rustls(MakeRustlsConnect),
+}
+
+#[derive(Clone)]
 pub struct PostgresMetadataStore {
     pool: Pool,
+    cancel_tls: PgCancelTls,
     tx_retries: Option<Arc<AtomicU64>>,
 }
 
@@ -180,19 +187,25 @@ impl PostgresMetadataStore {
 
         pg_config.ssl_mode(tls_policy.pg_ssl_mode());
         let direct_ssl = pg_config.get_ssl_negotiation() == PgSslNegotiation::Direct;
-        let manager = match tls_policy {
-            ResolvedTlsPolicy::NoTls => Manager::from_config(pg_config, NoTls, manager_cfg),
+        let (manager, cancel_tls) = match tls_policy {
+            ResolvedTlsPolicy::NoTls => (
+                Manager::from_config(pg_config, NoTls, manager_cfg),
+                PgCancelTls::NoTls,
+            ),
             ResolvedTlsPolicy::EncryptOnly { .. } => {
                 let tls = build_encrypt_only_rustls_connector(direct_ssl)?;
-                Manager::from_config(pg_config, tls, manager_cfg)
+                let cancel = PgCancelTls::Rustls(tls.clone());
+                (Manager::from_config(pg_config, tls, manager_cfg), cancel)
             }
             ResolvedTlsPolicy::VerifyCa { ca_source, .. } => {
                 let tls = build_verified_rustls_connector(&ca_source, false, direct_ssl)?;
-                Manager::from_config(pg_config, tls, manager_cfg)
+                let cancel = PgCancelTls::Rustls(tls.clone());
+                (Manager::from_config(pg_config, tls, manager_cfg), cancel)
             }
             ResolvedTlsPolicy::VerifyFull { ca_source } => {
                 let tls = build_verified_rustls_connector(&ca_source, true, direct_ssl)?;
-                Manager::from_config(pg_config, tls, manager_cfg)
+                let cancel = PgCancelTls::Rustls(tls.clone());
+                (Manager::from_config(pg_config, tls, manager_cfg), cancel)
             }
         };
 
@@ -223,6 +236,7 @@ impl PostgresMetadataStore {
 
         Ok(Self {
             pool,
+            cancel_tls,
             tx_retries: config.tx_retries.clone(),
         })
     }

@@ -32,13 +32,15 @@
 //! `File.size_bytes` populated from `MetadataStore` and optional cursor pagination.
 
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use bytes::{Bytes, BytesMut};
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio_stream::StreamExt;
-use tracing::info;
+use tracing::{error, info};
 
 use cc_common::backend::backend_service_server::BackendService;
 use cc_common::backend::*;
@@ -160,36 +162,94 @@ enum StreamStaging {
 }
 
 async fn create_spill_file() -> Result<(tempfile::NamedTempFile, tokio::fs::File), tonic::Status> {
-    tokio::task::spawn_blocking(|| {
+    let deadline = crate::resilience::current_rpc_deadline();
+    let metrics = crate::resilience::current_rpc_metrics();
+    if crate::resilience::remaining_rpc_deadline().is_some_and(|r| r.is_zero()) {
+        return Err(tonic::Status::deadline_exceeded(
+            "request deadline exceeded",
+        ));
+    }
+    let handle = tokio::task::spawn_blocking(move || {
+        if deadline.is_some_and(|d| d <= std::time::Instant::now()) {
+            return Err(tonic::Status::deadline_exceeded(
+                "request deadline exceeded",
+            ));
+        }
         let named = tempfile::NamedTempFile::new().map_err(|e| {
-            tonic::Status::internal(format!("failed to create upload spill file: {e}"))
+            error!(error = %e, "Failed to create upload spill file");
+            tonic::Status::internal("internal server error")
         })?;
         let std_file = named.as_file().try_clone().map_err(|e| {
-            tonic::Status::internal(format!("failed to clone upload spill file handle: {e}"))
+            error!(error = %e, "Failed to clone upload spill file handle");
+            tonic::Status::internal("internal server error")
         })?;
         Ok::<_, tonic::Status>((named, tokio::fs::File::from_std(std_file)))
-    })
-    .await
-    .map_err(|e| tonic::Status::internal(format!("spill file creation task failed: {e}")))?
+    });
+    let join_res = match crate::resilience::remaining_rpc_deadline() {
+        Some(rem) if rem.is_zero() => {
+            return Err(tonic::Status::deadline_exceeded(
+                "request deadline exceeded",
+            ));
+        }
+        Some(rem) => match tokio::time::timeout(rem, handle).await {
+            Ok(res) => res,
+            Err(_) => {
+                return Err(tonic::Status::deadline_exceeded(
+                    "request deadline exceeded",
+                ));
+            }
+        },
+        None => handle.await,
+    };
+    match join_res {
+        Ok(res) => res,
+        Err(join_err) => {
+            crate::resilience::handle_join_error(
+                "spill file creation task",
+                join_err,
+                metrics.as_ref(),
+            );
+            Err(tonic::Status::internal("internal server error"))
+        }
+    }
 }
 
 async fn compute_git_blob_hash_from_file(
     path: PathBuf,
     total_size: u64,
 ) -> Result<Vec<u8>, tonic::Status> {
-    tokio::task::spawn_blocking(move || {
+    let deadline = crate::resilience::current_rpc_deadline();
+    let metrics = crate::resilience::current_rpc_metrics();
+    if crate::resilience::remaining_rpc_deadline().is_some_and(|r| r.is_zero()) {
+        return Err(tonic::Status::deadline_exceeded(
+            "request deadline exceeded",
+        ));
+    }
+    let handle = tokio::task::spawn_blocking(move || {
         use std::io::Read as _;
 
+        if deadline.is_some_and(|d| d <= std::time::Instant::now()) {
+            return Err(tonic::Status::deadline_exceeded(
+                "request deadline exceeded",
+            ));
+        }
         let mut file = std::fs::File::open(&path).map_err(|e| {
-            tonic::Status::internal(format!("failed to open spilled upload file: {e}"))
+            error!(error = %e, "Failed to open spilled upload file");
+            tonic::Status::internal("internal server error")
         })?;
         let mut hasher = gix::hash::hasher(gix::hash::Kind::Sha1);
         hasher.update(format!("blob {total_size}\0").as_bytes());
         let mut buf = vec![0u8; cc_common::FILE_STREAM_CHUNK_SIZE];
         let mut hashed = 0u64;
         loop {
+            if deadline.is_some_and(|d| d <= std::time::Instant::now()) {
+                return Err(tonic::Status::deadline_exceeded(
+                    "request deadline exceeded",
+                ));
+            }
             let n = file.read(&mut buf).map_err(|e| {
-                tonic::Status::internal(format!("failed to read spilled upload file: {e}"))
+                error!(error = %e, "Failed to read spilled upload file");
+                tonic::Status::internal("internal server error")
             })?;
             if n == 0 {
                 break;
@@ -198,9 +258,12 @@ async fn compute_git_blob_hash_from_file(
             hasher.update(&buf[..n]);
         }
         if hashed != total_size {
-            return Err(tonic::Status::internal(format!(
-                "spilled upload file length mismatch: hashed {hashed} bytes, expected {total_size}"
-            )));
+            error!(
+                hashed,
+                expected = total_size,
+                "Spilled upload file length mismatch"
+            );
+            return Err(tonic::Status::internal("internal server error"));
         }
         hasher
             .try_finalize()
@@ -208,9 +271,56 @@ async fn compute_git_blob_hash_from_file(
             .map_err(|e| {
                 tonic::Status::invalid_argument(format!("SHA-1 digest computation error: {e}"))
             })
-    })
-    .await
-    .map_err(|e| tonic::Status::internal(format!("spilled upload hash task failed: {e}")))?
+    });
+    let join_res = match crate::resilience::remaining_rpc_deadline() {
+        Some(rem) if rem.is_zero() => {
+            return Err(tonic::Status::deadline_exceeded(
+                "request deadline exceeded",
+            ));
+        }
+        Some(rem) => match tokio::time::timeout(rem, handle).await {
+            Ok(res) => res,
+            Err(_) => {
+                return Err(tonic::Status::deadline_exceeded(
+                    "request deadline exceeded",
+                ));
+            }
+        },
+        None => handle.await,
+    };
+    match join_res {
+        Ok(res) => res,
+        Err(join_err) => {
+            crate::resilience::handle_join_error(
+                "spilled upload hash task",
+                join_err,
+                metrics.as_ref(),
+            );
+            Err(tonic::Status::internal("internal server error"))
+        }
+    }
+}
+
+/// Stream adapter forwarding [`CompositeStore::get_file_range_stream`] chunks directly into
+/// `ReadFile` responses without an intermediate `tokio::spawn` bridge task.
+#[derive(Debug)]
+pub struct ReadFileChunkStream {
+    rx: tokio::sync::mpsc::Receiver<crate::store::StoreResult<Bytes>>,
+}
+
+impl futures::Stream for ReadFileChunkStream {
+    type Item = Result<ReadFileResponse, tonic::Status>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.rx.poll_recv(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Ready(Some(Ok(chunk))) => Poll::Ready(Some(Ok(ReadFileResponse {
+                chunk: Vec::from(chunk),
+            }))),
+            Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(tonic::Status::from(err)))),
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -559,8 +669,7 @@ impl BackendService for CommitCloudBackendService {
         Ok(tonic::Response::new(WriteTreeResponse { tree_id }))
     }
 
-    type ReadFileStream =
-        tokio_stream::wrappers::ReceiverStream<Result<ReadFileResponse, tonic::Status>>;
+    type ReadFileStream = ReadFileChunkStream;
 
     async fn read_file(
         &self,
@@ -571,29 +680,12 @@ impl BackendService for CommitCloudBackendService {
         validate_digest_len(&req.file_id, cc_common::FILE_ID_LENGTH, "file_id")?;
         validate_optional_path(&req.path)?;
         let max_bytes = (req.max_bytes > 0).then_some(req.max_bytes);
-        let mut chunk_rx = self
+        let chunk_rx = self
             .store
             .get_file_range_stream(&req.project_id, &req.file_id, req.offset, max_bytes)
             .await?;
 
-        let (tx, rx) = tokio::sync::mpsc::channel(8);
-        tokio::spawn(async move {
-            while let Some(item) = chunk_rx.recv().await {
-                let msg = match item {
-                    Ok(chunk) => Ok(ReadFileResponse {
-                        chunk: Vec::from(chunk),
-                    }),
-                    Err(err) => Err(tonic::Status::from(err)),
-                };
-                if tx.send(msg).await.is_err() {
-                    break;
-                }
-            }
-        });
-
-        Ok(tonic::Response::new(
-            tokio_stream::wrappers::ReceiverStream::new(rx),
-        ))
+        Ok(tonic::Response::new(ReadFileChunkStream { rx: chunk_rx }))
     }
 
     async fn write_file(
@@ -727,15 +819,13 @@ impl BackendService for CommitCloudBackendService {
                             let (named, mut writer) = create_spill_file().await?;
                             if !buf.is_empty() {
                                 writer.write_all(buf).await.map_err(|e| {
-                                    tonic::Status::internal(format!(
-                                        "failed to spill upload buffer to disk: {e}"
-                                    ))
+                                    error!(error = %e, "Failed to spill upload buffer to disk");
+                                    tonic::Status::internal("internal server error")
                                 })?;
                             }
                             writer.write_all(&frame.chunk).await.map_err(|e| {
-                                tonic::Status::internal(format!(
-                                    "failed to write upload chunk to spill file: {e}"
-                                ))
+                                error!(error = %e, "Failed to write upload chunk to spill file");
+                                tonic::Status::internal("internal server error")
                             })?;
                             // Replacing `staging` drops both `buf` and the held memory permit
                             // immediately so memory returns to the global budget.
@@ -744,9 +834,8 @@ impl BackendService for CommitCloudBackendService {
                     }
                     StreamStaging::Disk { writer, .. } => {
                         writer.write_all(&frame.chunk).await.map_err(|e| {
-                            tonic::Status::internal(format!(
-                                "failed to write upload chunk to spill file: {e}"
-                            ))
+                            error!(error = %e, "Failed to write upload chunk to spill file");
+                            tonic::Status::internal("internal server error")
                         })?;
                     }
                 }
@@ -796,7 +885,8 @@ impl BackendService for CommitCloudBackendService {
             }
             StreamStaging::Disk { mut writer, named } => {
                 writer.flush().await.map_err(|e| {
-                    tonic::Status::internal(format!("failed to flush upload spill file: {e}"))
+                    error!(error = %e, "Failed to flush upload spill file");
+                    tonic::Status::internal("internal server error")
                 })?;
                 drop(writer);
                 let file_id = match streaming_hasher {

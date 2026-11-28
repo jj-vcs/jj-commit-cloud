@@ -389,34 +389,37 @@ impl SpannerMetadataStore {
     }
 
     pub(super) async fn is_project_registered_impl(&self, project_id: &str) -> StoreResult<bool> {
-        let stmt =
-            Statement::builder("SELECT 1 FROM Projects WHERE ProjectId = @project_id LIMIT 1")
-                .add_param("project_id", project_id)
-                .build();
-        let tx = self.db_client.single_use().build();
-        let mut rs = tx.execute_query(stmt).await.map_err(map_spanner_err)?;
-        Ok(rs
-            .next()
-            .await
-            .transpose()
-            .map_err(map_spanner_err)?
-            .is_some())
+        crate::resilience::run_with_rpc_deadline("Spanner read", async {
+            let stmt =
+                Statement::builder("SELECT 1 FROM Projects WHERE ProjectId = @project_id LIMIT 1")
+                    .add_param("project_id", project_id);
+            let mut rs = self.single_use_query(stmt).await?;
+            Ok(rs
+                .next()
+                .await
+                .transpose()
+                .map_err(map_spanner_err)?
+                .is_some())
+        })
+        .await
     }
 
     pub(super) async fn get_repo_project_id_impl(
         &self,
         repo_id: &str,
     ) -> StoreResult<Option<String>> {
-        let stmt = Statement::builder("SELECT ProjectId FROM Repositories WHERE RepoId = @repo_id")
-            .add_param("repo_id", repo_id)
-            .build();
-        let tx = self.db_client.single_use().build();
-        let mut rs = tx.execute_query(stmt).await.map_err(map_spanner_err)?;
-        let Some(row) = rs.next().await.transpose().map_err(map_spanner_err)? else {
-            return Ok(None);
-        };
-        let project_id: String = row.get("ProjectId").map_err(map_spanner_err)?;
-        Ok(Some(project_id))
+        crate::resilience::run_with_rpc_deadline("Spanner read", async {
+            let stmt =
+                Statement::builder("SELECT ProjectId FROM Repositories WHERE RepoId = @repo_id")
+                    .add_param("repo_id", repo_id);
+            let mut rs = self.single_use_query(stmt).await?;
+            let Some(row) = rs.next().await.transpose().map_err(map_spanner_err)? else {
+                return Ok(None);
+            };
+            let project_id: String = row.get("ProjectId").map_err(map_spanner_err)?;
+            Ok(Some(project_id))
+        })
+        .await
     }
 
     pub(super) async fn register_repo_in_project_impl(

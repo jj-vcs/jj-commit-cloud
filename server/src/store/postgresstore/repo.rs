@@ -24,6 +24,7 @@ use tokio_postgres::error::SqlState;
 
 use super::PostgresMetadataStore;
 use super::codec::{map_pg_err, namespace_lock_key};
+use super::pool::run_pg_bounded;
 use crate::store::{StoreError, StoreResult};
 
 impl PostgresMetadataStore {
@@ -145,14 +146,18 @@ impl PostgresMetadataStore {
     }
 
     pub(super) async fn is_project_registered_impl(&self, project_id: &str) -> StoreResult<bool> {
-        let client = self.get_client().await?;
-        let row = client
-            .query_opt(
+        let mut conn = self.checkout_guarded_client().await?;
+        conn.arm_for_query("PostgreSQL read")?;
+        let res = run_pg_bounded(
+            "PostgreSQL read",
+            conn.client().query_opt(
                 "SELECT 1 FROM projects WHERE project_id = $1",
                 &[&project_id],
-            )
-            .await
-            .map_err(map_pg_err)?;
+            ),
+        )
+        .await?;
+        conn.mark_clean_if_healthy(&res);
+        let row = res.map_err(map_pg_err)?;
         Ok(row.is_some())
     }
 
@@ -160,14 +165,18 @@ impl PostgresMetadataStore {
         &self,
         repo_id: &str,
     ) -> StoreResult<Option<String>> {
-        let client = self.get_client().await?;
-        let row = client
-            .query_opt(
+        let mut conn = self.checkout_guarded_client().await?;
+        conn.arm_for_query("PostgreSQL read")?;
+        let res = run_pg_bounded(
+            "PostgreSQL read",
+            conn.client().query_opt(
                 "SELECT project_id FROM repositories WHERE repo_id = $1",
                 &[&repo_id],
-            )
-            .await
-            .map_err(map_pg_err)?;
+            ),
+        )
+        .await?;
+        conn.mark_clean_if_healthy(&res);
+        let row = res.map_err(map_pg_err)?;
         Ok(row.map(|r| r.get(0)))
     }
 

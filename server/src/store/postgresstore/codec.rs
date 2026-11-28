@@ -58,6 +58,14 @@ pub(super) fn decode_commit_watermark(token: &[u8]) -> StoreResult<i64> {
     Ok(seq)
 }
 
+pub(super) fn classify_query_canceled(msg: String, rpc_deadline_expired: bool) -> StoreError {
+    if rpc_deadline_expired || msg.to_ascii_lowercase().contains("statement timeout") {
+        StoreError::DeadlineExceeded(msg)
+    } else {
+        StoreError::Unavailable(msg)
+    }
+}
+
 pub(super) fn is_retryable_sqlstate(code: &SqlState) -> bool {
     *code == SqlState::T_R_SERIALIZATION_FAILURE || *code == SqlState::T_R_DEADLOCK_DETECTED
 }
@@ -104,6 +112,12 @@ fn map_pg_err_inner(err: tokio_postgres::Error, context: Option<&str>) -> StoreE
         None => err.to_string(),
     };
     if let Some(code) = err.code() {
+        if *code == SqlState::QUERY_CANCELED {
+            return classify_query_canceled(
+                msg,
+                crate::resilience::remaining_rpc_deadline().is_some_and(|rem| rem.is_zero()),
+            );
+        }
         if *code == SqlState::INVALID_PASSWORD
             || *code == SqlState::INVALID_AUTHORIZATION_SPECIFICATION
         {
@@ -134,7 +148,14 @@ fn map_pg_err_inner(err: tokio_postgres::Error, context: Option<&str>) -> StoreE
             || *code == SqlState::CHARACTER_NOT_IN_REPERTOIRE
             || *code == SqlState::STRING_DATA_RIGHT_TRUNCATION
         {
-            return StoreError::InvalidArgument(msg);
+            tracing::warn!(
+                sqlstate = code.code(),
+                error = %msg,
+                "PostgreSQL rejected request argument"
+            );
+            return StoreError::InvalidArgument(
+                "invalid request argument rejected by storage backend".to_string(),
+            );
         }
     }
     if err.is_closed() {

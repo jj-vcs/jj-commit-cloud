@@ -26,6 +26,10 @@ use prost::Message as _;
 use tokio_postgres::IsolationLevel;
 
 use super::codec::{decode_commit_watermark, encode_commit_watermark, map_pg_err};
+use super::pool::{
+    RollbackOutcome, apply_tx_statement_timeout, is_healthy_pg_result, rollback_with_deadline,
+    run_pg_bounded,
+};
 use super::{PostgresMetadataStore, UNNEST_BATCH_SIZE};
 use crate::store::{CommitId, StoreError, StoreResult};
 
@@ -35,14 +39,18 @@ impl PostgresMetadataStore {
         project_id: &str,
         commit_id: &[u8],
     ) -> StoreResult<bool> {
-        let client = self.get_client().await?;
-        let row = client
-            .query_opt(
+        let mut conn = self.checkout_guarded_client().await?;
+        conn.arm_for_query("PostgreSQL read")?;
+        let res = run_pg_bounded(
+            "PostgreSQL read",
+            conn.client().query_opt(
                 "SELECT 1 FROM commits WHERE project_id = $1 AND commit_id = $2 LIMIT 1",
                 &[&project_id, &commit_id],
-            )
-            .await
-            .map_err(map_pg_err)?;
+            ),
+        )
+        .await?;
+        conn.mark_clean_if_healthy(&res);
+        let row = res.map_err(map_pg_err)?;
         Ok(row.is_some())
     }
 
@@ -51,14 +59,18 @@ impl PostgresMetadataStore {
         project_id: &str,
         commit_id: &[u8],
     ) -> StoreResult<Option<Commit>> {
-        let client = self.get_client().await?;
-        let row = client
-            .query_opt(
+        let mut conn = self.checkout_guarded_client().await?;
+        conn.arm_for_query("PostgreSQL read")?;
+        let res = run_pg_bounded(
+            "PostgreSQL read",
+            conn.client().query_opt(
                 "SELECT proto_bytes FROM commits WHERE project_id = $1 AND commit_id = $2",
                 &[&project_id, &commit_id],
-            )
-            .await
-            .map_err(map_pg_err)?;
+            ),
+        )
+        .await?;
+        conn.mark_clean_if_healthy(&res);
+        let row = res.map_err(map_pg_err)?;
         row.map(|r| {
             let bytes: Vec<u8> = r.get(0);
             Commit::decode(bytes.as_slice()).map_err(|e| {
@@ -73,14 +85,18 @@ impl PostgresMetadataStore {
         project_id: &str,
         commit_id: &[u8],
     ) -> StoreResult<Option<(Commit, u64)>> {
-        let client = self.get_client().await?;
-        let row = client
-            .query_opt(
+        let mut conn = self.checkout_guarded_client().await?;
+        conn.arm_for_query("PostgreSQL read")?;
+        let res = run_pg_bounded(
+            "PostgreSQL read",
+            conn.client().query_opt(
                 "SELECT proto_bytes, generation FROM commits WHERE project_id = $1 AND commit_id = $2",
                 &[&project_id, &commit_id],
-            )
-            .await
-            .map_err(map_pg_err)?;
+            ),
+        )
+        .await?;
+        conn.mark_clean_if_healthy(&res);
+        let row = res.map_err(map_pg_err)?;
         row.map(|r| {
             let bytes: Vec<u8> = r.get(0);
             let gen_i64: i64 = r.get(1);
@@ -100,14 +116,18 @@ impl PostgresMetadataStore {
         project_id: &str,
         commit_id: &[u8],
     ) -> StoreResult<Option<u64>> {
-        let client = self.get_client().await?;
-        let row = client
-            .query_opt(
+        let mut conn = self.checkout_guarded_client().await?;
+        conn.arm_for_query("PostgreSQL read")?;
+        let res = run_pg_bounded(
+            "PostgreSQL read",
+            conn.client().query_opt(
                 "SELECT generation FROM commits WHERE project_id = $1 AND commit_id = $2",
                 &[&project_id, &commit_id],
-            )
-            .await
-            .map_err(map_pg_err)?;
+            ),
+        )
+        .await?;
+        conn.mark_clean_if_healthy(&res);
+        let row = res.map_err(map_pg_err)?;
         row.map(|r| {
             let gen_i64: i64 = r.get(0);
             u64::try_from(gen_i64).map_err(|_| {
@@ -125,28 +145,42 @@ impl PostgresMetadataStore {
         if commit_ids.is_empty() {
             return Ok(HashMap::new());
         }
-        let client = self.get_client().await?;
+        let mut conn = self.checkout_guarded_client().await?;
         let mut out = HashMap::with_capacity(commit_ids.len());
         for chunk in commit_ids.chunks(UNNEST_BATCH_SIZE) {
-            let rows = client
-                .query(
+            conn.arm_for_query("PostgreSQL read")?;
+            let res = run_pg_bounded(
+                "PostgreSQL read",
+                conn.client().query(
                     "SELECT commit_id, generation FROM commits
                      WHERE project_id = $1 AND commit_id IN (SELECT UNNEST($2::BYTEA[]))",
                     &[&project_id, &chunk],
-                )
-                .await
-                .map_err(map_pg_err)?;
+                ),
+            )
+            .await?;
+            let rows = match res {
+                Ok(rows) => {
+                    conn.disarm_cancel_on_drop();
+                    rows
+                }
+                Err(err) => {
+                    conn.mark_clean_if_db_error(&err);
+                    return Err(map_pg_err(err));
+                }
+            };
             for row in rows {
                 let cid: Vec<u8> = row.get(0);
                 let gen_i64: i64 = row.get(1);
-                let gen_u64 = u64::try_from(gen_i64).map_err(|_| {
-                    StoreError::Corruption(format!(
+                let Ok(gen_u64) = u64::try_from(gen_i64) else {
+                    conn.mark_clean();
+                    return Err(StoreError::Corruption(format!(
                         "negative PostgreSQL commit generation {gen_i64}"
-                    ))
-                })?;
+                    )));
+                };
                 out.insert(cid, gen_u64);
             }
         }
+        conn.mark_clean();
         Ok(out)
     }
 
@@ -162,18 +196,23 @@ impl PostgresMetadataStore {
         })?;
         // Fast path: commits are content-addressed and immutable, so duplicate retries avoid
         // taking the per-project sequence lock.
-        {
-            let client = self.get_client().await?;
-            let exists = client
-                .query_opt(
+        let already_exists = {
+            let mut conn = self.checkout_guarded_client().await?;
+            conn.arm_for_query("PostgreSQL read")?;
+            let res = run_pg_bounded(
+                "PostgreSQL read",
+                conn.client().query_opt(
                     "SELECT 1 FROM commits WHERE project_id = $1 AND commit_id = $2",
                     &[&project_id, &commit_id],
-                )
-                .await
-                .map_err(map_pg_err)?;
-            if exists.is_some() {
-                return Ok(());
-            }
+                ),
+            )
+            .await?;
+            conn.mark_clean_if_healthy(&res);
+            let exists = res.map_err(map_pg_err)?;
+            exists.is_some()
+        };
+        if already_exists {
+            return Ok(());
         }
 
         let project_id = project_id.to_string();
@@ -233,29 +272,38 @@ impl PostgresMetadataStore {
         limit: usize,
     ) -> StoreResult<Vec<CommitId>> {
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
-        let client = self.get_client().await?;
-        let rows = match after_commit_id.filter(|c| !c.is_empty()) {
-            Some(after) => client
-                .query(
-                    "SELECT commit_id FROM commits
-                     WHERE project_id = $1 AND commit_id > $2
-                     ORDER BY commit_id ASC
-                     LIMIT $3",
-                    &[&project_id, &after, &limit_i64],
+        let mut conn = self.checkout_guarded_client().await?;
+        conn.arm_for_query("PostgreSQL read")?;
+        let res = match after_commit_id.filter(|c| !c.is_empty()) {
+            Some(after) => {
+                run_pg_bounded(
+                    "PostgreSQL read",
+                    conn.client().query(
+                        "SELECT commit_id FROM commits
+                         WHERE project_id = $1 AND commit_id > $2
+                         ORDER BY commit_id ASC
+                         LIMIT $3",
+                        &[&project_id, &after, &limit_i64],
+                    ),
                 )
-                .await
-                .map_err(map_pg_err)?,
-            None => client
-                .query(
-                    "SELECT commit_id FROM commits
-                     WHERE project_id = $1
-                     ORDER BY commit_id ASC
-                     LIMIT $2",
-                    &[&project_id, &limit_i64],
+                .await?
+            }
+            None => {
+                run_pg_bounded(
+                    "PostgreSQL read",
+                    conn.client().query(
+                        "SELECT commit_id FROM commits
+                         WHERE project_id = $1
+                         ORDER BY commit_id ASC
+                         LIMIT $2",
+                        &[&project_id, &limit_i64],
+                    ),
                 )
-                .await
-                .map_err(map_pg_err)?,
+                .await?
+            }
         };
+        conn.mark_clean_if_healthy(&res);
+        let rows = res.map_err(map_pg_err)?;
         Ok(rows.into_iter().map(|r| r.get::<_, Vec<u8>>(0)).collect())
     }
 
@@ -263,14 +311,18 @@ impl PostgresMetadataStore {
         &self,
         project_id: &str,
     ) -> StoreResult<Vec<u8>> {
-        let client = self.get_client().await?;
-        let row = client
-            .query_one(
+        let mut conn = self.checkout_guarded_client().await?;
+        conn.arm_for_query("PostgreSQL read")?;
+        let res = run_pg_bounded(
+            "PostgreSQL read",
+            conn.client().query_one(
                 "SELECT COALESCE(MAX(seq), 0)::BIGINT FROM commits WHERE project_id = $1",
                 &[&project_id],
-            )
-            .await
-            .map_err(map_pg_err)?;
+            ),
+        )
+        .await?;
+        conn.mark_clean_if_healthy(&res);
+        let row = res.map_err(map_pg_err)?;
         let max_seq: i64 = row.get(0);
         if max_seq < 0 {
             return Err(StoreError::Corruption(format!(
@@ -291,17 +343,21 @@ impl PostgresMetadataStore {
             return Ok((Vec::new(), since_token.to_vec(), false));
         }
         let fetch_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
-        let client = self.get_client().await?;
-        let rows = client
-            .query(
+        let mut conn = self.checkout_guarded_client().await?;
+        conn.arm_for_query("PostgreSQL read")?;
+        let res = run_pg_bounded(
+            "PostgreSQL read",
+            conn.client().query(
                 "SELECT seq, commit_id FROM commits
                  WHERE project_id = $1 AND seq > $2
                  ORDER BY seq ASC, commit_id ASC
                  LIMIT $3",
                 &[&project_id, &since_seq, &fetch_limit],
-            )
-            .await
-            .map_err(map_pg_err)?;
+            ),
+        )
+        .await?;
+        conn.mark_clean_if_healthy(&res);
+        let rows = res.map_err(map_pg_err)?;
 
         let mut items: Vec<(i64, CommitId)> = Vec::with_capacity(rows.len());
         for row in rows {
@@ -331,17 +387,21 @@ impl PostgresMetadataStore {
         min_id: &[u8],
         max_id: &[u8],
     ) -> StoreResult<Vec<CommitId>> {
-        let client = self.get_client().await?;
-        let rows = client
-            .query(
+        let mut conn = self.checkout_guarded_client().await?;
+        conn.arm_for_query("PostgreSQL read")?;
+        let res = run_pg_bounded(
+            "PostgreSQL read",
+            conn.client().query(
                 "SELECT commit_id FROM commits
                  WHERE project_id = $1 AND commit_id >= $2 AND commit_id <= $3
                  ORDER BY commit_id ASC
                  LIMIT 2",
                 &[&project_id, &min_id, &max_id],
-            )
-            .await
-            .map_err(map_pg_err)?;
+            ),
+        )
+        .await?;
+        conn.mark_clean_if_healthy(&res);
+        let rows = res.map_err(map_pg_err)?;
         Ok(rows.into_iter().map(|r| r.get::<_, Vec<u8>>(0)).collect())
     }
 
@@ -352,57 +412,129 @@ impl PostgresMetadataStore {
         max_id: &[u8],
         limit: usize,
     ) -> StoreResult<Vec<(Vec<u8>, Vec<CommitId>)>> {
-        let mut client = self.get_client().await?;
-        let tx = client
-            .build_transaction()
-            .read_only(true)
-            .isolation_level(IsolationLevel::RepeatableRead)
-            .start()
-            .await
-            .map_err(map_pg_err)?;
-
-        let ch_rows = match tx
-            .query(
-                "SELECT DISTINCT change_id FROM commits
-                 WHERE project_id = $1 AND change_id >= $2 AND change_id <= $3
-                 ORDER BY change_id ASC
-                 LIMIT 2",
-                &[&project_id, &min_id, &max_id],
+        let mut conn = self.checkout_guarded_client().await?;
+        conn.arm_for_query("PostgreSQL read-only transaction")?;
+        let (res, finish) = 'tx_block: {
+            let tx_res = run_pg_bounded(
+                "PostgreSQL read-only transaction start",
+                conn.client_mut()
+                    .build_transaction()
+                    .read_only(true)
+                    .isolation_level(IsolationLevel::RepeatableRead)
+                    .start(),
             )
-            .await
-        {
-            Ok(rows) => rows,
-            Err(err) => {
-                let _ = tx.rollback().await;
-                return Err(map_pg_err(err));
-            }
-        };
-        let mut change_ids: Vec<Vec<u8>> = ch_rows.into_iter().map(|r| r.get(0)).collect();
-        if change_ids.len() != 1 {
-            tx.commit().await.map_err(map_pg_err)?;
-            return Ok(change_ids.into_iter().map(|ch| (ch, Vec::new())).collect());
-        }
+            .await?;
+            let tx = match tx_res {
+                Ok(tx) => tx,
+                Err(err) => {
+                    let finish = if err.as_db_error().is_some() {
+                        RollbackOutcome::Clean
+                    } else {
+                        RollbackOutcome::EvictOnly
+                    };
+                    break 'tx_block (Err(map_pg_err(err)), finish);
+                }
+            };
 
-        let matched_ch = change_ids.swap_remove(0);
-        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
-        let c_rows = match tx
-            .query(
-                "SELECT commit_id FROM commits
-                 WHERE project_id = $1 AND change_id = $2
-                 ORDER BY commit_id ASC
-                 LIMIT $3",
-                &[&project_id, &matched_ch, &limit_i64],
-            )
-            .await
-        {
-            Ok(rows) => rows,
-            Err(err) => {
-                let _ = tx.rollback().await;
-                return Err(map_pg_err(err));
+            let tx_outcome: StoreResult<(
+                StoreResult<Vec<(Vec<u8>, Vec<CommitId>)>>,
+                RollbackOutcome,
+            )> = async {
+                if let Some(rem) = crate::resilience::remaining_rpc_deadline() {
+                    if rem.is_zero() {
+                        drop(tx);
+                        return Ok((
+                            Err(StoreError::DeadlineExceeded(
+                                "gRPC deadline expired in PostgreSQL read-only transaction"
+                                    .to_string(),
+                            )),
+                            RollbackOutcome::EvictOnly,
+                        ));
+                    }
+                    let timeout_res = run_pg_bounded(
+                        "PostgreSQL read-only transaction timeout",
+                        apply_tx_statement_timeout(&tx, rem),
+                    )
+                    .await?;
+                    if let Err(err) = timeout_res {
+                        let finish = rollback_with_deadline(tx).await;
+                        return Ok((Err(map_pg_err(err)), finish));
+                    }
+                }
+
+                let ch_res = run_pg_bounded(
+                    "PostgreSQL read",
+                    tx.query(
+                        "SELECT DISTINCT change_id FROM commits
+                             WHERE project_id = $1 AND change_id >= $2 AND change_id <= $3
+                             ORDER BY change_id ASC
+                             LIMIT 2",
+                        &[&project_id, &min_id, &max_id],
+                    ),
+                )
+                .await?;
+                let ch_rows = match ch_res {
+                    Ok(rows) => rows,
+                    Err(err) => {
+                        let finish = rollback_with_deadline(tx).await;
+                        return Ok((Err(map_pg_err(err)), finish));
+                    }
+                };
+                let mut change_ids: Vec<Vec<u8>> = ch_rows.into_iter().map(|r| r.get(0)).collect();
+                if change_ids.len() != 1 {
+                    let commit_res = run_pg_bounded("PostgreSQL commit", tx.commit()).await?;
+                    let finish = if is_healthy_pg_result(&commit_res) {
+                        RollbackOutcome::Clean
+                    } else {
+                        RollbackOutcome::EvictOnly
+                    };
+                    return Ok((
+                        commit_res
+                            .map(|()| change_ids.into_iter().map(|ch| (ch, Vec::new())).collect())
+                            .map_err(map_pg_err),
+                        finish,
+                    ));
+                }
+
+                let matched_ch = change_ids.swap_remove(0);
+                let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+                let c_res = run_pg_bounded(
+                    "PostgreSQL read",
+                    tx.query(
+                        "SELECT commit_id FROM commits
+                             WHERE project_id = $1 AND change_id = $2
+                             ORDER BY commit_id ASC
+                             LIMIT $3",
+                        &[&project_id, &matched_ch, &limit_i64],
+                    ),
+                )
+                .await?;
+                let c_rows = match c_res {
+                    Ok(rows) => rows,
+                    Err(err) => {
+                        let finish = rollback_with_deadline(tx).await;
+                        return Ok((Err(map_pg_err(err)), finish));
+                    }
+                };
+                let cids: Vec<CommitId> = c_rows.into_iter().map(|r| r.get(0)).collect();
+                let commit_res = run_pg_bounded("PostgreSQL commit", tx.commit()).await?;
+                let finish = if is_healthy_pg_result(&commit_res) {
+                    RollbackOutcome::Clean
+                } else {
+                    RollbackOutcome::EvictOnly
+                };
+                Ok((
+                    commit_res
+                        .map(|()| vec![(matched_ch, cids)])
+                        .map_err(map_pg_err),
+                    finish,
+                ))
             }
+            .await;
+
+            tx_outcome?
         };
-        let cids: Vec<CommitId> = c_rows.into_iter().map(|r| r.get(0)).collect();
-        tx.commit().await.map_err(map_pg_err)?;
-        Ok(vec![(matched_ch, cids)])
+        conn.finish_tx(finish);
+        res
     }
 }

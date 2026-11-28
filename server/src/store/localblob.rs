@@ -110,7 +110,16 @@ impl LocalFsBlobStore {
 
 /// Stores `data` at `target` unless a file with the same length is already there. The blob id
 /// is a hash over the length and the content, so a length mismatch means a damaged file.
-fn write_blob_file(target: &Path, data: &[u8]) -> StoreResult<()> {
+fn write_blob_file(
+    target: &Path,
+    data: &[u8],
+    deadline: Option<std::time::Instant>,
+) -> StoreResult<()> {
+    if deadline.is_some_and(|d| d <= std::time::Instant::now()) {
+        return Err(StoreError::DeadlineExceeded(
+            "gRPC deadline expired before writing local blob".to_string(),
+        ));
+    }
     match std::fs::metadata(target) {
         Ok(meta) if meta.is_file() && meta.len() == data.len() as u64 => return Ok(()),
         Ok(_) => {}
@@ -161,7 +170,17 @@ fn write_temp_and_rename(tmp_path: &Path, target: &Path, data: &[u8]) -> StoreRe
 /// Streams `src_path` into a private temp file inside `target`'s shard directory using a
 /// bounded 64 KiB buffer, fsyncs, and atomically renames onto `target`. Works identically
 /// across filesystems without allocating the whole blob on the heap.
-fn copy_file_to_blob_target(src_path: &Path, target: &Path, expected_size: u64) -> StoreResult<()> {
+fn copy_file_to_blob_target(
+    src_path: &Path,
+    target: &Path,
+    expected_size: u64,
+    deadline: Option<std::time::Instant>,
+) -> StoreResult<()> {
+    if deadline.is_some_and(|d| d <= std::time::Instant::now()) {
+        return Err(StoreError::DeadlineExceeded(
+            "gRPC deadline expired before copying staged local blob".to_string(),
+        ));
+    }
     match std::fs::metadata(target) {
         Ok(meta) if meta.is_file() && meta.len() == expected_size => return Ok(()),
         Ok(_) => {}
@@ -174,7 +193,7 @@ fn copy_file_to_blob_target(src_path: &Path, target: &Path, expected_size: u64) 
         .map_err(|e| StoreError::Backend(format!("failed to create blob shard dir: {e}")))?;
 
     let tmp_path = shard_dir.join(format!(".tmp-{}", uuid::Uuid::new_v4()));
-    let result = copy_temp_and_rename(src_path, &tmp_path, target, expected_size);
+    let result = copy_temp_and_rename(src_path, &tmp_path, target, expected_size, deadline);
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp_path);
     }
@@ -186,6 +205,7 @@ fn copy_temp_and_rename(
     tmp_path: &Path,
     target: &Path,
     expected_size: u64,
+    deadline: Option<std::time::Instant>,
 ) -> StoreResult<()> {
     let mut src = std::fs::File::open(src_path).map_err(|e| {
         StoreError::Backend(format!(
@@ -199,6 +219,11 @@ fn copy_temp_and_rename(
     let mut buf = vec![0u8; cc_common::FILE_STREAM_CHUNK_SIZE];
     let mut copied = 0u64;
     loop {
+        if deadline.is_some_and(|d| d <= std::time::Instant::now()) {
+            return Err(StoreError::DeadlineExceeded(
+                "gRPC deadline exceeded while copying staged local blob".to_string(),
+            ));
+        }
         let n = src
             .read(&mut buf)
             .map_err(|e| StoreError::Backend(format!("failed to read staged blob: {e}")))?;
@@ -280,11 +305,28 @@ impl BlobStore for LocalFsBlobStore {
 
     async fn put_blob(&self, blob_id: &[u8], data: Bytes) -> StoreResult<()> {
         let target = self.object_path(blob_id)?;
-        // tokio::fs::File reports some write errors only on flush, so write with blocking
-        // std::fs calls, where every error comes back from the call that hit it.
-        tokio::task::spawn_blocking(move || write_blob_file(&target, &data))
-            .await
-            .map_err(|e| StoreError::Backend(format!("blob write task failed: {e}")))?
+        let deadline = crate::resilience::current_rpc_deadline();
+        let metrics = crate::resilience::current_rpc_metrics();
+        crate::resilience::run_with_rpc_deadline("local blob write", async move {
+            // tokio::fs::File reports some write errors only on flush, so write with blocking
+            // std::fs calls, where every error comes back from the call that hit it.
+            match tokio::task::spawn_blocking(move || write_blob_file(&target, &data, deadline))
+                .await
+            {
+                Ok(res) => res,
+                Err(join_err) => {
+                    crate::resilience::handle_join_error(
+                        "local blob write task",
+                        join_err,
+                        metrics.as_ref(),
+                    );
+                    Err(StoreError::Backend(
+                        "local blob write task failed".to_string(),
+                    ))
+                }
+            }
+        })
+        .await
     }
 
     async fn put_blob_from_file(
@@ -295,21 +337,43 @@ impl BlobStore for LocalFsBlobStore {
     ) -> StoreResult<()> {
         let target = self.object_path(blob_id)?;
         let src = temp_path.to_path_buf();
-        tokio::task::spawn_blocking(move || copy_file_to_blob_target(&src, &target, size))
+        let deadline = crate::resilience::current_rpc_deadline();
+        let metrics = crate::resilience::current_rpc_metrics();
+        crate::resilience::run_with_rpc_deadline("local blob file copy", async move {
+            match tokio::task::spawn_blocking(move || {
+                copy_file_to_blob_target(&src, &target, size, deadline)
+            })
             .await
-            .map_err(|e| StoreError::Backend(format!("blob file copy task failed: {e}")))?
+            {
+                Ok(res) => res,
+                Err(join_err) => {
+                    crate::resilience::handle_join_error(
+                        "local blob file copy task",
+                        join_err,
+                        metrics.as_ref(),
+                    );
+                    Err(StoreError::Backend(
+                        "local blob file copy task failed".to_string(),
+                    ))
+                }
+            }
+        })
+        .await
     }
 
     async fn get_blob(&self, blob_id: &[u8]) -> StoreResult<Option<Bytes>> {
         let target = self.object_path(blob_id)?;
-        match tokio::fs::read(&target).await {
-            Ok(buf) => Ok(Some(Bytes::from(buf))),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(StoreError::Backend(format!(
-                "failed to read local blob {}: {e}",
-                target.display()
-            ))),
-        }
+        crate::resilience::run_with_rpc_deadline("local blob read", async move {
+            match tokio::fs::read(&target).await {
+                Ok(buf) => Ok(Some(Bytes::from(buf))),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(StoreError::Backend(format!(
+                    "failed to read local blob {}: {e}",
+                    target.display()
+                ))),
+            }
+        })
+        .await
     }
 
     async fn get_blob_range(
@@ -319,52 +383,57 @@ impl BlobStore for LocalFsBlobStore {
         length: Option<u64>,
     ) -> StoreResult<Option<Bytes>> {
         let target = self.object_path(blob_id)?;
-        let mut file = match tokio::fs::File::open(&target).await {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => {
-                return Err(StoreError::Backend(format!(
-                    "failed to open local blob {}: {e}",
-                    target.display()
+        crate::resilience::run_with_rpc_deadline("local blob range read", async move {
+            let mut file = match tokio::fs::File::open(&target).await {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => {
+                    return Err(StoreError::Backend(format!(
+                        "failed to open local blob {}: {e}",
+                        target.display()
+                    )));
+                }
+            };
+
+            let total_len = file
+                .metadata()
+                .await
+                .map_err(|e| StoreError::Backend(format!("failed to stat local blob: {e}")))?
+                .len();
+
+            if offset > total_len {
+                return Err(StoreError::OutOfRange(format!(
+                    "requested read at offset {offset}, file size is {total_len}"
                 )));
             }
-        };
+            if offset == total_len {
+                return Ok(Some(Bytes::new()));
+            }
 
-        let total_len = file
-            .metadata()
-            .await
-            .map_err(|e| StoreError::Backend(format!("failed to stat local blob: {e}")))?
-            .len();
+            file.seek(SeekFrom::Start(offset))
+                .await
+                .map_err(|e| StoreError::Backend(format!("failed to seek local blob: {e}")))?;
 
-        if offset > total_len {
-            return Err(StoreError::OutOfRange(format!(
-                "requested read at offset {offset}, file size is {total_len}"
-            )));
-        }
-        if offset == total_len {
-            return Ok(Some(Bytes::new()));
-        }
+            let to_read = match length {
+                Some(0) | None => total_len - offset,
+                Some(max_len) => max_len.min(total_len - offset),
+            };
 
-        file.seek(SeekFrom::Start(offset))
-            .await
-            .map_err(|e| StoreError::Backend(format!("failed to seek local blob: {e}")))?;
-
-        let to_read = match length {
-            Some(0) | None => total_len - offset,
-            Some(max_len) => max_len.min(total_len - offset),
-        };
-
-        let cap = usize::try_from(to_read).map_err(|_| {
-            StoreError::OutOfRange(format!(
-                "requested local blob range ({to_read} bytes) exceeds addressable memory"
-            ))
-        })?;
-        let mut buf = Vec::with_capacity(cap);
-        file.take(to_read)
-            .read_to_end(&mut buf)
-            .await
-            .map_err(|e| StoreError::Backend(format!("failed to read local blob range: {e}")))?;
-        Ok(Some(Bytes::from(buf)))
+            let cap = usize::try_from(to_read).map_err(|_| {
+                StoreError::OutOfRange(format!(
+                    "requested local blob range ({to_read} bytes) exceeds addressable memory"
+                ))
+            })?;
+            let mut buf = Vec::with_capacity(cap);
+            file.take(to_read)
+                .read_to_end(&mut buf)
+                .await
+                .map_err(|e| {
+                    StoreError::Backend(format!("failed to read local blob range: {e}"))
+                })?;
+            Ok(Some(Bytes::from(buf)))
+        })
+        .await
     }
 
     async fn get_blob_range_with_record(
@@ -380,53 +449,59 @@ impl BlobStore for LocalFsBlobStore {
             )));
         }
         let target = self.object_path(&record.blob_id)?;
-        let mut file = match tokio::fs::File::open(&target).await {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => {
-                return Err(StoreError::Backend(format!(
-                    "failed to open local blob {}: {e}",
-                    target.display()
+        let blob_id = record.blob_id.clone();
+        let content_size = record.content_size;
+        crate::resilience::run_with_rpc_deadline("local blob range read", async move {
+            let mut file = match tokio::fs::File::open(&target).await {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => {
+                    return Err(StoreError::Backend(format!(
+                        "failed to open local blob {}: {e}",
+                        target.display()
+                    )));
+                }
+            };
+            let total_len = file
+                .metadata()
+                .await
+                .map_err(|e| StoreError::Backend(format!("failed to stat local blob: {e}")))?
+                .len();
+            if total_len != content_size {
+                return Err(StoreError::Corruption(format!(
+                    "local blob {} has {total_len} bytes on disk, expected {content_size} bytes",
+                    hex::encode(&blob_id),
                 )));
             }
-        };
-        let total_len = file
-            .metadata()
-            .await
-            .map_err(|e| StoreError::Backend(format!("failed to stat local blob: {e}")))?
-            .len();
-        if total_len != record.content_size {
-            return Err(StoreError::Corruption(format!(
-                "local blob {} has {total_len} bytes on disk, expected {} bytes",
-                hex::encode(&record.blob_id),
-                record.content_size
-            )));
-        }
-        let to_read = expected_range_len(record.content_size, offset, length);
-        if to_read == 0 {
-            return Ok(Some(Bytes::new()));
-        }
-        file.seek(SeekFrom::Start(offset))
-            .await
-            .map_err(|e| StoreError::Backend(format!("failed to seek local blob: {e}")))?;
-        let cap = usize::try_from(to_read).map_err(|_| {
-            StoreError::OutOfRange(format!(
-                "requested local blob range ({to_read} bytes) exceeds addressable memory"
-            ))
-        })?;
-        let mut buf = Vec::with_capacity(cap);
-        file.take(to_read)
-            .read_to_end(&mut buf)
-            .await
-            .map_err(|e| StoreError::Backend(format!("failed to read local blob range: {e}")))?;
-        if buf.len() as u64 != to_read {
-            return Err(StoreError::Corruption(format!(
-                "local blob {} truncated while reading: expected {to_read} bytes, got {}",
-                hex::encode(&record.blob_id),
-                buf.len()
-            )));
-        }
-        Ok(Some(Bytes::from(buf)))
+            let to_read = expected_range_len(content_size, offset, length);
+            if to_read == 0 {
+                return Ok(Some(Bytes::new()));
+            }
+            file.seek(SeekFrom::Start(offset))
+                .await
+                .map_err(|e| StoreError::Backend(format!("failed to seek local blob: {e}")))?;
+            let cap = usize::try_from(to_read).map_err(|_| {
+                StoreError::OutOfRange(format!(
+                    "requested local blob range ({to_read} bytes) exceeds addressable memory"
+                ))
+            })?;
+            let mut buf = Vec::with_capacity(cap);
+            file.take(to_read)
+                .read_to_end(&mut buf)
+                .await
+                .map_err(|e| {
+                    StoreError::Backend(format!("failed to read local blob range: {e}"))
+                })?;
+            if buf.len() as u64 != to_read {
+                return Err(StoreError::Corruption(format!(
+                    "local blob {} truncated while reading: expected {to_read} bytes, got {}",
+                    hex::encode(&blob_id),
+                    buf.len()
+                )));
+            }
+            Ok(Some(Bytes::from(buf)))
+        })
+        .await
     }
 
     async fn get_blob_range_stream(
@@ -452,85 +527,107 @@ impl BlobStore for LocalFsBlobStore {
         }
 
         let target = self.object_path(&record.blob_id)?;
-        let mut file = match tokio::fs::File::open(&target).await {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => {
-                return Err(StoreError::Backend(format!(
-                    "failed to open local blob {}: {e}",
-                    target.display()
-                )));
-            }
-        };
-        let total_len = file
-            .metadata()
-            .await
-            .map_err(|e| StoreError::Backend(format!("failed to stat local blob: {e}")))?
-            .len();
-        if total_len != record.content_size {
-            return Err(StoreError::Corruption(format!(
-                "local blob {} has {total_len} bytes on disk, expected {} bytes",
-                hex::encode(&record.blob_id),
-                record.content_size
-            )));
-        }
-
         let expected_len = expected_range_len(record.content_size, offset, length);
+        let blob_id = record.blob_id.clone();
+        let content_size = record.content_size;
+
+        let maybe_file = crate::resilience::run_with_rpc_deadline(
+            "local blob stream open",
+            async move {
+                let mut file = match tokio::fs::File::open(&target).await {
+                    Ok(f) => f,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                    Err(e) => {
+                        return Err(StoreError::Backend(format!(
+                            "failed to open local blob {}: {e}",
+                            target.display()
+                        )));
+                    }
+                };
+                let total_len = file
+                    .metadata()
+                    .await
+                    .map_err(|e| StoreError::Backend(format!("failed to stat local blob: {e}")))?
+                    .len();
+                if total_len != content_size {
+                    return Err(StoreError::Corruption(format!(
+                        "local blob {} has {total_len} bytes on disk, expected {content_size} bytes",
+                        hex::encode(&blob_id),
+                    )));
+                }
+                if expected_len > 0 {
+                    file.seek(SeekFrom::Start(offset))
+                        .await
+                        .map_err(|e| {
+                            StoreError::Backend(format!("failed to seek local blob: {e}"))
+                        })?;
+                }
+                Ok(Some(file))
+            },
+        )
+        .await?;
+        let Some(mut file) = maybe_file else {
+            return Ok(None);
+        };
+
         let (tx, rx) = mpsc::channel(8);
         if expected_len == 0 {
             return Ok(Some(rx));
         }
 
-        file.seek(SeekFrom::Start(offset))
-            .await
-            .map_err(|e| StoreError::Backend(format!("failed to seek local blob: {e}")))?;
-
         let blob_id_hex = hex::encode(&record.blob_id);
-        tokio::spawn(async move {
-            let mut remaining = expected_len;
-            while remaining > 0 {
-                let to_read = remaining.min(cc_common::FILE_STREAM_CHUNK_SIZE as u64) as usize;
-                let mut buf = vec![0u8; to_read];
-                match file.read(&mut buf).await {
-                    Ok(0) => {
-                        let _ = tx
-                            .send(Err(StoreError::Corruption(format!(
-                                "local blob {blob_id_hex} truncated mid-stream ({remaining} bytes remaining)"
-                            ))))
-                            .await;
-                        return;
-                    }
-                    Ok(n) => {
-                        buf.truncate(n);
-                        remaining -= n as u64;
-                        if tx.send(Ok(Bytes::from(buf))).await.is_err() {
+        crate::resilience::spawn_blob_stream_producer(
+            "local blob stream",
+            tx,
+            move |tx| async move {
+                let mut remaining = expected_len;
+                while remaining > 0 {
+                    let to_read = remaining.min(cc_common::FILE_STREAM_CHUNK_SIZE as u64) as usize;
+                    let mut buf = vec![0u8; to_read];
+                    match file.read(&mut buf).await {
+                        Ok(0) => {
+                            let _ = tx
+                                .send(Err(StoreError::Corruption(format!(
+                                    "local blob {blob_id_hex} truncated mid-stream ({remaining} bytes remaining)"
+                                ))))
+                                .await;
+                            return;
+                        }
+                        Ok(n) => {
+                            buf.truncate(n);
+                            remaining -= n as u64;
+                            if tx.send(Ok(Bytes::from(buf))).await.is_err() {
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx
+                                .send(Err(StoreError::Backend(format!(
+                                    "failed to read local blob {blob_id_hex}: {e}"
+                                ))))
+                                .await;
                             return;
                         }
                     }
-                    Err(e) => {
-                        let _ = tx
-                            .send(Err(StoreError::Backend(format!(
-                                "failed to read local blob {blob_id_hex}: {e}"
-                            ))))
-                            .await;
-                        return;
-                    }
                 }
-            }
-        });
+            },
+        );
 
         Ok(Some(rx))
     }
 
     async fn has_blob(&self, blob_id: &[u8]) -> StoreResult<bool> {
         let target = self.object_path(blob_id)?;
-        match tokio::fs::metadata(&target).await {
-            Ok(meta) => Ok(meta.is_file()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(StoreError::Backend(format!(
-                "failed to stat local blob: {e}"
-            ))),
-        }
+        crate::resilience::run_with_rpc_deadline("local blob stat", async move {
+            match tokio::fs::metadata(&target).await {
+                Ok(meta) => Ok(meta.is_file()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(e) => Err(StoreError::Backend(format!(
+                    "failed to stat local blob: {e}"
+                ))),
+            }
+        })
+        .await
     }
 }
 
@@ -743,5 +840,32 @@ mod tests {
             matches!(trunc_err, StoreError::Corruption(_)),
             "{trunc_err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn local_blob_ops_fail_fast_when_rpc_deadline_expired() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(LocalFsBlobStore::open(dir.path()).unwrap());
+        let blob_id = vec![0xcd; 20];
+        let payload = Bytes::from_static(b"hello local blob");
+        store.put_blob(&blob_id, payload.clone()).await.unwrap();
+
+        let expired = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(10))
+            .unwrap_or_else(std::time::Instant::now);
+
+        assert!(matches!(
+            crate::resilience::with_rpc_deadline(Some(expired), store.put_blob(&blob_id, payload),)
+                .await,
+            Err(StoreError::DeadlineExceeded(_))
+        ));
+        assert!(matches!(
+            crate::resilience::with_rpc_deadline(Some(expired), store.get_blob(&blob_id)).await,
+            Err(StoreError::DeadlineExceeded(_))
+        ));
+        assert!(matches!(
+            crate::resilience::with_rpc_deadline(Some(expired), store.has_blob(&blob_id)).await,
+            Err(StoreError::DeadlineExceeded(_))
+        ));
     }
 }

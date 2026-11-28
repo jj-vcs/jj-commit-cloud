@@ -35,8 +35,9 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 
 use super::{
-    CallerIdentity, CallerKind, MAX_HTTP_BODY_BYTES, VerifyError, build_http_client,
-    read_bounded_json, validate_endpoint_url, validate_identity_text,
+    CallerIdentity, CallerKind, HTTP_REQUEST_TIMEOUT, MAX_HTTP_BODY_BYTES, VerifyError,
+    build_http_client, effective_http_timeout, read_bounded_json, validate_endpoint_url,
+    validate_identity_text,
 };
 
 const DEFAULT_JWKS_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
@@ -292,7 +293,39 @@ impl OidcValidator {
         self.enforce_actor_repo_suffix
     }
 
-    async fn fetch_jwks_from_remote(&self) -> Result<JwkSet, String> {
+    async fn send_get_with_deadline(
+        &self,
+        url: &str,
+        label: &'static str,
+    ) -> Result<reqwest::Response, VerifyError> {
+        let timeout = effective_http_timeout(HTTP_REQUEST_TIMEOUT)?;
+        let req = self.client.get(url).timeout(timeout);
+        let res = match tokio::time::timeout(timeout, req.send()).await {
+            Ok(res) => res,
+            Err(_) => {
+                return if crate::resilience::remaining_rpc_deadline().is_some_and(|r| r.is_zero()) {
+                    Err(VerifyError::DeadlineExceeded(format!(
+                        "gRPC deadline exceeded during {label} request"
+                    )))
+                } else {
+                    Err(VerifyError::Backend(format!("{label} request timed out")))
+                };
+            }
+        };
+        res.map_err(|e| {
+            if e.is_timeout()
+                && crate::resilience::remaining_rpc_deadline().is_some_and(|r| r.is_zero())
+            {
+                VerifyError::DeadlineExceeded(format!(
+                    "gRPC deadline exceeded during {label} request"
+                ))
+            } else {
+                VerifyError::Backend(format!("{label} request failed: {e}"))
+            }
+        })
+    }
+
+    async fn fetch_jwks_from_remote(&self) -> Result<JwkSet, VerifyError> {
         let jwks_uri = if let Some(explicit) = &self.explicit_jwks_uri {
             explicit.clone()
         } else {
@@ -301,35 +334,44 @@ impl OidcValidator {
                 self.issuer.trim_end_matches('/')
             );
             let resp = self
-                .client
-                .get(&discovery_url)
-                .send()
-                .await
-                .map_err(|e| format!("OIDC discovery request failed: {e}"))?;
+                .send_get_with_deadline(&discovery_url, "OIDC discovery")
+                .await?;
             if !resp.status().is_success() {
-                return Err(format!(
+                return Err(VerifyError::Backend(format!(
                     "OIDC discovery returned HTTP {}",
                     resp.status().as_u16()
-                ));
+                )));
             }
             let doc: OidcDiscoveryDocument =
                 read_bounded_json(resp, MAX_HTTP_BODY_BYTES, "OIDC discovery").await?;
-            validate_discovery_document(&self.issuer, &doc)?
+            validate_discovery_document(&self.issuer, &doc).map_err(VerifyError::Backend)?
         };
 
-        let resp = self
-            .client
-            .get(&jwks_uri)
-            .send()
-            .await
-            .map_err(|e| format!("JWKS request failed: {e}"))?;
+        let resp = self.send_get_with_deadline(&jwks_uri, "JWKS").await?;
         if !resp.status().is_success() {
-            return Err(format!(
+            return Err(VerifyError::Backend(format!(
                 "JWKS endpoint returned HTTP {}",
                 resp.status().as_u16()
-            ));
+            )));
         }
         read_bounded_json(resp, MAX_HTTP_BODY_BYTES, "JWKS").await
+    }
+
+    async fn lock_refresh_with_deadline(
+        &self,
+    ) -> Result<tokio::sync::MutexGuard<'_, ()>, VerifyError> {
+        match crate::resilience::remaining_rpc_deadline() {
+            Some(rem) if rem.is_zero() => Err(VerifyError::DeadlineExceeded(
+                "gRPC deadline expired waiting for JWKS refresh lock".to_string(),
+            )),
+            Some(rem) => match tokio::time::timeout(rem, self.refresh_lock.lock()).await {
+                Ok(guard) => Ok(guard),
+                Err(_) => Err(VerifyError::DeadlineExceeded(
+                    "gRPC deadline exceeded waiting for JWKS refresh lock".to_string(),
+                )),
+            },
+            None => Ok(self.refresh_lock.lock().await),
+        }
     }
 
     pub(super) fn find_candidate_keys(
@@ -357,7 +399,7 @@ impl OidcValidator {
         &self,
         kid: Option<&str>,
         alg: Algorithm,
-    ) -> Result<InitialJwksLookup, String> {
+    ) -> Result<InitialJwksLookup, VerifyError> {
         {
             let guard = self.cache.read().await;
             if let (Some(jwks), Some(fetched_at)) = (&guard.jwks, guard.fetched_at)
@@ -373,11 +415,13 @@ impl OidcValidator {
             if let Some(failed_at) = guard.last_initial_fetch_failure
                 && failed_at.elapsed() < self.refresh_cooldown
             {
-                return Err("JWKS fetch backoff active after recent failure".to_string());
+                return Err(VerifyError::Backend(
+                    "JWKS fetch backoff active after recent failure".to_string(),
+                ));
             }
         }
 
-        let _refresh_guard = self.refresh_lock.lock().await;
+        let _refresh_guard = self.lock_refresh_with_deadline().await?;
         {
             let guard = self.cache.read().await;
             if let (Some(jwks), Some(fetched_at)) = (&guard.jwks, guard.fetched_at)
@@ -393,15 +437,19 @@ impl OidcValidator {
             if let Some(failed_at) = guard.last_initial_fetch_failure
                 && failed_at.elapsed() < self.refresh_cooldown
             {
-                return Err("JWKS fetch backoff active after recent failure".to_string());
+                return Err(VerifyError::Backend(
+                    "JWKS fetch backoff active after recent failure".to_string(),
+                ));
             }
         }
 
         // Re-run OIDC discovery (unless explicit jwks_uri is pinned) on initial load and after
-        // TTL expiry so IDP jwks_uri rotation recovers automatically. Record failures for
-        // `refresh_cooldown` so an IDP outage fails fast instead of serially hammering the IDP.
+        // TTL expiry so IDP jwks_uri rotation recovers automatically. Record backend failures for
+        // `refresh_cooldown` so an IDP outage fails fast instead of serially hammering the IDP,
+        // without letting a single caller's tight local deadline poison the shared cooldown.
         let jwks = match self.fetch_jwks_from_remote().await {
             Ok(jwks) => jwks,
+            Err(err @ VerifyError::DeadlineExceeded(_)) => return Err(err),
             Err(err) => {
                 let mut guard = self.cache.write().await;
                 guard.last_initial_fetch_failure = Some(Instant::now());
@@ -430,8 +478,8 @@ impl OidcValidator {
         alg: Algorithm,
         observed_fetched_at: Instant,
         observed_generation: u64,
-    ) -> Result<Option<Vec<DecodingKey>>, String> {
-        let _refresh_guard = self.refresh_lock.lock().await;
+    ) -> Result<Option<Vec<DecodingKey>>, VerifyError> {
+        let _refresh_guard = self.lock_refresh_with_deadline().await?;
         {
             let guard = self.cache.read().await;
             // If another concurrent request refreshed the cache while we waited for
@@ -451,6 +499,9 @@ impl OidcValidator {
         }
 
         let fetch_res = self.fetch_jwks_from_remote().await;
+        if let Err(err @ VerifyError::DeadlineExceeded(_)) = fetch_res {
+            return Err(err);
+        }
         let completed_at = Instant::now();
         let mut guard = self.cache.write().await;
         // Record the forced-refresh timestamp after the network attempt finishes (including on
@@ -568,10 +619,7 @@ impl OidcValidator {
         }
 
         let kid = header.kid.as_deref();
-        let initial = self
-            .get_candidate_keys_initial(kid, alg)
-            .await
-            .map_err(VerifyError::Backend)?;
+        let initial = self.get_candidate_keys_initial(kid, alg).await?;
         let claims = if !initial.keys.is_empty() {
             match self.decode_with_keys(token, alg, &initial.keys) {
                 Ok(claims) => claims,
@@ -585,8 +633,7 @@ impl OidcValidator {
                     if kid.is_none() && !initial.just_fetched {
                         if let Some(refreshed_keys) = self
                             .refresh_jwks_on_miss(kid, alg, initial.fetched_at, initial.generation)
-                            .await
-                            .map_err(VerifyError::Backend)?
+                            .await?
                             && !refreshed_keys.is_empty()
                         {
                             self.decode_with_keys(token, alg, &refreshed_keys)
@@ -606,8 +653,7 @@ impl OidcValidator {
         } else {
             let Some(refreshed_keys) = self
                 .refresh_jwks_on_miss(kid, alg, initial.fetched_at, initial.generation)
-                .await
-                .map_err(VerifyError::Backend)?
+                .await?
             else {
                 return Err(VerifyError::InvalidCredential(
                     "unknown JWT kid and JWKS refresh cooldown is active".to_string(),

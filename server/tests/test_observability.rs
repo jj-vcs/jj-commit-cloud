@@ -632,6 +632,7 @@ async fn test_server_cli_metrics_listen_unauthenticated_and_fail_fast() {
         reconcile_client_fallback_total: 0,
         blob_cache_hits: 0,
         blob_cache_misses: 0,
+        panics_total: 0,
     };
     for _ in 0..20 {
         let (st, _, body) = http_get(metrics_addr, "/statz").await;

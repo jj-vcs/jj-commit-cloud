@@ -25,6 +25,7 @@ use tokio_postgres::error::SqlState;
 
 use super::PostgresMetadataStore;
 use super::codec::{current_unix_millis, decode_workspace_row, map_pg_err};
+use super::pool::run_pg_bounded;
 use crate::store::{StoreError, StoreResult};
 
 impl PostgresMetadataStore {
@@ -282,16 +283,20 @@ impl PostgresMetadataStore {
         repo_id: &str,
         workspace_name: &str,
     ) -> StoreResult<Option<WorkspaceState>> {
-        let client = self.get_client().await?;
-        let row = client
-            .query_opt(
+        let mut conn = self.checkout_guarded_client().await?;
+        conn.arm_for_query("PostgreSQL read")?;
+        let res = run_pg_bounded(
+            "PostgreSQL read",
+            conn.client().query_opt(
                 "SELECT \"user\", operation_id, commit_id, tree_ids, conflict_labels, sparse_patterns, sparse_patterns_set
                  FROM workspaces
                  WHERE repo_id = $1 AND workspace_name = $2",
                 &[&repo_id, &workspace_name],
-            )
-            .await
-            .map_err(map_pg_err)?;
+            ),
+        )
+        .await?;
+        conn.mark_clean_if_healthy(&res);
+        let row = res.map_err(map_pg_err)?;
         Ok(row.map(|r| {
             decode_workspace_row(
                 repo_id.to_string(),
@@ -307,18 +312,22 @@ impl PostgresMetadataStore {
         &self,
         repo_id: &str,
     ) -> StoreResult<Vec<WorkspaceState>> {
-        let client = self.get_client().await?;
-        let rows = client
-            .query(
+        let mut conn = self.checkout_guarded_client().await?;
+        conn.arm_for_query("PostgreSQL read")?;
+        let res = run_pg_bounded(
+            "PostgreSQL read",
+            conn.client().query(
                 "SELECT \"user\", workspace_name, operation_id, commit_id, tree_ids,
                         conflict_labels, sparse_patterns, sparse_patterns_set
                  FROM workspaces
                  WHERE repo_id = $1
                  ORDER BY workspace_name COLLATE \"C\" ASC",
                 &[&repo_id],
-            )
-            .await
-            .map_err(map_pg_err)?;
+            ),
+        )
+        .await?;
+        conn.mark_clean_if_healthy(&res);
+        let rows = res.map_err(map_pg_err)?;
         Ok(rows
             .into_iter()
             .map(|r| decode_workspace_row(repo_id.to_string(), r.get(0), r.get(1), &r, 2))
@@ -336,34 +345,43 @@ impl PostgresMetadataStore {
             return Ok((Vec::new(), false));
         }
         let fetch_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
-        let client = self.get_client().await?;
-        let rows = match after_workspace_name {
-            Some(after_ws) => client
-                .query(
-                    "SELECT \"user\", workspace_name, operation_id, commit_id, tree_ids,
-                            conflict_labels, sparse_patterns, sparse_patterns_set
-                     FROM workspaces
-                     WHERE repo_id = $1
-                       AND workspace_name COLLATE \"C\" > $2::TEXT COLLATE \"C\"
-                     ORDER BY workspace_name COLLATE \"C\" ASC
-                     LIMIT $3",
-                    &[&repo_id, &after_ws, &fetch_limit],
+        let mut conn = self.checkout_guarded_client().await?;
+        conn.arm_for_query("PostgreSQL read")?;
+        let res = match after_workspace_name {
+            Some(after_ws) => {
+                run_pg_bounded(
+                    "PostgreSQL read",
+                    conn.client().query(
+                        "SELECT \"user\", workspace_name, operation_id, commit_id, tree_ids,
+                                conflict_labels, sparse_patterns, sparse_patterns_set
+                         FROM workspaces
+                         WHERE repo_id = $1
+                           AND workspace_name COLLATE \"C\" > $2::TEXT COLLATE \"C\"
+                         ORDER BY workspace_name COLLATE \"C\" ASC
+                         LIMIT $3",
+                        &[&repo_id, &after_ws, &fetch_limit],
+                    ),
                 )
-                .await
-                .map_err(map_pg_err)?,
-            None => client
-                .query(
-                    "SELECT \"user\", workspace_name, operation_id, commit_id, tree_ids,
-                            conflict_labels, sparse_patterns, sparse_patterns_set
-                     FROM workspaces
-                     WHERE repo_id = $1
-                     ORDER BY workspace_name COLLATE \"C\" ASC
-                     LIMIT $2",
-                    &[&repo_id, &fetch_limit],
+                .await?
+            }
+            None => {
+                run_pg_bounded(
+                    "PostgreSQL read",
+                    conn.client().query(
+                        "SELECT \"user\", workspace_name, operation_id, commit_id, tree_ids,
+                                conflict_labels, sparse_patterns, sparse_patterns_set
+                         FROM workspaces
+                         WHERE repo_id = $1
+                         ORDER BY workspace_name COLLATE \"C\" ASC
+                         LIMIT $2",
+                        &[&repo_id, &fetch_limit],
+                    ),
                 )
-                .await
-                .map_err(map_pg_err)?,
+                .await?
+            }
         };
+        conn.mark_clean_if_healthy(&res);
+        let rows = res.map_err(map_pg_err)?;
         let mut out = Vec::new();
         let mut response_bytes = 0usize;
         let mut has_more = false;
@@ -389,15 +407,19 @@ impl PostgresMetadataStore {
         repo_id: &str,
         workspace_name: &str,
     ) -> StoreResult<bool> {
-        let client = self.get_client().await?;
-        let removed = client
-            .execute(
+        let mut conn = self.checkout_guarded_client().await?;
+        conn.arm_for_query("PostgreSQL write")?;
+        let res = run_pg_bounded(
+            "PostgreSQL write",
+            conn.client().execute(
                 "DELETE FROM workspaces
                  WHERE repo_id = $1 AND workspace_name = $2",
                 &[&repo_id, &workspace_name],
-            )
-            .await
-            .map_err(map_pg_err)?;
+            ),
+        )
+        .await?;
+        conn.mark_clean_if_healthy(&res);
+        let removed = res.map_err(map_pg_err)?;
         Ok(removed > 0)
     }
 }

@@ -14,7 +14,6 @@
 
 use std::fs;
 
-// Initialize a commit cloud repository and verify that the type file returns commit_cloud for the op store and op heads store.
 #[tokio::test]
 async fn test_cc_init_op_store_type_returns_commit_cloud() {
     let workspace = testutils::TestWorkspace::init().await;
@@ -29,7 +28,6 @@ async fn test_cc_init_op_store_type_returns_commit_cloud() {
     assert_eq!(op_heads_type.trim(), "commit_cloud");
 }
 
-// Run jj operation, modify file, and verify that the commit cloud operation log returns the accurate result
 #[tokio::test]
 async fn test_op_log_succeeds_on_snapshot() {
     let workspace = testutils::TestWorkspace::init().await;
