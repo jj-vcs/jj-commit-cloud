@@ -99,6 +99,7 @@ async fn test_daemon_routes_rpc_calls_over_uds() {
             project_id: "daemon-test-project".to_string(),
             repo_id: None,
             name: Some("daemon-test-repo".to_string()),
+            hash_algorithm: cc_common::backend::HashAlgorithm::Sha1 as i32,
         })
         .await
         .expect("Failed to register repo via daemon")
@@ -109,7 +110,7 @@ async fn test_daemon_routes_rpc_calls_over_uds() {
     assert!(!repo_id.is_empty());
 
     let test_commit = cc_common::backend::Commit {
-        parent_commit_ids: vec![],
+        parent_commit_ids: vec![cc_common::ROOT_COMMIT_ID_BYTES.to_vec()],
         predecessors: vec![],
         root_tree_id: vec![cc_common::EMPTY_TREE_ID_BYTES.to_vec()],
         change_id: vec![4; cc_common::CHANGE_ID_LENGTH],
@@ -119,6 +120,8 @@ async fn test_daemon_routes_rpc_calls_over_uds() {
         commit_id: vec![],
         conflict_labels: vec![],
         secure_sig: None,
+        raw_git_commit: vec![],
+        external_ids: Default::default(),
     };
 
     let write_commit_resp = backend_client
@@ -147,8 +150,8 @@ async fn test_daemon_routes_rpc_calls_over_uds() {
 
     // Test OpStoreService over daemon UDS
     let test_op = cc_common::op_store::Operation {
-        parents: vec![],
-        view_id: vec![20, 21, 22],
+        parents: vec![cc_common::ROOT_OPERATION_ID_BYTES.to_vec()],
+        view_id: cc_common::ROOT_VIEW_ID_BYTES.to_vec(),
         metadata: None,
         commit_predecessors: vec![],
         commit_predecessors_set: false,
@@ -173,7 +176,10 @@ async fn test_daemon_routes_rpc_calls_over_uds() {
         .await
         .expect("Failed to read operation via daemon")
         .into_inner();
-    assert_eq!(read_op_resp.operation.unwrap().view_id, vec![20, 21, 22]);
+    assert_eq!(
+        read_op_resp.operation.unwrap().view_id,
+        cc_common::ROOT_VIEW_ID_BYTES.to_vec()
+    );
 
     // Test WorkspaceService over daemon UDS
     #[allow(deprecated)]

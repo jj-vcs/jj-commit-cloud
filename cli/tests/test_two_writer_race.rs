@@ -20,20 +20,44 @@ use tempfile::NamedTempFile;
 use tokio::sync::Barrier;
 
 use cc_common::backend::backend_service_client::BackendServiceClient;
-use cc_common::backend::RegisterRepositoryRequest;
+use cc_common::backend::{HashAlgorithm, RegisterRepositoryRequest};
 use cc_common::op_store::op_store_service_client::OpStoreServiceClient;
-use cc_common::op_store::{GetOpHeadsRequest, UpdateOpHeadsRequest};
+use cc_common::op_store::{
+    GetOpHeadsRequest, Operation, OperationMetadata, UpdateOpHeadsRequest, WriteOperationRequest,
+};
 use testutils::spawn_sqlite_server;
 
 const ROUNDS: usize = 50;
 
+fn make_op(parent: Vec<u8>, desc: String, ts: i64) -> Operation {
+    Operation {
+        parents: vec![parent],
+        view_id: cc_common::ROOT_VIEW_ID_BYTES.to_vec(),
+        metadata: Some(OperationMetadata {
+            start_time_millis: ts,
+            end_time_millis: ts,
+            description: desc,
+            hostname: "test".to_string(),
+            username: "test".to_string(),
+            is_snapshot: false,
+            workspace_name: None,
+            attributes: Default::default(),
+        }),
+        commit_predecessors: vec![],
+        commit_predecessors_set: false,
+    }
+}
+
 async fn run_two_writer_race(server_url: String) {
-    let mut backend = BackendServiceClient::connect(server_url.clone()).await.unwrap();
+    let mut backend = BackendServiceClient::connect(server_url.clone())
+        .await
+        .unwrap();
     let repo_id = backend
         .register_repository(RegisterRepositoryRequest {
             project_id: "race-project".to_string(),
             repo_id: None,
             name: None,
+            hash_algorithm: HashAlgorithm::Sha1 as i32,
         })
         .await
         .unwrap()
@@ -41,8 +65,22 @@ async fn run_two_writer_race(server_url: String) {
         .repo_id;
 
     // Move off the root op first: a root-op parent is allowed to fork (new workspace init).
-    let mut setup = OpStoreServiceClient::connect(server_url.clone()).await.unwrap();
-    let mut base = vec![0xB0; 20];
+    let mut setup = OpStoreServiceClient::connect(server_url.clone())
+        .await
+        .unwrap();
+    let mut base = setup
+        .write_operation(WriteOperationRequest {
+            repo_id: repo_id.clone(),
+            operation: Some(make_op(
+                cc_common::ROOT_OPERATION_ID_BYTES.to_vec(),
+                "base".to_string(),
+                1,
+            )),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .operation_id;
     setup
         .update_op_heads(UpdateOpHeadsRequest {
             repo_id: repo_id.clone(),
@@ -56,15 +94,27 @@ async fn run_two_writer_race(server_url: String) {
         let barrier = Arc::new(Barrier::new(2));
         let mut handles = Vec::new();
         for writer in 0..2u8 {
-            let (url, repo_id, base, barrier) =
-                (server_url.clone(), repo_id.clone(), base.clone(), barrier.clone());
+            let (url, repo_id, base, barrier) = (
+                server_url.clone(),
+                repo_id.clone(),
+                base.clone(),
+                barrier.clone(),
+            );
             handles.push(tokio::spawn(async move {
                 let mut client = OpStoreServiceClient::connect(url).await.unwrap();
-                let new_id = {
-                    let mut id = vec![writer + 1; 20];
-                    id[..8].copy_from_slice(&(round as u64).to_be_bytes());
-                    id
-                };
+                let new_id = client
+                    .write_operation(WriteOperationRequest {
+                        repo_id: repo_id.clone(),
+                        operation: Some(make_op(
+                            base.clone(),
+                            format!("round {round} writer {writer}"),
+                            (round as i64) * 10 + (writer as i64) + 10,
+                        )),
+                    })
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .operation_id;
                 barrier.wait().await;
                 let result = client
                     .update_op_heads(UpdateOpHeadsRequest {
@@ -94,12 +144,17 @@ async fn run_two_writer_race(server_url: String) {
         );
 
         let heads = setup
-            .get_op_heads(GetOpHeadsRequest { repo_id: repo_id.clone() })
+            .get_op_heads(GetOpHeadsRequest {
+                repo_id: repo_id.clone(),
+            })
             .await
             .unwrap()
             .into_inner()
             .op_head_ids;
-        assert_eq!(heads, winners, "round {round}: head must be the winner only");
+        assert_eq!(
+            heads, winners,
+            "round {round}: head must be the winner only"
+        );
         base = winners.pop().unwrap();
     }
 }

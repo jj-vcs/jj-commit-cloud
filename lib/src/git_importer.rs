@@ -12,23 +12,39 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use cc_common::ROOT_COMMIT_ID_BYTES;
 use cc_common::backend::backend_service_client::BackendServiceClient;
 use cc_common::backend::{
     Commit, File, Signature, Timestamp, TreeEntry, TreeValue, WriteCommitRequest, WriteFileRequest,
-    WriteTreeRequest, tree_value,
+    WriteSymlinkRequest, WriteTreeRequest, tree_value,
 };
 use cc_common::op_store::op_store_service_client::OpStoreServiceClient;
 use cc_common::op_store::{
     GetOpHeadsRequest, Operation, OperationMetadata, ReadOperationRequest, ReadViewRequest,
     RefTarget, RefTargetTerm, UpdateOpHeadsRequest, View, WriteOperationRequest, WriteViewRequest,
 };
-use cc_common::{EMPTY_TREE_ID_BYTES, ROOT_CHANGE_ID_BYTES, ROOT_COMMIT_ID_BYTES};
 use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use uuid::Uuid;
 
 const CONCURRENT_BLOB_UPLOADS: usize = 32;
+const EMPTY_STRING_PLACEHOLDER: &str = "JJ_EMPTY_STRING";
+
+#[derive(Default)]
+struct ImportCache {
+    blobs: HashMap<gix::hash::ObjectId, Vec<u8>>,
+    trees: HashMap<gix::hash::ObjectId, Vec<u8>>,
+    symlinks: HashMap<gix::hash::ObjectId, Vec<u8>>,
+}
+
+fn normalize_git_signature_field(raw: &gix::bstr::BStr) -> String {
+    let text = raw.to_string();
+    if text == EMPTY_STRING_PLACEHOLDER {
+        String::new()
+    } else {
+        text
+    }
+}
 
 fn make_request<T>(payload: T) -> tonic::Request<T> {
     let mut req = tonic::Request::new(payload);
@@ -102,33 +118,36 @@ impl GitImporter {
             })?;
 
         // Ensure Jujutsu Root Commit exists on server in project CAS
-        self.write_root_commit(&mut backend_client, &project_id)
+        // Validate repository and project exist before importing any Git objects.
+        let _ = backend_client
+            .read_commit(make_request(cc_common::backend::ReadCommitRequest {
+                project_id: project_id.clone(),
+                commit_id: ROOT_COMMIT_ID_BYTES.to_vec(),
+            }))
             .await?;
 
         // Discover HEAD commit IDs and collect commits & blobs to upload
-        let mut blob_map: HashMap<gix::hash::ObjectId, Vec<u8>> = HashMap::new();
+        let mut cache = ImportCache::default();
         let (head_commit_ids, commits_to_process, blobs_to_upload) =
-            self.collect_git_objects(&thread_safe_repo, &dot_git, &mut blob_map)?;
+            self.collect_git_objects(&thread_safe_repo, &dot_git, &mut cache.blobs)?;
 
         // Concurrently upload file blobs to project CAS
         self.upload_blobs(
             &mut backend_client,
             &project_id,
             blobs_to_upload,
-            &mut blob_map,
+            &mut cache.blobs,
         )
         .await?;
 
         // Convert and upload commit graph to project CAS
-        let mut tree_map: HashMap<gix::hash::ObjectId, Vec<u8>> = HashMap::new();
         for commit_oid in commits_to_process {
             self.import_commit(
                 &thread_safe_repo,
                 commit_oid,
                 &mut backend_client,
                 &project_id,
-                &mut blob_map,
-                &mut tree_map,
+                &mut cache,
             )
             .await?;
         }
@@ -155,33 +174,6 @@ impl GitImporter {
         }
     }
 
-    /// Writes the synthetic Jujutsu root commit
-    async fn write_root_commit(
-        &self,
-        backend_client: &mut BackendServiceClient<tonic::transport::Channel>,
-        project_id: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let root_commit = Commit {
-            commit_id: ROOT_COMMIT_ID_BYTES.to_vec(),
-            change_id: ROOT_CHANGE_ID_BYTES.to_vec(),
-            parent_commit_ids: Vec::new(),
-            root_tree_id: vec![EMPTY_TREE_ID_BYTES.to_vec()],
-            description: "".to_string(),
-            author: None,
-            committer: None,
-            predecessors: Vec::new(),
-            conflict_labels: Vec::new(),
-            secure_sig: None,
-        };
-        let _ = backend_client
-            .write_commit(make_request(WriteCommitRequest {
-                project_id: project_id.to_string(),
-                commit: Some(root_commit),
-            }))
-            .await?;
-        Ok(())
-    }
-
     /// Resolves head commit IDs and collects commits & blobs to process
     fn collect_git_objects(
         &self,
@@ -199,36 +191,62 @@ impl GitImporter {
         let repo = thread_safe_repo.to_thread_local();
         let head_commit_ids = self.discover_head_commit_ids(&repo, dot_git);
 
-        // Collect all reachable commits in topological order (parents before children)
+        // Collect all reachable commits in post-order topological order (parents before children)
         let mut commits_to_process = Vec::new();
-        let mut visited = HashSet::new();
+        let mut visit_state: HashMap<gix::hash::ObjectId, bool> = HashMap::new();
 
         for head in &head_commit_ids {
             let head_oid = gix::hash::ObjectId::try_from(head.as_slice())?;
-            let mut stack = vec![head_oid];
+            if visit_state.contains_key(&head_oid) {
+                continue;
+            }
+            let mut stack = vec![(head_oid, false)];
 
-            while let Some(oid) = stack.pop() {
-                if visited.insert(oid) {
-                    commits_to_process.push(oid);
-                    if let Ok(obj) = repo.find_object(oid) {
-                        let commit_ref = obj.to_commit_ref();
-                        for parent in commit_ref.parents() {
-                            stack.push(parent);
+            while let Some((oid, expanded)) = stack.pop() {
+                if expanded {
+                    if visit_state.insert(oid, true) != Some(true) {
+                        commits_to_process.push(oid);
+                    }
+                    continue;
+                }
+                if visit_state.contains_key(&oid) {
+                    continue;
+                }
+                visit_state.insert(oid, false);
+                stack.push((oid, true));
+                if let Ok(obj) = repo.find_object(oid) {
+                    let commit_ref = obj.to_commit_ref();
+                    let parents: Vec<_> = commit_ref.parents().collect();
+                    for parent in parents.into_iter().rev() {
+                        if !visit_state.contains_key(&parent) {
+                            stack.push((parent, false));
                         }
                     }
                 }
             }
         }
-        commits_to_process.reverse();
 
         // Collect all file blobs for parallel upload
         let mut blobs_to_upload = Vec::new();
+        let mut seen_trees = HashSet::new();
         for commit_oid in &commits_to_process {
             let obj = repo.find_object(*commit_oid)?;
             let commit_ref = obj.to_commit_ref();
             let mut tree_stack = vec![commit_ref.tree()];
+            if let Some(trees_hdr) = commit_ref.extra_headers().find("jj:trees") {
+                for hex_id in trees_hdr.split(|b| *b == b' ') {
+                    if let Some(raw_id) = jj_lib::hex_util::decode_hex(hex_id)
+                        && let Ok(oid) = gix::hash::ObjectId::try_from(raw_id.as_slice())
+                    {
+                        tree_stack.push(oid);
+                    }
+                }
+            }
 
             while let Some(tree_oid) = tree_stack.pop() {
+                if !seen_trees.insert(tree_oid) {
+                    continue;
+                }
                 if let Ok(tree_obj) = repo.find_object(tree_oid) {
                     if let Ok(tree_ref) =
                         gix::objs::TreeRef::from_bytes(&tree_obj.data, repo.object_hash())
@@ -236,7 +254,7 @@ impl GitImporter {
                         for entry in tree_ref.entries {
                             if entry.mode.is_tree() {
                                 tree_stack.push(entry.oid.to_owned());
-                            } else if !entry.mode.is_link() {
+                            } else if !entry.mode.is_link() && !entry.mode.is_commit() {
                                 if !blob_map.contains_key(&entry.oid.to_owned()) {
                                     if let Ok(blob_obj) = repo.find_object(entry.oid) {
                                         blobs_to_upload
@@ -410,11 +428,12 @@ impl GitImporter {
         commit_oid: gix::hash::ObjectId,
         backend_client: &mut BackendServiceClient<tonic::transport::Channel>,
         project_id: &str,
-        blob_map: &mut HashMap<gix::hash::ObjectId, Vec<u8>>,
-        tree_map: &mut HashMap<gix::hash::ObjectId, Vec<u8>>,
+        cache: &mut ImportCache,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let (
-            tree_oid,
+            root_tree_oids,
+            change_id,
+            conflict_labels,
             author_sig_name,
             author_sig_email,
             author_time_millis,
@@ -425,12 +444,56 @@ impl GitImporter {
             committer_tz_offset,
             mut parent_ids,
             message,
+            raw_git_commit,
+            secure_sig,
         ) = {
             let repo = thread_safe_repo.to_thread_local();
             let object = repo.find_object(commit_oid)?;
+            let raw_bytes = object.data.to_vec();
             let commit_ref = object.to_commit_ref();
+            let parsed_sig = gix::objs::CommitRefIter::signature(&raw_bytes, gix::hash::Kind::Sha1)
+                .map_err(|e| format!("commit {commit_oid}: invalid signature: {e}"))?
+                .map(|(sig, data)| cc_common::backend::SecureSig {
+                    data: Vec::from(data.to_bstring()),
+                    sig: sig.as_ref().to_vec(),
+                });
 
-            let tree_oid = commit_ref.tree();
+            let change_id = commit_ref
+                .extra_headers()
+                .find("change-id")
+                .and_then(jj_lib::hex_util::decode_reverse_hex)
+                .filter(|id| id.len() == cc_common::CHANGE_ID_LENGTH)
+                .unwrap_or_else(|| {
+                    use jj_lib::object_id::ObjectId as _;
+                    let jj_commit_id = jj_lib::backend::CommitId::from_bytes(commit_oid.as_bytes());
+                    jj_lib::git_backend::synthetic_change_id_from_git_commit_id(&jj_commit_id)
+                        .as_bytes()
+                        .to_vec()
+                });
+
+            let root_tree_oids = match commit_ref.extra_headers().find("jj:trees") {
+                Some(value) => value
+                    .split(|b| *b == b' ')
+                    .map(|hex| {
+                        jj_lib::hex_util::decode_hex(hex)
+                            .filter(|id| id.len() == cc_common::TREE_ID_LENGTH)
+                            .and_then(|id| gix::hash::ObjectId::try_from(id.as_slice()).ok())
+                    })
+                    .collect::<Option<Vec<_>>>()
+                    .filter(|ids| ids.len() > 1 && ids.len() % 2 == 1)
+                    .ok_or_else(|| format!("commit {commit_oid}: invalid jj:trees header"))?,
+                None => vec![commit_ref.tree()],
+            };
+
+            let conflict_labels = match commit_ref.extra_headers().find("jj:conflict-labels") {
+                Some(value) => std::str::from_utf8(value)
+                    .map_err(|_| format!("commit {commit_oid}: jj:conflict-labels is not UTF-8"))?
+                    .split_terminator('\n')
+                    .map(str::to_string)
+                    .collect(),
+                None => Vec::new(),
+            };
+
             let author_sig = commit_ref
                 .author()
                 .map_err(|e| format!("commit {commit_oid}: invalid author: {e}"))?;
@@ -449,23 +512,33 @@ impl GitImporter {
                 .map(|p| p.as_bytes().to_vec())
                 .collect();
 
-            let author_time_millis = author_time.seconds * 1000;
-            let author_tz_offset = author_time.offset / 60;
-            let committer_time_millis = committer_time.seconds * 1000;
-            let committer_tz_offset = committer_time.offset / 60;
+            let author_time_millis = author_time
+                .seconds
+                .checked_mul(1000)
+                .ok_or_else(|| format!("commit {commit_oid}: author timestamp overflow"))?;
+            let author_tz_offset = author_time.offset.div_euclid(60);
+            let committer_time_millis = committer_time
+                .seconds
+                .checked_mul(1000)
+                .ok_or_else(|| format!("commit {commit_oid}: committer timestamp overflow"))?;
+            let committer_tz_offset = committer_time.offset.div_euclid(60);
 
             (
-                tree_oid,
-                author_sig.name.to_string(),
-                author_sig.email.to_string(),
+                root_tree_oids,
+                change_id,
+                conflict_labels,
+                normalize_git_signature_field(author_sig.name),
+                normalize_git_signature_field(author_sig.email),
                 author_time_millis,
                 author_tz_offset,
-                committer_sig.name.to_string(),
-                committer_sig.email.to_string(),
+                normalize_git_signature_field(committer_sig.name),
+                normalize_git_signature_field(committer_sig.email),
                 committer_time_millis,
                 committer_tz_offset,
                 parent_ids,
                 commit_ref.message.to_string(),
+                raw_bytes,
+                parsed_sig,
             )
         };
 
@@ -485,23 +558,26 @@ impl GitImporter {
             );
         }
 
-        // Process root tree
-        let root_tree_id = self
-            .process_tree(
-                thread_safe_repo,
-                tree_oid,
-                backend_client,
-                project_id,
-                blob_map,
-                tree_map,
-            )
-            .await?;
+        // Process all root tree terms (single tree or jj:trees conflict terms)
+        let mut root_tree_ids = Vec::with_capacity(root_tree_oids.len());
+        for tree_oid in root_tree_oids {
+            let tid = self
+                .process_tree(
+                    thread_safe_repo,
+                    tree_oid,
+                    backend_client,
+                    project_id,
+                    cache,
+                )
+                .await?;
+            root_tree_ids.push(tid);
+        }
 
         let jj_commit = Commit {
             commit_id: commit_oid.as_bytes().to_vec(),
-            change_id: Uuid::new_v4().as_bytes().to_vec(),
+            change_id,
             parent_commit_ids: parent_ids,
-            root_tree_id: vec![root_tree_id],
+            root_tree_id: root_tree_ids,
             description: message,
             author: Some(Signature {
                 name: author_sig_name,
@@ -520,8 +596,10 @@ impl GitImporter {
                 }),
             }),
             predecessors: Vec::new(),
-            conflict_labels: Vec::new(),
-            secure_sig: None,
+            conflict_labels,
+            secure_sig,
+            raw_git_commit,
+            external_ids: Default::default(),
         };
 
         backend_client
@@ -541,10 +619,9 @@ impl GitImporter {
         tree_oid: gix::hash::ObjectId,
         backend_client: &mut BackendServiceClient<tonic::transport::Channel>,
         project_id: &str,
-        blob_map: &mut HashMap<gix::hash::ObjectId, Vec<u8>>,
-        tree_map: &mut HashMap<gix::hash::ObjectId, Vec<u8>>,
+        cache: &mut ImportCache,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-        if let Some(existing) = tree_map.get(&tree_oid) {
+        if let Some(existing) = cache.trees.get(&tree_oid) {
             return Ok(existing.clone());
         }
 
@@ -556,61 +633,93 @@ impl GitImporter {
 
             let mut raw = Vec::new();
             for entry in tree_ref.entries {
-                let name = entry.filename.to_string();
+                let name = std::str::from_utf8(entry.filename.as_ref())
+                    .map_err(|_| {
+                        format!(
+                            "tree {tree_oid}: entry filename {:?} is not valid UTF-8",
+                            entry.filename
+                        )
+                    })?
+                    .to_string();
                 let entry_oid = entry.oid.to_owned();
                 let is_tree = entry.mode.is_tree();
                 let is_link = entry.mode.is_link();
+                let is_commit = entry.mode.is_commit();
                 let is_exec = entry.mode.is_executable();
-                let blob_data = if !is_tree && !is_link && !blob_map.contains_key(&entry_oid) {
+                let needs_blob = (is_link
+                    && cache.symlinks.get(&entry_oid).is_none_or(Vec::is_empty))
+                    || (!is_tree
+                        && !is_link
+                        && !is_commit
+                        && cache.blobs.get(&entry_oid).is_none_or(Vec::is_empty));
+                let blob_data = if needs_blob {
                     let blob_obj = repo.find_object(entry_oid)?;
                     Some(blob_obj.data.to_vec())
                 } else {
                     None
                 };
-                raw.push((name, entry_oid, is_tree, is_link, is_exec, blob_data));
+                raw.push((
+                    name, entry_oid, is_tree, is_link, is_commit, is_exec, blob_data,
+                ));
             }
             raw
         };
 
         let mut entries = Vec::new();
 
-        for (name, entry_oid, is_tree, is_link, is_exec, blob_data) in raw_entries {
+        for (name, entry_oid, is_tree, is_link, is_commit, is_exec, blob_data) in raw_entries {
             let tree_value = if is_tree {
                 let child_tree_id = Box::pin(self.process_tree(
                     thread_safe_repo,
                     entry_oid,
                     backend_client,
                     project_id,
-                    blob_map,
-                    tree_map,
+                    cache,
                 ))
                 .await?;
                 TreeValue {
                     value: Some(tree_value::Value::TreeId(child_tree_id)),
                 }
-            } else if is_link {
+            } else if is_commit {
                 TreeValue {
-                    value: Some(tree_value::Value::SymlinkId(entry_oid.as_bytes().to_vec())),
+                    value: Some(tree_value::Value::GitSubmoduleId(
+                        entry_oid.as_bytes().to_vec(),
+                    )),
+                }
+            } else if is_link {
+                let symlink_id = if let Some(existing) =
+                    cache.symlinks.get(&entry_oid).filter(|id| !id.is_empty())
+                {
+                    existing.clone()
+                } else {
+                    let raw_target = blob_data.ok_or_else(|| {
+                        format!("missing symlink target blob for '{name}' ({entry_oid})")
+                    })?;
+                    let target = String::from_utf8(raw_target).map_err(|_| {
+                        format!("symlink target for '{name}' ({entry_oid}) is not valid UTF-8")
+                    })?;
+                    let write_res = backend_client
+                        .write_symlink(make_request(WriteSymlinkRequest {
+                            project_id: project_id.to_string(),
+                            target,
+                        }))
+                        .await?
+                        .into_inner();
+                    let written_id = write_res.symlink_id;
+                    cache.symlinks.insert(entry_oid, written_id.clone());
+                    written_id
+                };
+                TreeValue {
+                    value: Some(tree_value::Value::SymlinkId(symlink_id)),
                 }
             } else {
-                let blob_id = if let Some(existing) = blob_map.get(&entry_oid) {
-                    if existing.is_empty() {
-                        let content = blob_data.unwrap_or_default();
-                        let write_res = backend_client
-                            .write_file(make_request(WriteFileRequest {
-                                project_id: project_id.to_string(),
-                                content,
-                            }))
-                            .await?
-                            .into_inner();
-                        let written_id = write_res.file_id;
-                        blob_map.insert(entry_oid, written_id.clone());
-                        written_id
-                    } else {
-                        existing.clone()
-                    }
+                let blob_id = if let Some(existing) =
+                    cache.blobs.get(&entry_oid).filter(|id| !id.is_empty())
+                {
+                    existing.clone()
                 } else {
-                    let content = blob_data.unwrap_or_default();
+                    let content = blob_data
+                        .ok_or_else(|| format!("missing file blob for '{name}' ({entry_oid})"))?;
                     let write_res = backend_client
                         .write_file(make_request(WriteFileRequest {
                             project_id: project_id.to_string(),
@@ -619,7 +728,7 @@ impl GitImporter {
                         .await?
                         .into_inner();
                     let written_id = write_res.file_id;
-                    blob_map.insert(entry_oid, written_id.clone());
+                    cache.blobs.insert(entry_oid, written_id.clone());
                     written_id
                 };
                 TreeValue {
@@ -627,6 +736,7 @@ impl GitImporter {
                         id: blob_id,
                         executable: is_exec,
                         copy_id: Vec::new(),
+                        size_bytes: None,
                     })),
                 }
             };
@@ -647,7 +757,7 @@ impl GitImporter {
             .into_inner();
 
         let written_tree_id = write_tree_res.tree_id;
-        tree_map.insert(tree_oid, written_tree_id.clone());
+        cache.trees.insert(tree_oid, written_tree_id.clone());
 
         Ok(written_tree_id)
     }

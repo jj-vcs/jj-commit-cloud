@@ -14,40 +14,101 @@
 
 syntax = "proto3";
 
-// TODO: Add strong types for main entities across the protos (e.g., `message OperationId { bytes id_bytes = 1; }`)
-// instead of raw bytes/strings.
-
 package commit_cloud.op_store;
 
-// Service interface for remote Operation Store and OpHeads Store RPCs
-// Used by clients to query operations, save repository views, and update operation heads
+// Operation log, repository view, and operation-head coordination service
+// backing `jj_lib::op_store::OpStore` and
+// `jj_lib::op_heads_store::OpHeadsStore`.
+//
+// Ordering & Isolation Contract:
+// - Clients MUST persist `WriteView` before `WriteOperation`, and
+//   `WriteOperation` before publishing `new_op_head_id` via `UpdateOpHeads`.
+// - `WriteView` and `WriteOperation` are deterministic, idempotent
+//   content-addressed writes.
+// - `UpdateOpHeads` executes under serializable isolation, removing
+//   `old_op_head_ids` and adding `new_op_head_id` while retaining concurrent
+//   sibling operation heads. A `ROOT_OPERATION_ID` entry in `old_op_head_ids`
+//   is exempt from active-head presence checks so a new workspace joining an
+//   existing repository can fork from root and leave merging to
+//   `ReconcileOpHeads`.
+//
+// Status Codes:
+// - `UNAUTHENTICATED`: Server requires Bearer authentication and request
+//   metadata lacks a valid `authorization: Bearer <token>` header.
+// - `NOT_FOUND`: `repo_id` is unregistered, or requested `view_id` /
+//   `operation_id` is absent.
+// - `FAILED_PRECONDITION`: `WriteView`, `WriteOperation`, or `PublishOperation`
+//   references an unpersisted non-root `commit_id`, `WriteOperation` or
+//   `PublishOperation` references an unpersisted `view_id` or parent
+//   `operation_id`, or `UpdateOpHeads` references an unpersisted
+//   `new_op_head_id`.
+// - `INVALID_ARGUMENT`: Malformed identifier, digest length, or hex prefix;
+//   empty `view.head_ids`, absent `RefTarget` (except tracked remote
+//   bookmarks), or malformed bookmark key; parentless non-root `Operation`,
+//   duplicate/mixed root parents, or inconsistent/duplicate
+//   `commit_predecessors`; mismatched `operation.view_id`; `ROOT_OPERATION_ID`
+//   supplied as `UpdateOpHeads.new_op_head_id`; or missing message payload.
+// - `ABORTED`: `UpdateOpHeads` or `PublishOperation` failed optimistic
+//   concurrency validation against active operation heads (for example, when a
+//   non-root `old_op_head_ids` entry is no longer active).
+// - `UNIMPLEMENTED`: Requested RPC (`ResolveOperationPrefix`,
+//   `PublishOperation`) is not yet enabled on this server.
 service OpStoreService {
-  // RPCs for reading and writing operation log entries
-  // An operation is a single step in time (like running `jj describe`), making history undoable
-  rpc ReadOperation (ReadOperationRequest) returns (ReadOperationResponse);
-  rpc WriteOperation (WriteOperationRequest) returns (WriteOperationResponse);
+  // Reads an operation node by 16-byte `operation_id`. Synthesizes the all-zero
+  // root operation.
+  rpc ReadOperation(ReadOperationRequest) returns (ReadOperationResponse);
 
-  // RPCs for reading and writing repository view objects
-  // A view is a picture of the repo state, recording active workspace commits and bookmark pointers
-  rpc ReadView (ReadViewRequest) returns (ReadViewResponse);
-  rpc WriteView (WriteViewRequest) returns (WriteViewResponse);
+  // Persists an operation node and returns its deterministic 16-byte
+  // `operation_id`. Idempotent.
+  rpc WriteOperation(WriteOperationRequest) returns (WriteOperationResponse);
 
-  // RPCs for reading and updating active operation heads
-  // OpHeads track the latest operations in the graph, used to find current state or resolve branch conflicts
-  rpc GetOpHeads (GetOpHeadsRequest) returns (GetOpHeadsResponse);
-  // UpdateOpHeads removes old_op_head_ids from the heads and adds new_op_head_id,
-  // atomically. Every old id must still be a head, or the call fails with ABORTED
-  // and changes nothing: of two writers that expect the same head, one wins. The
-  // root operation is the exception: a new workspace joining a repository that
-  // already has operations starts from it, so its first operation is added as a
-  // second head, and ReconcileOpHeads merges the fork (the jj client calls it
-  // whenever it loads the repository).
-  rpc UpdateOpHeads (UpdateOpHeadsRequest) returns (UpdateOpHeadsResponse);
-  rpc ReconcileOpHeads (ReconcileOpHeadsRequest) returns (ReconcileOpHeadsResponse);
+  // Resolves a hexadecimal `OperationId` prefix to zero, one, or multiple
+  // (ambiguous) matches.
+  rpc ResolveOperationPrefix(ResolveOperationPrefixRequest)
+      returns (ResolveOperationPrefixResponse);
+
+  // Reads a repository `View` snapshot by 16-byte `view_id`. Synthesizes the
+  // all-zero root view.
+  rpc ReadView(ReadViewRequest) returns (ReadViewResponse);
+
+  // Persists a `View` snapshot using key-sorted canonical hashing and returns
+  // its 16-byte `view_id`.
+  rpc WriteView(WriteViewRequest) returns (WriteViewResponse);
+
+  // Returns the active operation head IDs for `repo_id` (defaults to
+  // `[ROOT_OPERATION_ID]` on init).
+  rpc GetOpHeads(GetOpHeadsRequest) returns (GetOpHeadsResponse);
+
+  // Atomically advances operation heads from `old_op_head_ids` to
+  // `new_op_head_id`, preserving concurrent sibling heads for 3-way
+  // reconciliation. Rejects virtual `ROOT_OPERATION_ID` as `new_op_head_id`
+  // (`INVALID_ARGUMENT`). A `ROOT_OPERATION_ID` entry in `old_op_head_ids` is
+  // exempt from stale-head `ABORTED` validation so newly initialized workspaces
+  // can fork from root and converge via `ReconcileOpHeads`.
+  rpc UpdateOpHeads(UpdateOpHeadsRequest) returns (UpdateOpHeadsResponse);
+
+  // Reconciles divergent operation heads on the server using `jj_lib`'s 3-way
+  // view and tree merge algebra. When reconciliation succeeds (or `repo_id`
+  // already has a single head), returns `client_resolution_required = false`,
+  // `op_head` set to the 16-byte resolved `OperationId`, and
+  // `current_op_head_ids = [op_head]`. When cross-branch commit rewrites or
+  // abandonments require client-side `DefaultIndexStore` descendant rebasing,
+  // returns `client_resolution_required = true`, an empty `op_head`, and the
+  // active unreconciled `current_op_head_ids` in a single round-trip.
+  rpc ReconcileOpHeads(ReconcileOpHeadsRequest)
+      returns (ReconcileOpHeadsResponse);
+
+  // Persists a `View`, its referencing `Operation`, and an `UpdateOpHeads`
+  // transition in a single roundtrip. `operation.view_id` may be left empty
+  // (the server fills it from `hash_view(view)`) or set to `hash_view(view)`
+  // (returning `INVALID_ARGUMENT` on mismatch). Idempotent on retry: if
+  // `operation_id` is already persisted and `old_op_head_ids` have already been
+  // superseded by a later operation, the server returns `current_op_head_ids`
+  // without re-adding `operation_id` as a divergent head.
+  rpc PublishOperation(PublishOperationRequest)
+      returns (PublishOperationResponse);
 }
 
-// Messages for reading and writing operation log entries
-// Used when fetching operation details during `jj op log` or saving a new transaction operation
 message ReadOperationRequest {
   string repo_id = 1;
   bytes operation_id = 2;
@@ -66,8 +127,25 @@ message WriteOperationResponse {
   bytes operation_id = 1;
 }
 
-// Messages for reading and writing repository view objects
-// Used when looking up workspace heads, local/remote bookmarks, and tags for a given operation
+enum PrefixResolutionStatus {
+  PREFIX_RESOLUTION_STATUS_UNSPECIFIED = 0;
+  PREFIX_RESOLUTION_NO_MATCH = 1;
+  PREFIX_RESOLUTION_SINGLE_MATCH = 2;
+  PREFIX_RESOLUTION_AMBIGUOUS_MATCH = 3;
+}
+
+message ResolveOperationPrefixRequest {
+  string repo_id = 1;
+  // Lowercase hexadecimal prefix string (0 to 32 hex characters).
+  string hex_prefix = 2;
+}
+
+message ResolveOperationPrefixResponse {
+  PrefixResolutionStatus status = 1;
+  // Populated when `status == PREFIX_RESOLUTION_SINGLE_MATCH`.
+  bytes matched_operation_id = 2;
+}
+
 message ReadViewRequest {
   string repo_id = 1;
   bytes view_id = 2;
@@ -87,8 +165,6 @@ message WriteViewResponse {
   bytes view_id = 1;
 }
 
-// Messages for querying and updating active operation heads
-// Used to discover current branch heads or update operation head pointers after a transaction
 message GetOpHeadsRequest {
   string repo_id = 1;
 }
@@ -112,12 +188,33 @@ message ReconcileOpHeadsRequest {
 }
 
 message ReconcileOpHeadsResponse {
+  // Resolved 16-byte `OperationId` when `client_resolution_required == false`
+  // (empty when `client_resolution_required == true`).
   bytes op_head = 1;
+  // True when cross-branch commit rewrites or abandonments require client-side
+  // descendant rebasing against `current_op_head_ids`.
+  bool client_resolution_required = 2;
+  // Active 16-byte operation head IDs after the call (`[op_head]` when
+  // `client_resolution_required == false`, or the unreconciled heads when
+  // `client_resolution_required == true`).
+  repeated bytes current_op_head_ids = 3;
 }
 
-// Messages representing Operation metadata and graph structure
-// Stores start/end time, username, hostname, and parent operations to build the undo history graph
-// Server needs to hash attributes in sorted or deterministic way
+message PublishOperationRequest {
+  string repo_id = 1;
+  View view = 2;
+  Operation operation = 3;
+  repeated bytes old_op_head_ids = 4;
+}
+
+message PublishOperationResponse {
+  bytes view_id = 1;
+  bytes operation_id = 2;
+  repeated bytes current_op_head_ids = 3;
+}
+
+// Operation metadata. `attributes` map keys are sorted server-side before
+// hashing.
 message OperationMetadata {
   int64 start_time_millis = 1;
   int64 end_time_millis = 2;
@@ -142,8 +239,6 @@ message Operation {
   bool commit_predecessors_set = 5;
 }
 
-// Messages representing RefTarget, Bookmarks, and Views
-// Bookmarks are named labels (like `main`), while RefTargets record added/removed commits to track bookmark conflicts
 message RefTargetTerm {
   bytes commit_id = 1;
 }
@@ -158,13 +253,13 @@ message RemoteRef {
   bool is_tracked = 2;
 }
 
-// We use Protobuf map fields to cleanly represent key-value mappings (Google internal does this)
-// git fields (git_refs, git heads, etc) in upstream Views proto are omitted here
-// Protobuf map serialization is in non-deterministic order for key-value pairs
-// The server MUST perform key-sorted (or some other deterministic) hashing scheme to generate view_id
+// Repository state snapshot. Map fields are hashed in deterministic key-sorted
+// order by the server.
 message View {
   repeated bytes head_ids = 1;
   map<string, bytes> wc_commit_ids = 2;
   map<string, RefTarget> local_bookmarks = 3;
+  // Keyed as `"<bookmark>@<remote>"` with non-empty bookmark and remote names
+  // (`remote` contains no `'@'`).
   map<string, RemoteRef> remote_bookmarks = 4;
 }

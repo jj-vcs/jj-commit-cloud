@@ -49,6 +49,8 @@ pub enum StoreError {
     Write(String),
     // A Compare-And-Swap (CAS) optimistic concurrency conflict occurred.
     CasConflict(String),
+    // An existing immutable binding conflicts with the requested registration.
+    AlreadyExists(String),
     // Data failed to be encoded into protobuf format.
     Encode(String),
     // Data was retrieved but could not be decoded, indicating corruption.
@@ -63,6 +65,7 @@ impl std::fmt::Display for StoreError {
             StoreError::Read(msg) => write!(f, "storage read error: {msg}"),
             StoreError::Write(msg) => write!(f, "storage write error: {msg}"),
             StoreError::CasConflict(msg) => write!(f, "CAS conflict: {msg}"),
+            StoreError::AlreadyExists(msg) => write!(f, "already exists: {msg}"),
             StoreError::Encode(msg) => write!(f, "storage encode error: {msg}"),
             StoreError::Decode(msg) => write!(f, "stored data is corrupt: {msg}"),
             StoreError::Task(msg) => write!(f, "storage task error: {msg}"),
