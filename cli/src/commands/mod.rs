@@ -14,6 +14,7 @@
 
 pub mod clone;
 pub mod daemon;
+pub mod export_git;
 pub mod import_git;
 pub mod init;
 pub mod workspace;

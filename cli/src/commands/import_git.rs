@@ -12,58 +12,77 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use cc_lib::git_importer::GitImporter;
+//! `jj cc import-git` command wrapping [`GitImporter`] to stream local Git history to Commit Cloud.
+
+use std::path::PathBuf;
+
+use cc_lib::git_bridge::{GitImportOptions, GitImporter};
+use cc_lib::util::run_on_tokio;
 use clap::Parser;
 use jj_cli::command_error::{CommandError, user_error};
-use std::path::PathBuf;
 
 #[derive(Parser, Clone, Debug)]
 pub struct ImportGitArgs {
-    /// Path to the existing .git directory (or project root containing .git)
+    /// Path to the local Git repository (working tree root or `.git` directory)
     #[arg(long)]
     pub git_dir: PathBuf,
 
-    /// Target Project ID in Commit Cloud (owns shared commit/tree/file storage)
-    #[arg(long)]
-    pub project_id: String,
-
-    /// Target Repository ID in Commit Cloud (owns operation log)
-    #[arg(long)]
-    pub repo_id: String,
-
-    /// Remote Commit Cloud server URL (e.g. http://localhost:8080)
+    /// Remote Commit Cloud gRPC server URL (e.g. http://127.0.0.1:8080)
     #[arg(long)]
     pub server: String,
+
+    /// Optional shared project ID owning commits, trees, symlinks, and blobs
+    #[arg(long)]
+    pub project_id: Option<String>,
+
+    /// Optional target repository ID (allocates a new repository when omitted)
+    #[arg(long)]
+    pub repo_id: Option<String>,
+
+    /// Register the target `--repo-id` if it does not exist yet
+    #[arg(long)]
+    pub create: bool,
 }
 
 pub async fn cmd_import_git(args: &ImportGitArgs) -> Result<(), CommandError> {
-    let work_dir = if args.git_dir.file_name() == Some(std::ffi::OsStr::new(".git")) {
-        args.git_dir.parent().unwrap_or(&args.git_dir).to_path_buf()
-    } else {
-        args.git_dir.clone()
+    if args.repo_id.as_deref().is_some_and(|s| s.trim().is_empty()) {
+        return Err(user_error("--repo-id must not be empty or whitespace"));
+    }
+    if args
+        .project_id
+        .as_deref()
+        .is_some_and(|s| s.trim().is_empty())
+    {
+        return Err(user_error("--project-id must not be empty or whitespace"));
+    }
+
+    let opts = GitImportOptions {
+        git_dir: args.git_dir.clone(),
+        server_url: args.server.clone(),
+        project_id: args.project_id.clone(),
+        repo_id: args.repo_id.clone(),
+        create_repo: args.create || args.repo_id.is_none(),
     };
 
-    println!(
-        "Opening Git repository at {:?} for Target Project ID '{}' / Repo ID '{}'...",
-        work_dir, args.project_id, args.repo_id
-    );
-    let importer = GitImporter::new(
-        work_dir,
-        args.project_id.clone(),
-        args.repo_id.clone(),
-        args.server.clone(),
-    );
-
-    let repo_id = cc_lib::util::run_async(move || async move { importer.run().await })
+    let report = run_on_tokio(async move { GitImporter::new(opts).run().await })
+        .await
         .map_err(|e| user_error(format!("Git import failed: {e}")))?;
 
-    println!("\n✅ Git repository imported successfully!");
-    println!("Cloud Repository ID: {}", repo_id);
-    println!("\nTo connect a workspace to this cloud repository, run:");
     println!(
-        "jj cc init --server {} --project-id {} --repo-id {} .",
-        args.server, args.project_id, repo_id
+        "Imported Git repository into Commit Cloud (repo_id: {}, project_id: {})",
+        report.repo_id, report.project_id
     );
-
+    println!(
+        "  Commits: {}, Trees: {}, Blobs: {}, Symlinks: {}, Bookmarks: {}",
+        report.commits_imported,
+        report.trees_imported,
+        report.blobs_imported,
+        report.symlinks_imported,
+        report.bookmarks_imported
+    );
+    println!(
+        "Clone with:\n  jj cc clone --server {} {} ./checkout",
+        args.server, report.repo_id
+    );
     Ok(())
 }
