@@ -24,10 +24,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use cc_lib::daemon_client::{
-    DaemonRuntimeInfo, ExistingDaemonConnection, PidMatch, acquire_daemon_spawn_lock,
-    check_pid_matches_daemon, connect_existing_daemon, connect_existing_daemon_verified,
-    default_daemon_cache_dir, default_daemon_state_dir, ensure_private_state_dir,
-    is_daemon_enabled, probe_daemon_channel_health, read_daemon_runtime_info, read_daemon_stats,
+    DAEMON_WIRE_VERSION, DaemonRuntimeInfo, ExistingDaemonConnection, PidMatch,
+    acquire_daemon_spawn_lock, check_pid_matches_daemon, connect_existing_daemon,
+    connect_existing_daemon_any_version_verified, default_daemon_cache_dir,
+    default_daemon_state_dir, ensure_private_state_dir, is_daemon_enabled,
+    probe_daemon_channel_health_any_version, read_daemon_runtime_info, read_daemon_stats,
     set_user_daemon_enabled, spawn_and_wait_daemon, terminate_daemon_pid_with_verification,
     user_daemon_config_path, verify_private_state_dir,
 };
@@ -69,6 +70,9 @@ pub enum DaemonSubcommand {
         /// Optional idle shutdown timeout in seconds (`0` disables idle exit)
         #[arg(long)]
         idle_timeout_secs: Option<u64>,
+        /// Optional L2 disk cache quota in MiB (`0` disables automatic background L2 LRU eviction)
+        #[arg(long)]
+        max_disk_cache_mb: Option<u64>,
     },
     /// Stop the running `jj-cc-daemon` process
     Stop,
@@ -107,12 +111,14 @@ pub async fn cmd_cc_daemon(args: &DaemonArgs) -> Result<(), CommandError> {
             socket,
             listen,
             idle_timeout_secs,
+            max_disk_cache_mb,
         } => {
             handle_start(
                 upstream.as_deref(),
                 socket.as_deref(),
                 listen.as_deref(),
                 *idle_timeout_secs,
+                *max_disk_cache_mb,
             )
             .await
         }
@@ -138,15 +144,21 @@ fn check_already_running_start_flags(
     socket: Option<&Path>,
     listen: Option<&str>,
     idle_timeout_secs: Option<u64>,
+    max_disk_cache_mb: Option<u64>,
 ) -> Result<(), CommandError> {
-    if upstream.is_some() || socket.is_some() || listen.is_some() || idle_timeout_secs.is_some() {
+    if upstream.is_some()
+        || socket.is_some()
+        || listen.is_some()
+        || idle_timeout_secs.is_some()
+        || max_disk_cache_mb.is_some()
+    {
         let endpoint = info
             .socket_path
             .as_deref()
             .or(info.tcp_addr.as_deref())
             .unwrap_or("<unknown>");
         return Err(user_error(format!(
-            "jj-cc-daemon is already running (pid {}, endpoint {endpoint}); cannot apply startup flags (--upstream/--socket/--listen/--idle-timeout-secs) to an existing daemon. Run `jj cc daemon stop` first and then re-run `jj cc daemon start`.",
+            "jj-cc-daemon is already running (pid {}, endpoint {endpoint}); cannot apply startup flags (--upstream/--socket/--listen/--idle-timeout-secs/--max-disk-cache-mb) to an existing daemon. Run `jj cc daemon stop` first and then re-run `jj cc daemon start`.",
             info.pid
         )));
     }
@@ -158,6 +170,7 @@ async fn handle_start(
     socket: Option<&Path>,
     listen: Option<&str>,
     idle_timeout_secs: Option<u64>,
+    max_disk_cache_mb: Option<u64>,
 ) -> Result<(), CommandError> {
     let state_dir = default_daemon_state_dir();
     let cache_dir = default_daemon_cache_dir();
@@ -180,6 +193,7 @@ async fn handle_start(
             sock_owned.as_deref(),
             listen_owned.as_deref(),
             idle_timeout_secs,
+            max_disk_cache_mb,
         )
         .await?;
         Ok((info, false))
@@ -193,7 +207,14 @@ async fn handle_start(
         .or(info.tcp_addr.as_deref())
         .unwrap_or("<unknown>");
     if already_running {
-        check_already_running_start_flags(&info, upstream, socket, listen, idle_timeout_secs)?;
+        check_already_running_start_flags(
+            &info,
+            upstream,
+            socket,
+            listen,
+            idle_timeout_secs,
+            max_disk_cache_mb,
+        )?;
         println!(
             "jj-cc-daemon is already running (pid {}, endpoint {endpoint})",
             info.pid
@@ -260,7 +281,9 @@ async fn handle_stop() -> Result<(), CommandError> {
             return Ok(StopOutcome::NotRunning);
         };
 
-        let live = connect_existing_daemon_verified(&st_stop)
+        // Allow connecting across wire-version mismatches so `jj cc daemon stop` can always
+        // stop an older or newer daemon before restarting.
+        let live = connect_existing_daemon_any_version_verified(&st_stop)
             .await
             .map_err(|e| format!("Daemon probe failed: {e}"))?;
 
@@ -306,10 +329,11 @@ async fn probe_daemon_still_live(
     conn: &ExistingDaemonConnection,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     if conn.info.socket_path.is_some() {
-        return Ok(connect_existing_daemon(state_dir)
+        return Ok(connect_existing_daemon_any_version_verified(state_dir)
             .await?
-            .is_some_and(|(cur, _)| {
-                cur.pid == conn.info.pid && cur.started_unix_secs == conn.info.started_unix_secs
+            .is_some_and(|cur| {
+                cur.info.pid == conn.info.pid
+                    && cur.info.started_unix_secs == conn.info.started_unix_secs
             }));
     }
     let still_same_record = read_daemon_runtime_info(state_dir).is_some_and(|cur| {
@@ -318,7 +342,10 @@ async fn probe_daemon_still_live(
     if !still_same_record {
         return Ok(false);
     }
-    Ok(probe_daemon_channel_health(conn.channel.clone(), conn.info.secret.as_deref()).await)
+    Ok(
+        probe_daemon_channel_health_any_version(conn.channel.clone(), conn.info.secret.as_deref())
+            .await,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -444,9 +471,9 @@ async fn handle_status() -> Result<(), CommandError> {
     let enabled = is_daemon_enabled();
     let st_check = state_dir.clone();
     let probe = run_on_tokio(async move {
-        Ok(connect_existing_daemon(&st_check)
+        Ok(connect_existing_daemon_any_version_verified(&st_check)
             .await?
-            .map(|(info, _)| info))
+            .map(|conn| (conn.info, conn.wire_version_mismatch)))
     })
     .await;
 
@@ -461,8 +488,22 @@ async fn handle_status() -> Result<(), CommandError> {
     println!("Preference file: {}", user_daemon_config_path().display());
 
     match probe {
-        Ok(Some(info)) => {
-            println!("Daemon state:    RUNNING (pid {})", info.pid);
+        Ok(Some((info, wire_version_mismatch))) => {
+            if let Some(mismatch) = wire_version_mismatch {
+                println!(
+                    "Daemon state:    RUNNING (pid {}) [WIRE VERSION MISMATCH]",
+                    info.pid
+                );
+                println!("Wire version:    {mismatch}");
+            } else {
+                println!("Daemon state:    RUNNING (pid {})", info.pid);
+                match info.wire_version {
+                    Some(v) => println!("Wire version:    v{v}"),
+                    None => println!(
+                        "Wire version:    legacy (unversioned; CLI supports v{DAEMON_WIRE_VERSION})"
+                    ),
+                }
+            }
             if let Some(sock) = &info.socket_path {
                 println!("Unix socket:     {sock}");
             }
@@ -483,6 +524,12 @@ async fn handle_status() -> Result<(), CommandError> {
                     "Write-through:   {} objects | Upstream RPCs: {}",
                     stats.write_through_objects, stats.upstream_rpcs
                 );
+                if stats.l2_evicted_objects > 0 {
+                    println!(
+                        "L2 evictions:    {} objects ({} bytes)",
+                        stats.l2_evicted_objects, stats.l2_evicted_bytes
+                    );
+                }
             }
         }
         Ok(None) => {
@@ -509,10 +556,10 @@ async fn handle_clear_cache() -> Result<(), CommandError> {
     let cache_dir_display = cache_dir.display().to_string();
     run_on_tokio(async move {
         let _spawn_lock = acquire_daemon_spawn_lock(&state_dir).await?;
-        if let Some((info, _)) = connect_existing_daemon(&state_dir).await? {
+        if let Some(conn) = connect_existing_daemon_any_version_verified(&state_dir).await? {
             return Err(format!(
                 "jj-cc-daemon (pid {}) is running; stop it first with `jj cc daemon stop` before clearing the L2 cache",
-                info.pid
+                conn.info.pid
             )
             .into());
         }
@@ -600,6 +647,7 @@ mod tests {
             default_upstream: None,
             started_unix_secs: 12345,
             secret: None,
+            wire_version: Some(DAEMON_WIRE_VERSION),
         };
         let daemon_json = state_dir.join("daemon.json");
         let raw_json = format!(
@@ -720,13 +768,15 @@ mod tests {
             default_upstream: None,
             started_unix_secs: 1,
             secret: None,
+            wire_version: Some(DAEMON_WIRE_VERSION),
         };
 
-        assert!(check_already_running_start_flags(&info, None, None, None, None).is_ok());
+        assert!(check_already_running_start_flags(&info, None, None, None, None, None).is_ok());
         assert!(
             check_already_running_start_flags(
                 &info,
                 Some("http://127.0.0.1:8080"),
+                None,
                 None,
                 None,
                 None,
@@ -740,18 +790,25 @@ mod tests {
                 Some(Path::new("/tmp/other.sock")),
                 None,
                 None,
+                None,
             )
             .is_err()
         );
         assert!(
-            check_already_running_start_flags(&info, None, None, Some("127.0.0.1:0"), None)
+            check_already_running_start_flags(&info, None, None, Some("127.0.0.1:0"), None, None)
                 .is_err()
         );
-        let err = check_already_running_start_flags(&info, None, None, None, Some(60))
+        let err = check_already_running_start_flags(&info, None, None, None, Some(60), None)
             .expect_err("explicit --idle-timeout-secs on running daemon must fail");
         assert!(
             format!("{err:?}").contains("jj cc daemon stop"),
             "error should guide user to stop daemon first: {err:?}"
+        );
+        let disk_err = check_already_running_start_flags(&info, None, None, None, None, Some(4096))
+            .expect_err("explicit --max-disk-cache-mb on running daemon must fail");
+        assert!(
+            format!("{disk_err:?}").contains("--max-disk-cache-mb"),
+            "error should mention --max-disk-cache-mb: {disk_err:?}"
         );
     }
 
@@ -774,15 +831,17 @@ mod tests {
             default_upstream: None,
             started_unix_secs: 555,
             secret: None,
+            wire_version: Some(cc_common::DAEMON_WIRE_VERSION),
         };
         let format_runtime_json = |r: &DaemonRuntimeInfo| {
             format!(
-                r#"{{"pid":{},"socket_path":{:?},"tcp_addr":null,"cache_dir":{:?},"stats_path":{:?},"default_upstream":null,"started_unix_secs":{}}}"#,
+                r#"{{"pid":{},"socket_path":{:?},"tcp_addr":null,"cache_dir":{:?},"stats_path":{:?},"default_upstream":null,"started_unix_secs":{},"wire_version":{}}}"#,
                 r.pid,
                 r.socket_path.as_deref().unwrap(),
                 r.cache_dir,
                 r.stats_path,
                 r.started_unix_secs,
+                r.wire_version.unwrap_or(cc_common::DAEMON_WIRE_VERSION),
             )
         };
         fs::write(&daemon_json, format_runtime_json(&info)).unwrap();

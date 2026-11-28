@@ -30,8 +30,11 @@ use bytes::Bytes;
 use sha1::{Digest, Sha1};
 use tokio::io::{AsyncWriteExt, BufWriter};
 
-use super::l1::{l1_entry_weight, l1_key_overhead};
-use super::l2::{ensure_private_dir_within, is_valid_object_id};
+use super::l1::l1_key_overhead;
+use super::l2::{
+    create_private_file_with_initial_mode, ensure_private_dir_within, is_valid_object_id,
+    set_file_private,
+};
 use super::{
     CACHE_STREAM_CHUNK_BYTES, CacheInner, CacheScope, MAX_L1_OBJECT_BYTES, ObjectKind, TEMP_SEQ,
 };
@@ -369,14 +372,7 @@ async fn open_staging_file(
         ensure_private_dir_within(&inner.cache_dir, &staging_dir)?;
         let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let path = staging_dir.join(format!(".tmp.{}.{seq}", std::process::id()));
-        let mut opts = fs::OpenOptions::new();
-        opts.read(true).write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let file = opts.open(&path)?;
+        let file = create_private_file_with_initial_mode(&path, true, 0o600)?;
         Ok((tokio::fs::File::from_std(file), StagingTempFile::new(path)))
     })
     .await
@@ -501,7 +497,7 @@ fn commit_staged_disk_file(
         return false;
     }
 
-    let l2_written = match std_file.sync_all() {
+    let l2_written = match set_file_private(&std_file).and_then(|()| std_file.sync_all()) {
         Ok(()) => {
             drop(std_file);
             let dst = inner.object_path(scope, ObjectKind::File, file_id);
@@ -518,6 +514,7 @@ fn commit_staged_disk_file(
             match rename_res {
                 Ok(()) => {
                     guard.disarm();
+                    inner.record_l2_bytes_written(bytes_written);
                     true
                 }
                 Err(err) => {
@@ -547,11 +544,11 @@ fn commit_staged_disk_file(
     } else {
         // Evict any stale L1 entry if the object exceeds the L1 threshold.
         if bytes_written > MAX_L1_OBJECT_BYTES as u64 {
-            let mut l1 = inner.l1.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(prev) = l1.map.pop(&l1_key) {
-                let prev_weight = l1_entry_weight(&l1_key, &prev);
-                l1.current_bytes = l1.current_bytes.saturating_sub(prev_weight);
-            }
+            inner
+                .l1
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&l1_key);
         }
         false
     };

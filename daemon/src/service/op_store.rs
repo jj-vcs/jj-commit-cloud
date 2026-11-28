@@ -53,7 +53,7 @@ impl OpStoreService for DaemonProxy {
         &self,
         request: Request<ReadOperationRequest>,
     ) -> Result<Response<ReadOperationResponse>, Status> {
-        let _active = self.track_active_rpc();
+        let _active = self.begin_rpc(request.metadata())?;
         let meta = request.metadata().clone();
         let req = request.into_inner();
         let scope = self.scope_for(&meta, &req.repo_id)?;
@@ -105,7 +105,7 @@ impl OpStoreService for DaemonProxy {
         &self,
         request: Request<WriteOperationRequest>,
     ) -> Result<Response<WriteOperationResponse>, Status> {
-        let _active = self.track_active_rpc();
+        let _active = self.begin_rpc(request.metadata())?;
         let meta = request.metadata().clone();
         let req = request.into_inner();
         let scope = self.scope_for(&meta, &req.repo_id)?;
@@ -136,7 +136,7 @@ impl OpStoreService for DaemonProxy {
         &self,
         request: Request<ResolveOperationPrefixRequest>,
     ) -> Result<Response<ResolveOperationPrefixResponse>, Status> {
-        let _active = self.track_active_rpc();
+        let _active = self.begin_rpc(request.metadata())?;
         let meta = request.metadata().clone();
         let out = self
             .inner
@@ -154,7 +154,7 @@ impl OpStoreService for DaemonProxy {
         &self,
         request: Request<ReadViewRequest>,
     ) -> Result<Response<ReadViewResponse>, Status> {
-        let _active = self.track_active_rpc();
+        let _active = self.begin_rpc(request.metadata())?;
         let meta = request.metadata().clone();
         let req = request.into_inner();
         let scope = self.scope_for(&meta, &req.repo_id)?;
@@ -210,7 +210,7 @@ impl OpStoreService for DaemonProxy {
         &self,
         request: Request<WriteViewRequest>,
     ) -> Result<Response<WriteViewResponse>, Status> {
-        let _active = self.track_active_rpc();
+        let _active = self.begin_rpc(request.metadata())?;
         let meta = request.metadata().clone();
         let req = request.into_inner();
         let scope = self.scope_for(&meta, &req.repo_id)?;
@@ -241,7 +241,7 @@ impl OpStoreService for DaemonProxy {
         &self,
         request: Request<GetOpHeadsRequest>,
     ) -> Result<Response<GetOpHeadsResponse>, Status> {
-        let _active = self.track_active_rpc();
+        let _active = self.begin_rpc(request.metadata())?;
         let meta = request.metadata().clone();
         let out = self
             .inner
@@ -259,7 +259,7 @@ impl OpStoreService for DaemonProxy {
         &self,
         request: Request<UpdateOpHeadsRequest>,
     ) -> Result<Response<UpdateOpHeadsResponse>, Status> {
-        let _active = self.track_active_rpc();
+        let _active = self.begin_rpc(request.metadata())?;
         let meta = request.metadata().clone();
         let out = self
             .inner
@@ -277,7 +277,7 @@ impl OpStoreService for DaemonProxy {
         &self,
         request: Request<ReconcileOpHeadsRequest>,
     ) -> Result<Response<ReconcileOpHeadsResponse>, Status> {
-        let _active = self.track_active_rpc();
+        let _active = self.begin_rpc(request.metadata())?;
         let meta = request.metadata().clone();
         let out = self
             .inner
@@ -295,7 +295,7 @@ impl OpStoreService for DaemonProxy {
         &self,
         request: Request<PublishOperationRequest>,
     ) -> Result<Response<PublishOperationResponse>, Status> {
-        let _active = self.track_active_rpc();
+        let _active = self.begin_rpc(request.metadata())?;
         let meta = request.metadata().clone();
         let req = request.into_inner();
         let scope = self.scope_for(&meta, &req.repo_id)?;

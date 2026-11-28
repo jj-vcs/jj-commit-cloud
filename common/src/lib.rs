@@ -31,10 +31,16 @@
 //! `Merge<TreeId>` conflict terms.
 //!
 //! # Cross-Process and RPC Boundaries
-//! [`FILE_STREAM_CHUNK_SIZE`] (64 KiB) defines the shared streaming chunk target for file
-//! transfers, [`MAX_GRPC_MESSAGE_BYTES`] (64 MiB) defines the message size bound for
-//! `tonic` clients and servers, and [`validate_optional_repo_path`] enforces canonical
-//! repository-relative path rules across tree, file, and symlink RPCs.
+//! [`FILE_STREAM_CHUNK_SIZE`] (64 KiB) defines the shared streaming chunk target,
+//! [`MAX_GRPC_MESSAGE_BYTES`] (64 MiB) bounds `tonic` message sizes,
+//! [`validate_optional_repo_path`] enforces canonical repository paths across RPCs,
+//! [`DAEMON_WIRE_VERSION`] governs CLI-to-daemon wire negotiation, and
+//! [`resolve_unix_socket_path`] enforces platform POSIX `sun_path` byte limits.
+
+use std::io;
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 
 #[allow(clippy::result_large_err)]
 pub mod backend {
@@ -100,6 +106,179 @@ pub fn validate_optional_repo_path(path: &str) -> Result<(), &'static str> {
         }
     }
     Ok(())
+}
+
+/// Metadata header sent by `cc-lib` clients to negotiate the CLI/daemon wire protocol version.
+pub const DAEMON_WIRE_VERSION_HEADER: &str = "x-jj-cc-daemon-wire-version";
+/// Current CLI-to-daemon wire protocol version.
+pub const DAEMON_WIRE_VERSION: u32 = 1;
+/// ASCII string form of [`DAEMON_WIRE_VERSION`] for gRPC metadata headers.
+pub const DAEMON_WIRE_VERSION_STR: &str = "1";
+
+/// Linux `sockaddr_un.sun_path` buffer length in bytes (including trailing NUL byte).
+pub const LINUX_UNIX_SOCKET_PATH_BYTES: usize = 108;
+/// macOS / BSD `sockaddr_un.sun_path` buffer length in bytes (including trailing NUL byte).
+pub const BSD_UNIX_SOCKET_PATH_BYTES: usize = 104;
+
+/// Platform `sockaddr_un.sun_path` buffer length in bytes (including trailing NUL byte).
+/// Usable socket path length is `MAX_UNIX_SOCKET_PATH_BYTES - 1` bytes.
+#[cfg(unix)]
+pub const MAX_UNIX_SOCKET_PATH_BYTES: usize = {
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly",
+        target_os = "ios",
+    ))]
+    {
+        BSD_UNIX_SOCKET_PATH_BYTES
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly",
+        target_os = "ios",
+    )))]
+    {
+        LINUX_UNIX_SOCKET_PATH_BYTES
+    }
+};
+
+/// Validates that `path` fits within a POSIX `sockaddr_un.sun_path` buffer of `max_sun_path_bytes`
+/// bytes (reserving 1 byte for the trailing NUL terminator) and contains no embedded NUL bytes.
+pub fn validate_unix_socket_path_len(path: &Path, max_sun_path_bytes: usize) -> io::Result<()> {
+    #[cfg(unix)]
+    let raw_bytes = {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes()
+    };
+    #[cfg(not(unix))]
+    let raw_bytes = path.as_os_str().as_encoded_bytes();
+
+    if raw_bytes.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Unix domain socket path must not be empty; set JJ_CC_DAEMON_SOCKET or JJ_CC_DAEMON_DIR",
+        ));
+    }
+    if raw_bytes.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "Unix domain socket path '{}' contains an embedded NUL byte",
+                path.display()
+            ),
+        ));
+    }
+    let max_usable = max_sun_path_bytes.saturating_sub(1);
+    if raw_bytes.len() > max_usable {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "Unix domain socket path '{}' is {} bytes, which exceeds this platform's limit of {} usable bytes (sun_path buffer {} bytes including NUL terminator); set JJ_CC_DAEMON_SOCKET to a shorter path or use a shorter JJ_CC_DAEMON_DIR / XDG_CACHE_HOME",
+                path.display(),
+                raw_bytes.len(),
+                max_usable,
+                max_sun_path_bytes,
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn extract_unix_socket_file_name(path: &Path) -> io::Result<&std::ffi::OsStr> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let raw = path.as_os_str().as_bytes();
+    if raw.is_empty()
+        || raw.ends_with(b"/")
+        || raw == b"."
+        || raw == b".."
+        || raw.ends_with(b"/.")
+        || raw.ends_with(b"/..")
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "Unix domain socket path '{}' must end in a socket file name",
+                path.display()
+            ),
+        ));
+    }
+    path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "Unix domain socket path '{}' must end in a socket file name",
+                path.display()
+            ),
+        )
+    })
+}
+
+/// Canonicalizes the existing parent directory of a Unix domain socket path without following a
+/// symlink at the socket filename itself, then enforces [`MAX_UNIX_SOCKET_PATH_BYTES`].
+#[cfg(unix)]
+pub fn resolve_unix_socket_path(path: &Path) -> io::Result<PathBuf> {
+    let file_name = extract_unix_socket_file_name(path)?;
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let canonical_parent = std::fs::canonicalize(parent)?;
+    let resolved = canonical_parent.join(file_name);
+    validate_unix_socket_path_len(&resolved, MAX_UNIX_SOCKET_PATH_BYTES)?;
+    Ok(resolved)
+}
+
+/// Like [`resolve_unix_socket_path`], but when the immediate parent directory does not exist yet
+/// it canonicalizes the deepest existing ancestor and appends the remaining relative components
+/// so callers can fail fast on overlong socket paths before creating directories or spawning.
+#[cfg(unix)]
+pub fn resolve_unix_socket_path_or_ancestors(path: &Path) -> io::Result<PathBuf> {
+    let file_name = extract_unix_socket_file_name(path)?;
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let resolved_parent = match std::fs::canonicalize(parent) {
+        Ok(canonical) => canonical,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            let mut missing_tail = Vec::new();
+            let mut cur = parent;
+            loop {
+                match std::fs::canonicalize(cur) {
+                    Ok(mut base) => {
+                        for comp in missing_tail.into_iter().rev() {
+                            base.push(comp);
+                        }
+                        break base;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        if let Some(comp) = cur.file_name() {
+                            missing_tail.push(comp.to_os_string());
+                            match cur.parent() {
+                                Some(next) if !next.as_os_str().is_empty() => cur = next,
+                                _ => cur = Path::new("."),
+                            }
+                        } else {
+                            return Err(err);
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Err(err) => return Err(err),
+    };
+    let resolved = resolved_parent.join(file_name);
+    validate_unix_socket_path_len(&resolved, MAX_UNIX_SOCKET_PATH_BYTES)?;
+    Ok(resolved)
 }
 
 #[cfg(test)]
@@ -246,5 +425,149 @@ mod tests {
         let absent_bytes = workspace::GetWorkspaceResponse { workspace: None }.encode_to_vec();
         let absent = workspace::GetWorkspaceResponse::decode(absent_bytes.as_slice()).unwrap();
         assert!(absent.workspace.is_none());
+    }
+
+    #[test]
+    fn daemon_wire_version_constants_are_consistent() {
+        assert_eq!(DAEMON_WIRE_VERSION.to_string(), DAEMON_WIRE_VERSION_STR);
+        assert_eq!(DAEMON_WIRE_VERSION_HEADER, "x-jj-cc-daemon-wire-version");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn max_unix_socket_path_bytes_matches_libc_sockaddr_un() {
+        // SAFETY: `libc::sockaddr_un` is a plain C struct; zero-initialization is valid.
+        let addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            MAX_UNIX_SOCKET_PATH_BYTES,
+            addr.sun_path.len(),
+            "MAX_UNIX_SOCKET_PATH_BYTES must match platform sockaddr_un.sun_path length"
+        );
+    }
+
+    #[test]
+    fn validate_unix_socket_path_len_enforces_linux_and_bsd_boundaries() {
+        for (platform_max, usable_max) in [
+            (LINUX_UNIX_SOCKET_PATH_BYTES, 107usize),
+            (BSD_UNIX_SOCKET_PATH_BYTES, 103usize),
+        ] {
+            let ok_path = format!("/{}", "a".repeat(usable_max - 1));
+            assert_eq!(ok_path.len(), usable_max);
+            validate_unix_socket_path_len(Path::new(&ok_path), platform_max)
+                .expect("path of exact usable max length (sun_path - 1) must succeed");
+
+            let too_long = format!("/{}", "a".repeat(usable_max));
+            assert_eq!(too_long.len(), platform_max);
+            let err = validate_unix_socket_path_len(Path::new(&too_long), platform_max)
+                .expect_err("path of length == sun_path (no room for NUL) must fail");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            let msg = err.to_string();
+            assert!(
+                msg.contains("JJ_CC_DAEMON_SOCKET")
+                    && msg.contains("JJ_CC_DAEMON_DIR")
+                    && msg.contains("XDG_CACHE_HOME"),
+                "error should give actionable env var guidance: {msg}"
+            );
+        }
+
+        assert!(
+            validate_unix_socket_path_len(Path::new(""), LINUX_UNIX_SOCKET_PATH_BYTES).is_err()
+        );
+        assert!(validate_unix_socket_path_len(
+            Path::new("/tmp/bad\0.sock"),
+            LINUX_UNIX_SOCKET_PATH_BYTES
+        )
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_unix_socket_path_canonicalizes_ancestor_symlinks_and_guards_length() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let real_dir = dir.path().join("real");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let link_dir = dir.path().join("link");
+        symlink(&real_dir, &link_dir).unwrap();
+
+        let canonical_real = std::fs::canonicalize(&real_dir).unwrap();
+        let resolved = resolve_unix_socket_path(&link_dir.join("daemon.sock")).unwrap();
+        assert_eq!(resolved, canonical_real.join("daemon.sock"));
+
+        // A dangling symlink at the socket filename itself is NOT followed, so the daemon can
+        // inspect and unlink it safely.
+        let dangling_sock = link_dir.join("dangling.sock");
+        symlink(dir.path().join("nonexistent-target"), &dangling_sock).unwrap();
+        let resolved_dangling = resolve_unix_socket_path(&dangling_sock).unwrap();
+        assert_eq!(resolved_dangling, canonical_real.join("dangling.sock"));
+
+        // An ancestor symlink that expands to a path exceeding the platform sun_path limit must
+        // fail fast even when the uncanonicalized symlink path looked short.
+        let long_target = dir.path().join("d".repeat(MAX_UNIX_SOCKET_PATH_BYTES));
+        std::fs::create_dir_all(&long_target).unwrap();
+        let short_alias = dir.path().join("s");
+        symlink(&long_target, &short_alias).unwrap();
+        let err = resolve_unix_socket_path(&short_alias.join("a.sock"))
+            .expect_err("canonical path exceeding sun_path must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("JJ_CC_DAEMON_SOCKET"),
+            "unexpected error: {err}"
+        );
+
+        // `resolve_unix_socket_path_or_ancestors` also catches overlong paths before parent dir
+        // creation.
+        let err_missing =
+            resolve_unix_socket_path_or_ancestors(&short_alias.join("nested").join("a.sock"))
+                .expect_err("overlong path with missing child dir must fail fast");
+        assert_eq!(err_missing.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_unix_socket_path_rejects_trailing_slash_and_dot_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+
+        for invalid in [
+            PathBuf::from(""),
+            PathBuf::from("/"),
+            PathBuf::from("."),
+            PathBuf::from(".."),
+            PathBuf::from(format!("{}/", base.display())),
+            PathBuf::from(format!("{}///", base.display())),
+            PathBuf::from(format!("{}/daemon.sock/", base.display())),
+            PathBuf::from(format!("{}/daemon.sock/.", base.display())),
+            PathBuf::from(format!("{}/daemon.sock/./", base.display())),
+            PathBuf::from(format!("{}/daemon.sock/..", base.display())),
+            PathBuf::from(format!("{}/.", base.display())),
+            PathBuf::from(format!("{}/..", base.display())),
+            PathBuf::from("daemon.sock/"),
+            PathBuf::from("daemon.sock/."),
+        ] {
+            let err = resolve_unix_socket_path(&invalid)
+                .expect_err(&format!("resolve_unix_socket_path must reject {invalid:?}"));
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+            let err_anc = resolve_unix_socket_path_or_ancestors(&invalid).expect_err(&format!(
+                "resolve_unix_socket_path_or_ancestors must reject {invalid:?}"
+            ));
+            assert_eq!(err_anc.kind(), io::ErrorKind::InvalidInput);
+        }
+
+        // Valid filenames containing dots (e.g. leading or trailing dot) remain accepted.
+        let canonical_base = std::fs::canonicalize(base).unwrap();
+        for valid_name in ["daemon.sock", ".hidden.sock", "foo..sock", "foo."] {
+            let candidate = base.join(valid_name);
+            assert_eq!(
+                resolve_unix_socket_path(&candidate).unwrap(),
+                canonical_base.join(valid_name)
+            );
+            assert_eq!(
+                resolve_unix_socket_path_or_ancestors(&candidate).unwrap(),
+                canonical_base.join(valid_name)
+            );
+        }
     }
 }

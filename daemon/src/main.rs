@@ -27,8 +27,9 @@
 //! single graceful shutdown signal.
 //!
 //! # Cross-Process and RPC Boundaries
-//! Accepts `--upstream` (legacy `--server`), `--allow-upstream`, `--socket`, `--listen`, and
-//! `--idle-timeout-secs` (legacy `--idle-timeout`) via CLI flags or `JJ_CC_*` environment vars.
+//! Accepts `--upstream` (legacy `--server`), `--allow-upstream`, `--socket`, `--listen`,
+//! `--memory-cache-mb`, `--max-disk-cache-mb`, and `--idle-timeout-secs` (legacy
+//! `--idle-timeout`) via CLI flags or `JJ_CC_*` environment vars.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -36,7 +37,8 @@ use std::path::PathBuf;
 use clap::Parser;
 use clap::builder::{OsStringValueParser, TypedValueParser as _};
 use jj_commit_cloud_daemon::{
-    DaemonConfig, default_daemon_cache_dir, default_daemon_state_dir, run_daemon,
+    DEFAULT_MAX_DISK_CACHE_MB, DaemonConfig, default_daemon_cache_dir, default_daemon_state_dir,
+    run_daemon,
 };
 
 fn permissive_path_parser() -> impl clap::builder::TypedValueParser<Value = PathBuf> {
@@ -82,6 +84,15 @@ struct Args {
     /// Maximum L1 in-memory object cache capacity in MiB
     #[arg(long, default_value_t = 256, env = "JJ_CC_DAEMON_MEMORY_MB")]
     memory_cache_mb: usize,
+
+    /// Maximum L2 disk cache size in MiB before automatic background LRU eviction (`0` disables
+    /// automatic L2 disk-quota LRU eviction)
+    #[arg(
+        long,
+        default_value_t = DEFAULT_MAX_DISK_CACHE_MB,
+        env = "JJ_CC_DAEMON_MAX_DISK_CACHE_MB"
+    )]
+    max_disk_cache_mb: u64,
 
     /// Idle shutdown timeout in seconds (`0` disables automatic idle exit)
     #[arg(
@@ -162,6 +173,7 @@ fn build_config(args: Args) -> DaemonConfig {
         default_upstream: non_empty_string(args.upstream),
         allowed_upstreams: args.allow_upstreams,
         memory_cache_mb: args.memory_cache_mb,
+        max_disk_cache_mb: args.max_disk_cache_mb,
         idle_timeout_secs: args.idle_timeout_secs,
         write_discovery_files,
     }
@@ -206,10 +218,14 @@ mod tests {
             "http://127.0.0.1:9090",
             "--idle-timeout-secs",
             "0",
+            "--max-disk-cache-mb",
+            "0",
         ])
         .expect("modern flags should parse");
         assert_eq!(modern.upstream.as_deref(), Some("http://127.0.0.1:9090"));
         assert_eq!(modern.idle_timeout_secs, 0);
+        assert_eq!(modern.max_disk_cache_mb, 0);
+        assert_eq!(legacy.max_disk_cache_mb, DEFAULT_MAX_DISK_CACHE_MB);
     }
 
     #[test]

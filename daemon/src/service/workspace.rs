@@ -40,7 +40,7 @@ impl WorkspaceService for DaemonProxy {
         &self,
         request: Request<GetWorkspaceRequest>,
     ) -> Result<Response<GetWorkspaceResponse>, Status> {
-        let _active = self.track_active_rpc();
+        let _active = self.begin_rpc(request.metadata())?;
         let meta = request.metadata().clone();
         let out = self
             .inner
@@ -58,7 +58,7 @@ impl WorkspaceService for DaemonProxy {
         &self,
         request: Request<UpdateWorkspaceRequest>,
     ) -> Result<Response<UpdateWorkspaceResponse>, Status> {
-        let _active = self.track_active_rpc();
+        let _active = self.begin_rpc(request.metadata())?;
         let meta = request.metadata().clone();
         let out = self
             .inner
@@ -76,7 +76,7 @@ impl WorkspaceService for DaemonProxy {
         &self,
         request: Request<ListWorkspacesRequest>,
     ) -> Result<Response<ListWorkspacesResponse>, Status> {
-        let _active = self.track_active_rpc();
+        let _active = self.begin_rpc(request.metadata())?;
         let meta = request.metadata().clone();
         let out = self
             .inner
@@ -94,7 +94,7 @@ impl WorkspaceService for DaemonProxy {
         &self,
         request: Request<CheckWorkingCopyChangesRequest>,
     ) -> Result<Response<CheckWorkingCopyChangesResponse>, Status> {
-        let _active = self.track_active_rpc();
+        let _active = self.begin_rpc(request.metadata())?;
         let meta = request.metadata().clone();
         let out = self
             .inner
@@ -112,7 +112,7 @@ impl WorkspaceService for DaemonProxy {
         &self,
         request: Request<DeleteWorkspaceRequest>,
     ) -> Result<Response<DeleteWorkspaceResponse>, Status> {
-        let _active = self.track_active_rpc();
+        let _active = self.begin_rpc(request.metadata())?;
         let meta = request.metadata().clone();
         let out = self
             .inner

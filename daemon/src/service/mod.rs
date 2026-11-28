@@ -28,7 +28,8 @@
 //! workspace RPCs forward straight through to jj-cc-server.
 //!
 //! # Cross-Process and RPC Boundaries
-//! Outbound upstream clients match `cc_common::MAX_GRPC_MESSAGE_BYTES` (`64 MiB`). `ReadFile`
+//! Outbound upstream clients match `cc_common::MAX_GRPC_MESSAGE_BYTES` (`64 MiB`). Every RPC
+//! enforces CLI-daemon wire-version validation (`x-jj-cc-daemon-wire-version`). `ReadFile`
 //! and `WriteFileStream` stream directly with bounded RAM (`<= 4 MiB`), spilling to disk
 //! staging up to `max_l2_object_bytes` with no hard size cap; ranged cold `ReadFile` misses
 //! and giant paginated `ReadTree` requests forward directly to upstream.
@@ -147,6 +148,11 @@ fn write_stats_file(path: &Path, stats: &CacheStatsSnapshot) {
         }
         {
             let mut file = opts.open(&tmp)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
             file.write_all(&json)?;
         }
         std::fs::rename(&tmp, path)?;
@@ -235,6 +241,11 @@ impl DaemonProxy {
         }
     }
 
+    fn begin_rpc(&self, meta: &MetadataMap) -> Result<ActiveRpcGuard, Status> {
+        crate::validate_daemon_wire_version(meta)?;
+        Ok(self.track_active_rpc())
+    }
+
     pub fn active_rpcs(&self) -> usize {
         self.inner.active_rpcs.load(Ordering::Acquire)
     }
@@ -281,7 +292,7 @@ impl DaemonProxy {
             .min(u64::MAX - 1)
     }
 
-    fn maybe_flush_stats(&self) {
+    pub(crate) fn maybe_flush_stats(&self) {
         let Some(path) = self.inner.stats_path.clone() else {
             return;
         };

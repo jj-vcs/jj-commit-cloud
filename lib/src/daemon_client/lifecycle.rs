@@ -77,9 +77,40 @@ pub(super) fn open_daemon_log(state_dir: &Path) -> std::io::Result<fs::File> {
         use std::os::unix::fs::OpenOptionsExt;
         log_opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    log_opts.open(&log_path)
+    let file = log_opts.open(&log_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = file.metadata()?.permissions().mode() & 0o7777;
+        if mode != 0o600 {
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(file)
 }
 
+#[cfg(unix)]
+pub(super) fn resolve_spawn_unix_socket_path(
+    state_dir: &Path,
+    socket_override: Option<&Path>,
+    env_socket: Option<&std::ffi::OsStr>,
+) -> PathBuf {
+    if let Some(sock) = socket_override {
+        return sock.to_path_buf();
+    }
+    if let Some(raw) = env_socket {
+        let non_empty = raw
+            .to_str()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(!raw.is_empty());
+        if non_empty {
+            return PathBuf::from(raw);
+        }
+    }
+    state_dir.join("daemon.sock")
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_daemon_child(
     state_dir: &Path,
     cache_dir: &Path,
@@ -87,9 +118,17 @@ pub(super) fn spawn_daemon_child(
     socket_override: Option<&Path>,
     listen_override: Option<&str>,
     idle_timeout_secs: Option<u64>,
+    max_disk_cache_mb: Option<u64>,
 ) -> Result<Child, Box<dyn std::error::Error + Send + Sync>> {
     ensure_private_state_dir(state_dir)?;
     ensure_private_state_dir(cache_dir)?;
+    #[cfg(unix)]
+    {
+        let env_socket = std::env::var_os("JJ_CC_DAEMON_SOCKET");
+        let target_socket =
+            resolve_spawn_unix_socket_path(state_dir, socket_override, env_socket.as_deref());
+        cc_common::resolve_unix_socket_path_or_ancestors(&target_socket)?;
+    }
     let bin =
         locate_daemon_binary().ok_or("jj-cc-daemon binary not found alongside jj or in PATH")?;
 
@@ -124,10 +163,14 @@ pub(super) fn spawn_daemon_child(
     if let Some(idle) = idle_timeout_secs {
         cmd.arg("--idle-timeout-secs").arg(idle.to_string());
     }
+    if let Some(max_disk_mb) = max_disk_cache_mb {
+        cmd.arg("--max-disk-cache-mb").arg(max_disk_mb.to_string());
+    }
 
     Ok(cmd.spawn()?)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_daemon_background(
     state_dir: &Path,
     cache_dir: &Path,
@@ -135,6 +178,7 @@ pub fn spawn_daemon_background(
     socket_override: Option<&Path>,
     listen_override: Option<&str>,
     idle_timeout_secs: Option<u64>,
+    max_disk_cache_mb: Option<u64>,
 ) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
     let child = spawn_daemon_child(
         state_dir,
@@ -143,6 +187,7 @@ pub fn spawn_daemon_background(
         socket_override,
         listen_override,
         idle_timeout_secs,
+        max_disk_cache_mb,
     )?;
     Ok(child.id())
 }
@@ -174,6 +219,7 @@ impl Drop for SpawnedChildGuard {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn spawn_and_wait_daemon(
     state_dir: &Path,
     cache_dir: &Path,
@@ -181,6 +227,7 @@ pub async fn spawn_and_wait_daemon(
     socket_override: Option<&Path>,
     listen_override: Option<&str>,
     idle_timeout_secs: Option<u64>,
+    max_disk_cache_mb: Option<u64>,
 ) -> Result<(DaemonRuntimeInfo, Channel), Box<dyn std::error::Error + Send + Sync>> {
     let child = spawn_daemon_child(
         state_dir,
@@ -189,6 +236,7 @@ pub async fn spawn_and_wait_daemon(
         socket_override,
         listen_override,
         idle_timeout_secs,
+        max_disk_cache_mb,
     )?;
     wait_for_spawned_daemon(child, state_dir, DAEMON_SPAWN_WAIT_TIMEOUT).await
 }
@@ -464,6 +512,14 @@ pub async fn acquire_daemon_spawn_lock(
         Duration::from_secs(10),
         tokio::task::spawn_blocking(move || -> std::io::Result<fs::File> {
             file.lock()?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = file.metadata()?.permissions().mode() & 0o7777;
+                if mode != 0o600 {
+                    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+                }
+            }
             Ok(file)
         }),
     )

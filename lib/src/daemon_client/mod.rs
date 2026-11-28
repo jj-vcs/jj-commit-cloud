@@ -29,8 +29,9 @@
 //! # Cross-Process and RPC Boundaries
 //! Spawned daemons run in an independent process group (`process_group(0)` on Unix) with
 //! stdout and stderr appended to `<state_dir>/daemon.log` (`0600`). Unix domain socket
-//! connections verify peer UID and PID via `SO_PEERCRED`, and loopback TCP connections
-//! attach [`DAEMON_SECRET_HEADER`] read from `0600` `daemon.json`.
+//! paths are parent-canonicalized and bounded to POSIX `sun_path` limits, verify peer UID
+//! and PID via `SO_PEERCRED`, and negotiate [`DAEMON_WIRE_VERSION`] alongside loopback TCP
+//! [`DAEMON_SECRET_HEADER`] auth.
 
 use std::fmt;
 use std::fs;
@@ -49,9 +50,12 @@ pub use lifecycle::{
     terminate_daemon_pid, terminate_daemon_pid_with_verification,
 };
 pub use transport::{
-    ExistingDaemonConnection, connect_existing_daemon, connect_existing_daemon_verified,
-    connect_or_spawn_daemon, probe_daemon_channel_health,
+    ExistingDaemonConnection, connect_existing_daemon,
+    connect_existing_daemon_any_version_verified, connect_existing_daemon_verified,
+    connect_or_spawn_daemon, probe_daemon_channel_health, probe_daemon_channel_health_any_version,
 };
+
+pub use cc_common::{DAEMON_WIRE_VERSION, DAEMON_WIRE_VERSION_HEADER, DAEMON_WIRE_VERSION_STR};
 
 pub const UPSTREAM_HEADER: &str = "x-jj-cc-upstream";
 pub const DAEMON_SECRET_HEADER: &str = "x-jj-cc-daemon-secret";
@@ -74,6 +78,22 @@ pub struct DaemonRuntimeInfo {
     pub started_unix_secs: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_version: Option<u32>,
+}
+
+/// Checks whether a running daemon's advertised `wire_version` matches [`DAEMON_WIRE_VERSION`].
+/// A missing `wire_version` (`None`) is allowed for backward compatibility with older daemons.
+pub fn check_daemon_wire_version(info: &DaemonRuntimeInfo) -> Result<(), String> {
+    if let Some(version) = info.wire_version
+        && version != DAEMON_WIRE_VERSION
+    {
+        return Err(format!(
+            "CLI/daemon wire version mismatch: running jj-cc-daemon (pid {}) uses wire version {version}, but this CLI expects wire version {DAEMON_WIRE_VERSION}; run `jj cc daemon stop` to restart the daemon",
+            info.pid
+        ));
+    }
+    Ok(())
 }
 
 impl fmt::Debug for DaemonRuntimeInfo {
@@ -87,6 +107,7 @@ impl fmt::Debug for DaemonRuntimeInfo {
             .field("default_upstream", &self.default_upstream)
             .field("started_unix_secs", &self.started_unix_secs)
             .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
+            .field("wire_version", &self.wire_version)
             .finish()
     }
 }
@@ -103,6 +124,10 @@ pub struct DaemonStatsView {
     pub l1_entries: usize,
     #[serde(default)]
     pub l2_write_errors: u64,
+    #[serde(default)]
+    pub l2_evicted_objects: u64,
+    #[serde(default)]
+    pub l2_evicted_bytes: u64,
 }
 
 impl DaemonStatsView {
@@ -244,6 +269,11 @@ fn write_user_daemon_preference(
         }
         {
             let mut file = opts.open(&tmp_path)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            }
             file.write_all(content.as_bytes())?;
             file.sync_all()?;
         }

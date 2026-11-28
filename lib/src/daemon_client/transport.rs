@@ -43,7 +43,8 @@ use super::lifecycle::{
     PidMatch, acquire_daemon_spawn_lock, check_pid_matches_daemon, spawn_and_wait_daemon,
 };
 use super::{
-    DAEMON_SECRET_HEADER, DaemonRuntimeInfo, default_daemon_cache_dir, default_daemon_state_dir,
+    DAEMON_SECRET_HEADER, DAEMON_WIRE_VERSION_HEADER, DAEMON_WIRE_VERSION_STR, DaemonRuntimeInfo,
+    check_daemon_wire_version, default_daemon_cache_dir, default_daemon_state_dir,
     ensure_private_state_dir, read_daemon_runtime_info, verify_private_state_dir,
 };
 
@@ -103,17 +104,30 @@ pub struct ExistingDaemonConnection {
     /// True when `info.pid` was matched against the Unix domain socket peer's
     /// `SO_PEERCRED` PID and the peer answered a `tonic_health` probe as serving.
     pub peer_pid_verified: bool,
+    /// Set when connecting across version mismatches (`allow_version_mismatch = true`) to a live
+    /// daemon whose `daemon.json` `wire_version` or health probe reported a wire-version mismatch.
+    pub wire_version_mismatch: Option<String>,
 }
 
 pub async fn connect_existing_daemon_verified(
     state_dir: &Path,
 ) -> Result<Option<ExistingDaemonConnection>, Box<dyn std::error::Error + Send + Sync>> {
-    connect_existing_daemon_verified_with(state_dir, check_pid_matches_daemon).await
+    connect_existing_daemon_verified_with(state_dir, check_pid_matches_daemon, false).await
+}
+
+/// Connects to a live daemon in `state_dir` without failing on a `wire_version` mismatch.
+/// Used by `jj cc daemon stop`, `jj cc daemon status`, and `jj cc daemon clear-cache` so users
+/// can inspect and stop a daemon running a different wire version.
+pub async fn connect_existing_daemon_any_version_verified(
+    state_dir: &Path,
+) -> Result<Option<ExistingDaemonConnection>, Box<dyn std::error::Error + Send + Sync>> {
+    connect_existing_daemon_verified_with(state_dir, check_pid_matches_daemon, true).await
 }
 
 pub(super) async fn connect_existing_daemon_verified_with<F>(
     state_dir: &Path,
     pid_check: F,
+    allow_version_mismatch: bool,
 ) -> Result<Option<ExistingDaemonConnection>, Box<dyn std::error::Error + Send + Sync>>
 where
     F: FnOnce(u32) -> PidMatch + Send + 'static,
@@ -139,20 +153,52 @@ where
     let Ok(info) = serde_json::from_str::<DaemonRuntimeInfo>(&raw) else {
         return Ok(None);
     };
+    let version_check = check_daemon_wire_version(&info);
+    // Probe with an unversioned health check when `daemon.json` already advertises a different
+    // wire version so we can distinguish a live mismatched daemon from a stale `daemon.json`
+    // (and let `jj cc daemon stop` verify SO_PEERCRED / health before signaling).
+    let probe_with_version = version_check.is_ok();
 
     #[cfg(unix)]
     if let Some(sock_str) = &info.socket_path {
+        use std::os::unix::fs::FileTypeExt;
         let sock_path = PathBuf::from(sock_str);
-        if sock_path.exists()
+        if fs::symlink_metadata(&sock_path).is_ok_and(|m| m.file_type().is_socket())
             && let Ok((ch, peer_pid_verified)) =
                 connect_unix_channel(&sock_path, Some(info.pid)).await
-            && probe_daemon_health(ch.clone(), None).await
         {
-            return Ok(Some(ExistingDaemonConnection {
-                info,
-                channel: ch,
-                peer_pid_verified: peer_pid_verified.load(Ordering::Acquire),
-            }));
+            let live_outcome =
+                probe_daemon_health_inner(ch.clone(), None, probe_with_version).await;
+            match live_outcome {
+                HealthProbeResult::Serving => {
+                    if !allow_version_mismatch && let Err(mismatch) = version_check {
+                        return Err(mismatch.into());
+                    }
+                    return Ok(Some(ExistingDaemonConnection {
+                        info,
+                        channel: ch,
+                        peer_pid_verified: peer_pid_verified.load(Ordering::Acquire),
+                        wire_version_mismatch: version_check.err(),
+                    }));
+                }
+                HealthProbeResult::VersionMismatch(msg) => {
+                    if !allow_version_mismatch {
+                        return Err(msg.into());
+                    }
+                    if matches!(
+                        probe_daemon_health_inner(ch.clone(), None, false).await,
+                        HealthProbeResult::Serving
+                    ) {
+                        return Ok(Some(ExistingDaemonConnection {
+                            info,
+                            channel: ch,
+                            peer_pid_verified: peer_pid_verified.load(Ordering::Acquire),
+                            wire_version_mismatch: Some(msg),
+                        }));
+                    }
+                }
+                HealthProbeResult::Unavailable => {}
+            }
         }
         return Ok(None);
     }
@@ -167,7 +213,7 @@ where
         let has_secret = info.secret.as_deref().is_some_and(|s| !s.is_empty());
         // Never send the per-daemon TCP secret to a PID confirmed not to be `jj-cc-daemon`.
         // When OS inspection is unavailable (`Unknown`), require a non-empty `info.secret` so
-        // `probe_daemon_health` authenticates the listener.
+        // `probe_daemon_health_inner` authenticates the listener.
         let pid_ok = match pid_match {
             PidMatch::ConfirmedDaemon => true,
             PidMatch::Unknown => has_secret,
@@ -182,13 +228,40 @@ where
                 .keep_alive_timeout(Duration::from_secs(20))
                 .connect()
                 .await
-            && probe_daemon_health(ch.clone(), info.secret.as_deref()).await
         {
-            return Ok(Some(ExistingDaemonConnection {
-                info,
-                channel: ch,
-                peer_pid_verified: false,
-            }));
+            let live_outcome =
+                probe_daemon_health_inner(ch.clone(), info.secret.as_deref(), probe_with_version)
+                    .await;
+            match live_outcome {
+                HealthProbeResult::Serving => {
+                    if !allow_version_mismatch && let Err(mismatch) = version_check {
+                        return Err(mismatch.into());
+                    }
+                    return Ok(Some(ExistingDaemonConnection {
+                        info,
+                        channel: ch,
+                        peer_pid_verified: false,
+                        wire_version_mismatch: version_check.err(),
+                    }));
+                }
+                HealthProbeResult::VersionMismatch(msg) => {
+                    if !allow_version_mismatch {
+                        return Err(msg.into());
+                    }
+                    if matches!(
+                        probe_daemon_health_inner(ch.clone(), info.secret.as_deref(), false).await,
+                        HealthProbeResult::Serving
+                    ) {
+                        return Ok(Some(ExistingDaemonConnection {
+                            info,
+                            channel: ch,
+                            peer_pid_verified: false,
+                            wire_version_mismatch: Some(msg),
+                        }));
+                    }
+                }
+                HealthProbeResult::Unavailable => {}
+            }
         }
     }
 
@@ -204,10 +277,35 @@ pub async fn connect_existing_daemon(
 }
 
 pub async fn probe_daemon_channel_health(channel: Channel, secret: Option<&str>) -> bool {
-    probe_daemon_health(channel, secret).await
+    matches!(
+        probe_daemon_health_inner(channel, secret, true).await,
+        HealthProbeResult::Serving
+    )
 }
 
-async fn probe_daemon_health(channel: Channel, secret: Option<&str>) -> bool {
+/// Probes daemon health without attaching [`DAEMON_WIRE_VERSION_HEADER`] so `jj cc daemon stop`
+/// can observe shutdown of a daemon running a different wire protocol version.
+pub async fn probe_daemon_channel_health_any_version(
+    channel: Channel,
+    secret: Option<&str>,
+) -> bool {
+    matches!(
+        probe_daemon_health_inner(channel, secret, false).await,
+        HealthProbeResult::Serving
+    )
+}
+
+enum HealthProbeResult {
+    Serving,
+    VersionMismatch(String),
+    Unavailable,
+}
+
+async fn probe_daemon_health_inner(
+    channel: Channel,
+    secret: Option<&str>,
+    send_wire_version: bool,
+) -> HealthProbeResult {
     use tonic_health::pb::HealthCheckRequest;
     use tonic_health::pb::health_check_response::ServingStatus;
     use tonic_health::pb::health_client::HealthClient;
@@ -216,17 +314,30 @@ async fn probe_daemon_health(channel: Channel, secret: Option<&str>) -> bool {
     let mut req = tonic::Request::new(HealthCheckRequest {
         service: String::new(),
     });
+    if send_wire_version {
+        req.metadata_mut().insert(
+            DAEMON_WIRE_VERSION_HEADER,
+            tonic::metadata::MetadataValue::from_static(DAEMON_WIRE_VERSION_STR),
+        );
+    }
     if let Some(secret) = secret {
         let Ok(mut val) = tonic::metadata::MetadataValue::try_from(secret) else {
-            return false;
+            return HealthProbeResult::Unavailable;
         };
         val.set_sensitive(true);
         req.metadata_mut().insert(DAEMON_SECRET_HEADER, val);
     }
-    matches!(
-        tokio::time::timeout(Duration::from_secs(2), client.check(req)).await,
-        Ok(Ok(resp)) if resp.get_ref().status() == ServingStatus::Serving
-    )
+    match tokio::time::timeout(Duration::from_secs(2), client.check(req)).await {
+        Ok(Ok(resp)) if resp.get_ref().status() == ServingStatus::Serving => {
+            HealthProbeResult::Serving
+        }
+        Ok(Err(status))
+            if send_wire_version && status.code() == tonic::Code::FailedPrecondition =>
+        {
+            HealthProbeResult::VersionMismatch(status.message().to_string())
+        }
+        _ => HealthProbeResult::Unavailable,
+    }
 }
 
 async fn check_cached_route(
@@ -287,7 +398,9 @@ where
     let still_live = match liveness {
         PidMatch::ConfirmedDaemon => true,
         PidMatch::NotDaemon => false,
-        PidMatch::Unknown => probe_daemon_health(channel.clone(), info.secret.as_deref()).await,
+        PidMatch::Unknown => {
+            probe_daemon_channel_health(channel.clone(), info.secret.as_deref()).await
+        }
     };
 
     let mut guard = DAEMON_ROUTE_CACHE.lock().unwrap();
@@ -342,6 +455,7 @@ pub(super) async fn connect_or_spawn_in(
                 None,
                 None,
                 None,
+                None,
             )
             .await
         }
@@ -392,7 +506,7 @@ async fn connect_unix_channel(
     use hyper_util::rt::TokioIo;
     use tower::service_fn;
 
-    let path = socket_path.to_path_buf();
+    let path = cc_common::resolve_unix_socket_path(socket_path)?;
     let check_initial_pid = Arc::new(AtomicBool::new(true));
     let peer_pid_verified = Arc::new(AtomicBool::new(false));
     let peer_pid_verified_for_conn = Arc::clone(&peer_pid_verified);

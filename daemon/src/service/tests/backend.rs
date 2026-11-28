@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::fs;
 use std::sync::Arc;
 
 use cc_common::backend::backend_service_server::BackendService;
@@ -26,8 +27,9 @@ use cc_common::{
 use tonic::Request;
 use tonic::metadata::MetadataMap;
 
-use super::super::{DaemonProxy, MAX_IDENTIFIER_LEN};
+use super::super::{DaemonProxy, MAX_IDENTIFIER_LEN, write_stats_file};
 use super::{MockUpstream, req_with_upstream, spawn_mock_upstream};
+use crate::cache::CacheStatsSnapshot;
 use crate::cache::{CacheScope, ObjectKind, TwoTierCache};
 use crate::upstream::{UPSTREAM_HEADER, UpstreamPool};
 
@@ -1321,4 +1323,116 @@ async fn write_commit_skips_auth_write_through_and_strips_spoofed_actor_keys() {
         "second ReadCommit should serve the cached authoritative server-sanitized commit"
     );
     assert_eq!(cached_unauth, read_unauth);
+}
+
+#[tokio::test]
+async fn daemon_proxy_enforces_wire_version_header_and_allows_missing_for_compat() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = Arc::new(TwoTierCache::new(dir.path().to_path_buf(), 1024 * 1024).unwrap());
+    let proxy = DaemonProxy::new(
+        cache,
+        Arc::new(UpstreamPool::new(Some("http://127.0.0.1:1".to_string()))),
+        None,
+    );
+    let make_req = || ReadTreeRequest {
+        project_id: "proj".to_string(),
+        path: String::new(),
+        tree_id: EMPTY_TREE_ID_BYTES.to_vec(),
+        page_size: 0,
+        page_token: String::new(),
+    };
+
+    // Missing wire-version header succeeds (backward compatibility).
+    let ok_missing = BackendService::read_tree(&proxy, Request::new(make_req()))
+        .await
+        .expect("missing wire-version header must remain backward-compatible");
+    assert_eq!(ok_missing.into_inner().tree_id, EMPTY_TREE_ID_BYTES);
+
+    // Matching wire-version header succeeds.
+    let mut ok_matching_req = Request::new(make_req());
+    ok_matching_req.metadata_mut().insert(
+        crate::DAEMON_WIRE_VERSION_HEADER,
+        crate::DAEMON_WIRE_VERSION_STR.parse().unwrap(),
+    );
+    let ok_matching = BackendService::read_tree(&proxy, ok_matching_req)
+        .await
+        .expect("matching wire-version header must succeed");
+    assert_eq!(ok_matching.into_inner().tree_id, EMPTY_TREE_ID_BYTES);
+
+    // Mismatched wire-version header fails with FAILED_PRECONDITION + restart guidance.
+    let mut bad_req = Request::new(make_req());
+    bad_req
+        .metadata_mut()
+        .insert(crate::DAEMON_WIRE_VERSION_HEADER, "99".parse().unwrap());
+    let err = BackendService::read_tree(&proxy, bad_req)
+        .await
+        .expect_err("mismatched wire-version header must be rejected");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        err.message().contains("jj cc daemon stop"),
+        "error must guide user to restart daemon: {err}"
+    );
+
+    // Duplicate wire-version headers are rejected (even if both carry the valid version).
+    let mut dup_req = Request::new(make_req());
+    dup_req.metadata_mut().append(
+        crate::DAEMON_WIRE_VERSION_HEADER,
+        crate::DAEMON_WIRE_VERSION_STR.parse().unwrap(),
+    );
+    dup_req.metadata_mut().append(
+        crate::DAEMON_WIRE_VERSION_HEADER,
+        crate::DAEMON_WIRE_VERSION_STR.parse().unwrap(),
+    );
+    let dup_err = BackendService::read_tree(&proxy, dup_req)
+        .await
+        .expect_err("duplicate wire-version headers must be rejected");
+    assert_eq!(dup_err.code(), tonic::Code::FailedPrecondition);
+
+    // Non-ASCII / malformed wire-version header fails with FAILED_PRECONDITION.
+    let mut non_ascii_req = Request::new(make_req());
+    let raw_val = tonic::metadata::MetadataValue::try_from(b"1\x80".as_slice()).unwrap();
+    non_ascii_req
+        .metadata_mut()
+        .insert(crate::DAEMON_WIRE_VERSION_HEADER, raw_val);
+    let non_ascii_err = BackendService::read_tree(&proxy, non_ascii_req)
+        .await
+        .expect_err("non-ASCII wire-version header must be rejected");
+    assert_eq!(non_ascii_err.code(), tonic::Code::FailedPrecondition);
+
+    // OpStoreService and WorkspaceService handlers enforce the same check.
+    let mut bad_op_req = Request::new(ReadViewRequest {
+        repo_id: "repo".to_string(),
+        view_id: ROOT_VIEW_ID_BYTES.to_vec(),
+    });
+    bad_op_req
+        .metadata_mut()
+        .insert(crate::DAEMON_WIRE_VERSION_HEADER, "2".parse().unwrap());
+    let op_err = OpStoreService::read_view(&proxy, bad_op_req)
+        .await
+        .expect_err("OpStoreService must reject mismatched wire version");
+    assert_eq!(op_err.code(), tonic::Code::FailedPrecondition);
+
+    let mut bad_ws_req = Request::new(GetWorkspaceRequest {
+        repo_id: "repo".to_string(),
+        workspace_name: "default".to_string(),
+    });
+    bad_ws_req
+        .metadata_mut()
+        .insert(crate::DAEMON_WIRE_VERSION_HEADER, "2".parse().unwrap());
+    let ws_err = WorkspaceService::get_workspace(&proxy, bad_ws_req)
+        .await
+        .expect_err("WorkspaceService must reject mismatched wire version");
+    assert_eq!(ws_err.code(), tonic::Code::FailedPrecondition);
+}
+
+#[cfg(unix)]
+#[test]
+fn write_stats_file_enforces_strict_0600_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let stats_path = dir.path().join("daemon.stats.json");
+    write_stats_file(&stats_path, &CacheStatsSnapshot::default());
+    let mode = fs::metadata(&stats_path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
 }

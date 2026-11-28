@@ -100,7 +100,7 @@ impl BackendService for DaemonProxy {
         &self,
         request: Request<RegisterProjectRequest>,
     ) -> Result<Response<RegisterProjectResponse>, Status> {
-        let _active = self.track_active_rpc();
+        let _active = self.begin_rpc(request.metadata())?;
         let meta = request.metadata().clone();
         let out = self
             .inner
@@ -118,7 +118,7 @@ impl BackendService for DaemonProxy {
         &self,
         request: Request<RegisterRepositoryRequest>,
     ) -> Result<Response<RegisterRepositoryResponse>, Status> {
-        let _active = self.track_active_rpc();
+        let _active = self.begin_rpc(request.metadata())?;
         let meta = request.metadata().clone();
         let req = request.into_inner();
         let explicit_repo_id = req.repo_id.as_deref().is_some_and(|s| !s.trim().is_empty());
@@ -143,7 +143,7 @@ impl BackendService for DaemonProxy {
         &self,
         request: Request<DeleteRepositoryRequest>,
     ) -> Result<Response<DeleteRepositoryResponse>, Status> {
-        let _active = self.track_active_rpc();
+        let _active = self.begin_rpc(request.metadata())?;
         let meta = request.metadata().clone();
         let req = request.into_inner();
         let repo_id = req.repo_id.clone();
@@ -197,7 +197,7 @@ impl BackendService for DaemonProxy {
         &self,
         request: Request<ReadCommitRequest>,
     ) -> Result<Response<ReadCommitResponse>, Status> {
-        let _active = self.track_active_rpc();
+        let _active = self.begin_rpc(request.metadata())?;
         let meta = request.metadata().clone();
         let req = request.into_inner();
         let scope = self.scope_for(&meta, &req.project_id)?;
@@ -239,7 +239,7 @@ impl BackendService for DaemonProxy {
         &self,
         request: Request<WriteCommitRequest>,
     ) -> Result<Response<WriteCommitResponse>, Status> {
-        let _active = self.track_active_rpc();
+        let _active = self.begin_rpc(request.metadata())?;
         let meta = request.metadata().clone();
         let req = request.into_inner();
         let out = self.inner.upstream.prepare_outbound(&meta, req)?;
@@ -259,7 +259,7 @@ impl BackendService for DaemonProxy {
         &self,
         request: Request<ListCommitsRequest>,
     ) -> Result<Response<ListCommitsResponse>, Status> {
-        let _active = self.track_active_rpc();
+        let _active = self.begin_rpc(request.metadata())?;
         let meta = request.metadata().clone();
         let out = self
             .inner
@@ -277,7 +277,7 @@ impl BackendService for DaemonProxy {
         &self,
         request: Request<ResolveCommitPrefixRequest>,
     ) -> Result<Response<ResolveCommitPrefixResponse>, Status> {
-        let _active = self.track_active_rpc();
+        let _active = self.begin_rpc(request.metadata())?;
         let meta = request.metadata().clone();
         let out = self
             .inner
@@ -295,7 +295,7 @@ impl BackendService for DaemonProxy {
         &self,
         request: Request<ResolveChangePrefixRequest>,
     ) -> Result<Response<ResolveChangePrefixResponse>, Status> {
-        let _active = self.track_active_rpc();
+        let _active = self.begin_rpc(request.metadata())?;
         let meta = request.metadata().clone();
         let out = self
             .inner
@@ -344,7 +344,7 @@ impl BackendService for DaemonProxy {
         &self,
         request: Request<ReadSymlinkRequest>,
     ) -> Result<Response<ReadSymlinkResponse>, Status> {
-        let _active = self.track_active_rpc();
+        let _active = self.begin_rpc(request.metadata())?;
         let meta = request.metadata().clone();
         let req = request.into_inner();
         let scope = self.scope_for(&meta, &req.project_id)?;
@@ -377,7 +377,7 @@ impl BackendService for DaemonProxy {
         &self,
         request: Request<WriteSymlinkRequest>,
     ) -> Result<Response<WriteSymlinkResponse>, Status> {
-        let _active = self.track_active_rpc();
+        let _active = self.begin_rpc(request.metadata())?;
         let meta = request.metadata().clone();
         let req = request.into_inner();
         let scope = self.scope_for(&meta, &req.project_id)?;

@@ -39,7 +39,7 @@ use tokio::sync::watch;
 
 use super::l2::{
     discard_invalid_l2_entry, ensure_private_dir_within, is_regular_file, is_valid_object_id,
-    l2_payload_is_valid, write_marker_private,
+    l2_payload_is_valid, maybe_refresh_l2_mtime, write_marker_private,
 };
 use super::{CacheInner, CacheScope, MAX_L1_OBJECT_BYTES, ObjectKind};
 
@@ -90,6 +90,7 @@ pub(super) struct ByteBoundedLru {
     pub(super) map: LruCache<L1Key, Bytes>,
     pub(super) current_bytes: usize,
     pub(super) max_bytes: usize,
+    shared_counts: HashMap<ObjectKind, HashMap<Vec<u8>, usize>>,
 }
 
 impl ByteBoundedLru {
@@ -98,7 +99,42 @@ impl ByteBoundedLru {
             map: LruCache::unbounded(),
             current_bytes: 0,
             max_bytes,
+            shared_counts: HashMap::new(),
         }
+    }
+
+    fn inc_shared(&mut self, key: &L1Key) {
+        if let L1Partition::Shared { .. } = &key.0 {
+            *self
+                .shared_counts
+                .entry(key.1)
+                .or_default()
+                .entry(key.2.clone())
+                .or_insert(0) += 1;
+        }
+    }
+
+    fn dec_shared(&mut self, key: &L1Key) {
+        if let L1Partition::Shared { .. } = &key.0
+            && let Some(by_id) = self.shared_counts.get_mut(&key.1)
+            && let Some(count) = by_id.get_mut(key.2.as_slice())
+        {
+            if *count <= 1 {
+                by_id.remove(key.2.as_slice());
+            } else {
+                *count -= 1;
+            }
+        }
+    }
+
+    pub(super) fn contains_shared(&self, kind: ObjectKind, id_bytes: &[u8]) -> bool {
+        self.shared_counts
+            .get(&kind)
+            .is_some_and(|by_id| by_id.contains_key(id_bytes))
+    }
+
+    pub(super) fn snapshot_keys(&self) -> Vec<L1Key> {
+        self.map.iter().map(|(k, _)| k.clone()).collect()
     }
 
     pub(super) fn get(&mut self, key: &L1Key) -> Option<Bytes> {
@@ -109,15 +145,24 @@ impl ByteBoundedLru {
         self.map.peek(key).map(|b| b.len() as u64)
     }
 
+    pub(super) fn remove(&mut self, key: &L1Key) {
+        if let Some(prev) = self.map.pop(key) {
+            let prev_weight = l1_entry_weight(key, &prev);
+            self.current_bytes = self.current_bytes.saturating_sub(prev_weight);
+            self.dec_shared(key);
+        }
+    }
+
     pub(super) fn put(&mut self, key: L1Key, val: Bytes) -> bool {
         let key_overhead = l1_key_overhead(&key);
         let weight = val.len().saturating_add(key_overhead);
         if self.max_bytes == 0 || val.len() > MAX_L1_OBJECT_BYTES || weight > self.max_bytes {
-            if let Some(prev) = self.map.pop(&key) {
-                let prev_weight = l1_entry_weight(&key, &prev);
-                self.current_bytes = self.current_bytes.saturating_sub(prev_weight);
-            }
+            self.remove(&key);
             return false;
+        }
+        let is_new = !self.map.contains(&key);
+        if is_new {
+            self.inc_shared(&key);
         }
         if let Some(prev) = self.map.put(key, val) {
             let prev_weight = prev.len().saturating_add(key_overhead);
@@ -127,10 +172,12 @@ impl ByteBoundedLru {
         while self.current_bytes > self.max_bytes {
             let Some((evicted_key, evicted_val)) = self.map.pop_lru() else {
                 self.current_bytes = 0;
+                self.shared_counts.clear();
                 break;
             };
             let evicted_weight = l1_entry_weight(&evicted_key, &evicted_val);
             self.current_bytes = self.current_bytes.saturating_sub(evicted_weight);
+            self.dec_shared(&evicted_key);
         }
         true
     }
@@ -147,10 +194,7 @@ impl ByteBoundedLru {
             })
             .collect();
         for key in doomed {
-            if let Some(val) = self.map.pop(&key) {
-                let weight = l1_entry_weight(&key, &val);
-                self.current_bytes = self.current_bytes.saturating_sub(weight);
-            }
+            self.remove(&key);
         }
     }
 }
@@ -431,7 +475,10 @@ impl CacheInner {
         let l2_written =
             if self.max_l2_object_bytes > 0 && (payload.len() as u64) <= self.max_l2_object_bytes {
                 match self.write_l2_atomic(&dst, id_bytes, payload) {
-                    Ok(()) => true,
+                    Ok(()) => {
+                        self.record_l2_bytes_written(payload.len() as u64);
+                        true
+                    }
                     Err(err) => {
                         self.l2_write_errors.fetch_add(1, Ordering::Relaxed);
                         tracing::warn!("failed to write L2 cache entry {}: {err}", dst.display());
@@ -533,6 +580,7 @@ impl CacheInner {
         if self.is_pending_purge(&scope.namespace_hex) {
             return None;
         }
+        maybe_refresh_l2_mtime(&file, &path, &meta);
         self.l2_hits.fetch_add(1, Ordering::Relaxed);
         let b = Bytes::from(bytes);
         self.l1

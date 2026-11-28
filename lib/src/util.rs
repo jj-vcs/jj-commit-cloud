@@ -89,6 +89,10 @@ impl Interceptor for ClientInterceptor {
     fn call(&mut self, mut req: Request<()>) -> Result<Request<()>, Status> {
         if let Some(up) = &self.daemon_upstream {
             req.metadata_mut().insert(UPSTREAM_HEADER, up.clone());
+            req.metadata_mut().insert(
+                cc_common::DAEMON_WIRE_VERSION_HEADER,
+                MetadataValue::from_static(cc_common::DAEMON_WIRE_VERSION_STR),
+            );
         }
         if let Some(secret) = &self.daemon_secret {
             req.metadata_mut()
@@ -440,9 +444,25 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("s3cr3t")
         );
+        assert_eq!(
+            req.metadata()
+                .get(cc_common::DAEMON_WIRE_VERSION_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some(cc_common::DAEMON_WIRE_VERSION_STR)
+        );
         assert!(
             !format!("{ic:?}").contains("s3cr3t"),
             "sensitive secret must be redacted in Debug"
+        );
+
+        let mut direct = ClientInterceptor::direct();
+        let direct_req = direct.call(Request::new(())).unwrap();
+        assert!(
+            direct_req
+                .metadata()
+                .get(cc_common::DAEMON_WIRE_VERSION_HEADER)
+                .is_none(),
+            "direct server calls must not attach daemon wire-version metadata"
         );
     }
 

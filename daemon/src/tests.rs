@@ -30,6 +30,7 @@ async fn run_daemon_rejects_non_loopback_listen_address() {
         default_upstream: None,
         allowed_upstreams: Vec::new(),
         memory_cache_mb: 8,
+        max_disk_cache_mb: DEFAULT_MAX_DISK_CACHE_MB,
         idle_timeout_secs: 0,
         write_discovery_files: true,
     };
@@ -54,6 +55,7 @@ async fn tcp_listener_requires_per_daemon_secret_from_0600_daemon_json() {
         default_upstream: Some("http://127.0.0.1:1".to_string()),
         allowed_upstreams: Vec::new(),
         memory_cache_mb: 8,
+        max_disk_cache_mb: DEFAULT_MAX_DISK_CACHE_MB,
         idle_timeout_secs: 0,
         write_discovery_files: true,
     };
@@ -141,6 +143,7 @@ async fn state_dir_rejects_open_permissions_and_socket_parent_mode_is_preserved(
         default_upstream: None,
         allowed_upstreams: Vec::new(),
         memory_cache_mb: 8,
+        max_disk_cache_mb: DEFAULT_MAX_DISK_CACHE_MB,
         idle_timeout_secs: 0,
         write_discovery_files: true,
     };
@@ -163,6 +166,7 @@ async fn state_dir_rejects_open_permissions_and_socket_parent_mode_is_preserved(
         default_upstream: None,
         allowed_upstreams: Vec::new(),
         memory_cache_mb: 8,
+        max_disk_cache_mb: DEFAULT_MAX_DISK_CACHE_MB,
         idle_timeout_secs: 0,
         write_discovery_files: true,
     };
@@ -207,6 +211,7 @@ fn shutdown_cleanup_preserves_successor_daemon_files() {
             default_upstream: None,
             started_unix_secs: 1,
             secret: None,
+            wire_version: Some(DAEMON_WIRE_VERSION),
         },
     )
     .unwrap();
@@ -231,6 +236,7 @@ fn shutdown_cleanup_preserves_successor_daemon_files() {
             default_upstream: None,
             started_unix_secs: 2,
             secret: None,
+            wire_version: Some(DAEMON_WIRE_VERSION),
         },
     )
     .unwrap();
@@ -279,6 +285,7 @@ async fn cache_dir_rejects_open_permissions_and_symlink() {
         default_upstream: None,
         allowed_upstreams: Vec::new(),
         memory_cache_mb: 8,
+        max_disk_cache_mb: DEFAULT_MAX_DISK_CACHE_MB,
         idle_timeout_secs: 0,
         write_discovery_files: true,
     };
@@ -300,6 +307,7 @@ async fn cache_dir_rejects_open_permissions_and_symlink() {
         default_upstream: None,
         allowed_upstreams: Vec::new(),
         memory_cache_mb: 8,
+        max_disk_cache_mb: DEFAULT_MAX_DISK_CACHE_MB,
         idle_timeout_secs: 0,
         write_discovery_files: true,
     };
@@ -335,6 +343,7 @@ async fn duplicate_startup_preserves_live_stats_and_dangling_symlink_is_cleaned(
         default_upstream: Some("http://127.0.0.1:1".to_string()),
         allowed_upstreams: Vec::new(),
         memory_cache_mb: 8,
+        max_disk_cache_mb: DEFAULT_MAX_DISK_CACHE_MB,
         idle_timeout_secs: 0,
         write_discovery_files: true,
     };
@@ -403,6 +412,7 @@ async fn duplicate_startup_preserves_live_stats_and_dangling_symlink_is_cleaned(
         default_upstream: Some("http://127.0.0.1:1".to_string()),
         allowed_upstreams: Vec::new(),
         memory_cache_mb: 8,
+        max_disk_cache_mb: DEFAULT_MAX_DISK_CACHE_MB,
         idle_timeout_secs: 0,
         write_discovery_files: true,
     };
@@ -441,6 +451,7 @@ async fn startup_failure_cleans_up_newly_bound_socket() {
         default_upstream: None,
         allowed_upstreams: Vec::new(),
         memory_cache_mb: 8,
+        max_disk_cache_mb: DEFAULT_MAX_DISK_CACHE_MB,
         idle_timeout_secs: 0,
         write_discovery_files: true,
     };
@@ -607,6 +618,7 @@ async fn idle_timeout_waits_for_active_rpc_and_then_shuts_down() {
         default_upstream: Some(upstream_url),
         allowed_upstreams: Vec::new(),
         memory_cache_mb: 8,
+        max_disk_cache_mb: DEFAULT_MAX_DISK_CACHE_MB,
         idle_timeout_secs: 1,
         write_discovery_files: true,
     };
@@ -674,6 +686,7 @@ async fn tcp_only_duplicate_daemon_fails_without_clobbering_live_discovery_or_st
         default_upstream: Some("http://127.0.0.1:1".to_string()),
         allowed_upstreams: Vec::new(),
         memory_cache_mb: 8,
+        max_disk_cache_mb: DEFAULT_MAX_DISK_CACHE_MB,
         idle_timeout_secs: 0,
         write_discovery_files: true,
     };
@@ -749,6 +762,7 @@ async fn tcp_only_duplicate_daemon_fails_without_clobbering_live_discovery_or_st
         default_upstream: Some("http://127.0.0.1:2".to_string()),
         allowed_upstreams: Vec::new(),
         memory_cache_mb: 8,
+        max_disk_cache_mb: DEFAULT_MAX_DISK_CACHE_MB,
         idle_timeout_secs: 0,
         write_discovery_files: true,
     };
@@ -786,6 +800,7 @@ async fn tcp_only_duplicate_daemon_fails_without_clobbering_live_discovery_or_st
         default_upstream: Some("http://127.0.0.1:1".to_string()),
         allowed_upstreams: Vec::new(),
         memory_cache_mb: 8,
+        max_disk_cache_mb: DEFAULT_MAX_DISK_CACHE_MB,
         idle_timeout_secs: 0,
         write_discovery_files: true,
     };
@@ -819,6 +834,7 @@ async fn explicit_socket_without_discovery_files_leaves_state_dir_untouched() {
         default_upstream: Some("http://127.0.0.1:1".to_string()),
         allowed_upstreams: Vec::new(),
         memory_cache_mb: 8,
+        max_disk_cache_mb: DEFAULT_MAX_DISK_CACHE_MB,
         idle_timeout_secs: 0,
         write_discovery_files: false,
     };
@@ -862,6 +878,7 @@ async fn socket_startup_refuses_to_unlink_regular_file_or_directory_but_cleans_s
         default_upstream: Some("http://127.0.0.1:1".to_string()),
         allowed_upstreams: Vec::new(),
         memory_cache_mb: 8,
+        max_disk_cache_mb: DEFAULT_MAX_DISK_CACHE_MB,
         idle_timeout_secs: 0,
         write_discovery_files: false,
     };
@@ -885,6 +902,7 @@ async fn socket_startup_refuses_to_unlink_regular_file_or_directory_but_cleans_s
         default_upstream: Some("http://127.0.0.1:1".to_string()),
         allowed_upstreams: Vec::new(),
         memory_cache_mb: 8,
+        max_disk_cache_mb: DEFAULT_MAX_DISK_CACHE_MB,
         idle_timeout_secs: 0,
         write_discovery_files: false,
     };
@@ -910,6 +928,7 @@ async fn socket_startup_refuses_to_unlink_regular_file_or_directory_but_cleans_s
         default_upstream: Some("http://127.0.0.1:1".to_string()),
         allowed_upstreams: Vec::new(),
         memory_cache_mb: 8,
+        max_disk_cache_mb: DEFAULT_MAX_DISK_CACHE_MB,
         idle_timeout_secs: 0,
         write_discovery_files: false,
     };
@@ -944,6 +963,7 @@ fn daemon_runtime_info_debug_redacts_secret() {
         default_upstream: Some("http://127.0.0.1:8080".to_string()),
         started_unix_secs: 1_700_000_000,
         secret: Some(secret.to_string()),
+        wire_version: Some(DAEMON_WIRE_VERSION),
     };
     let compact = format!("{with_secret:?}");
     let pretty = format!("{with_secret:#?}");
@@ -954,6 +974,10 @@ fn daemon_runtime_info_debug_redacts_secret() {
     assert!(
         compact.contains("<redacted>"),
         "Debug formatting should indicate secret is redacted: {compact}"
+    );
+    assert!(
+        compact.contains(&format!("wire_version: Some({DAEMON_WIRE_VERSION})")),
+        "Debug formatting should include wire_version: {compact}"
     );
 
     let without_secret = DaemonRuntimeInfo {
@@ -1024,5 +1048,234 @@ fn create_private_dir_all_and_ensure_private_dir_do_not_chmod_symlink_target() {
             .mode()
             & 0o777,
         0o700
+    );
+}
+
+#[tokio::test]
+async fn daemon_server_enforces_wire_version_negotiation_and_publishes_runtime_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    let cache_dir = dir.path().join("cache");
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let cfg = DaemonConfig {
+        state_dir: state_dir.clone(),
+        socket_path: None,
+        listen_addr: Some("127.0.0.1:0".parse().unwrap()),
+        cache_dir,
+        default_upstream: Some("http://127.0.0.1:1".to_string()),
+        allowed_upstreams: Vec::new(),
+        memory_cache_mb: 8,
+        max_disk_cache_mb: 0,
+        idle_timeout_secs: 0,
+        write_discovery_files: true,
+    };
+    let handle = tokio::spawn(async move {
+        run_daemon(cfg, async move {
+            let _ = stop_rx.await;
+        })
+        .await
+    });
+
+    let info_path = state_dir.join("daemon.json");
+    let info: DaemonRuntimeInfo = loop {
+        if let Ok(raw) = fs::read(&info_path)
+            && let Ok(parsed) = serde_json::from_slice(&raw)
+        {
+            break parsed;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(
+        info.wire_version,
+        Some(DAEMON_WIRE_VERSION),
+        "daemon.json must record current wire_version"
+    );
+
+    let secret = info.secret.expect("TCP secret present");
+    let channel = Endpoint::from_shared(info.tcp_addr.unwrap())
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut client = BackendServiceClient::new(channel.clone());
+    let empty_tree_req = || ReadTreeRequest {
+        project_id: "repo".to_string(),
+        path: String::new(),
+        tree_id: EMPTY_TREE_ID_BYTES.to_vec(),
+        page_size: 0,
+        page_token: String::new(),
+    };
+
+    // Matching wire version succeeds.
+    let mut ok_req = Request::new(empty_tree_req());
+    ok_req
+        .metadata_mut()
+        .insert(DAEMON_SECRET_HEADER, secret.parse().unwrap());
+    ok_req.metadata_mut().insert(
+        DAEMON_WIRE_VERSION_HEADER,
+        DAEMON_WIRE_VERSION_STR.parse().unwrap(),
+    );
+    assert_eq!(
+        client.read_tree(ok_req).await.unwrap().into_inner().tree_id,
+        EMPTY_TREE_ID_BYTES
+    );
+
+    // Missing wire version remains backward-compatible (e.g. legacy health probes).
+    let mut compat_req = Request::new(empty_tree_req());
+    compat_req
+        .metadata_mut()
+        .insert(DAEMON_SECRET_HEADER, secret.parse().unwrap());
+    assert_eq!(
+        client
+            .read_tree(compat_req)
+            .await
+            .unwrap()
+            .into_inner()
+            .tree_id,
+        EMPTY_TREE_ID_BYTES
+    );
+
+    // Mismatched wire version fails with FAILED_PRECONDITION and restart guidance.
+    let mut bad_req = Request::new(empty_tree_req());
+    bad_req
+        .metadata_mut()
+        .insert(DAEMON_SECRET_HEADER, secret.parse().unwrap());
+    bad_req
+        .metadata_mut()
+        .insert(DAEMON_WIRE_VERSION_HEADER, "99".parse().unwrap());
+    let err = client.read_tree(bad_req).await.unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert!(
+        err.message().contains("jj cc daemon stop"),
+        "unexpected mismatch error: {err}"
+    );
+
+    // Duplicate wire-version headers fail with FAILED_PRECONDITION.
+    let mut dup_req = Request::new(empty_tree_req());
+    dup_req
+        .metadata_mut()
+        .insert(DAEMON_SECRET_HEADER, secret.parse().unwrap());
+    dup_req.metadata_mut().append(
+        DAEMON_WIRE_VERSION_HEADER,
+        DAEMON_WIRE_VERSION_STR.parse().unwrap(),
+    );
+    dup_req.metadata_mut().append(
+        DAEMON_WIRE_VERSION_HEADER,
+        DAEMON_WIRE_VERSION_STR.parse().unwrap(),
+    );
+    let dup_err = client.read_tree(dup_req).await.unwrap_err();
+    assert_eq!(dup_err.code(), Code::FailedPrecondition);
+
+    // Health probe also enforces mismatched header while allowing omitted header.
+    let mut health = tonic_health::pb::health_client::HealthClient::new(channel);
+    let mut bad_health = Request::new(tonic_health::pb::HealthCheckRequest {
+        service: String::new(),
+    });
+    bad_health
+        .metadata_mut()
+        .insert(DAEMON_SECRET_HEADER, secret.parse().unwrap());
+    bad_health
+        .metadata_mut()
+        .insert(DAEMON_WIRE_VERSION_HEADER, "42".parse().unwrap());
+    assert_eq!(
+        health.check(bad_health).await.unwrap_err().code(),
+        Code::FailedPrecondition
+    );
+
+    let mut unversioned_health = Request::new(tonic_health::pb::HealthCheckRequest {
+        service: String::new(),
+    });
+    unversioned_health
+        .metadata_mut()
+        .insert(DAEMON_SECRET_HEADER, secret.parse().unwrap());
+    assert!(health.check(unversioned_health).await.is_ok());
+
+    let _ = stop_tx.send(());
+    handle.await.unwrap().unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn run_daemon_canonicalizes_socket_parent_and_rejects_overlong_socket_path() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let dir = tempfile::tempdir().unwrap();
+    let real_base = dir.path().join("real_base");
+    let state_dir = real_base.join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+    // Symlinked ancestor directory (`alias/state` -> `real_base/state`), while `state` itself
+    // is a real 0700 directory.
+    let alias = dir.path().join("alias");
+    symlink(&real_base, &alias).unwrap();
+    let aliased_state = alias.join("state");
+    let aliased_sock = aliased_state.join("daemon.sock");
+
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let cfg = DaemonConfig {
+        state_dir: aliased_state.clone(),
+        socket_path: Some(aliased_sock),
+        listen_addr: None,
+        cache_dir: dir.path().join("cache"),
+        default_upstream: None,
+        allowed_upstreams: Vec::new(),
+        memory_cache_mb: 8,
+        max_disk_cache_mb: 0,
+        idle_timeout_secs: 0,
+        write_discovery_files: true,
+    };
+    let handle = tokio::spawn(async move {
+        run_daemon(cfg, async move {
+            let _ = stop_rx.await;
+        })
+        .await
+    });
+
+    let info_path = aliased_state.join("daemon.json");
+    let info: DaemonRuntimeInfo = loop {
+        if let Ok(raw) = fs::read(&info_path)
+            && let Ok(parsed) = serde_json::from_slice(&raw)
+        {
+            break parsed;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let expected_canonical_sock = fs::canonicalize(&state_dir).unwrap().join("daemon.sock");
+    assert_eq!(
+        info.socket_path.as_deref(),
+        Some(expected_canonical_sock.to_string_lossy().as_ref()),
+        "daemon.json should publish canonicalized Unix socket path"
+    );
+    let _ = stop_tx.send(());
+    handle.await.unwrap().unwrap();
+
+    // Overlong socket path must fail fast with actionable env var guidance.
+    let long_dir = dir
+        .path()
+        .join("x".repeat(cc_common::MAX_UNIX_SOCKET_PATH_BYTES));
+    let long_sock = long_dir.join("daemon.sock");
+    let bad_cfg = DaemonConfig {
+        state_dir: PathBuf::new(),
+        socket_path: Some(long_sock),
+        listen_addr: None,
+        cache_dir: dir.path().join("cache2"),
+        default_upstream: None,
+        allowed_upstreams: Vec::new(),
+        memory_cache_mb: 8,
+        max_disk_cache_mb: 0,
+        idle_timeout_secs: 0,
+        write_discovery_files: false,
+    };
+    let err = run_daemon(bad_cfg, std::future::pending())
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("JJ_CC_DAEMON_SOCKET"),
+        "overlong socket path error should guide user to JJ_CC_DAEMON_SOCKET: {err}"
+    );
+    assert!(
+        !long_dir.exists(),
+        "fast-fail validation should reject overlong path before creating missing parent dirs"
     );
 }

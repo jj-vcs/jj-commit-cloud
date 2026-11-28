@@ -14,13 +14,16 @@
 
 use std::fs;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, SystemTime};
 
+use super::super::eviction::EvictionStats;
 #[cfg(unix)]
 use super::super::eviction::is_pid_dead;
-use super::super::l2::create_dir_all_private;
+use super::super::l2::{create_dir_all_private, create_private_file_with_initial_mode};
 use super::super::{
-    CACHE_STREAM_CHUNK_BYTES, CacheScope, CacheStatsSnapshot, MAX_L1_OBJECT_BYTES, ObjectKind,
-    TwoTierCache,
+    CACHE_STREAM_CHUNK_BYTES, CacheScope, CacheStatsSnapshot, DEFAULT_MAX_L2_OBJECT_BYTES,
+    MAX_L1_OBJECT_BYTES, ObjectKind, TwoTierCache, effective_max_l2_object_bytes,
 };
 use super::{collect_range_chunks, git_blob_id};
 use bytes::Bytes;
@@ -28,6 +31,7 @@ use cc_common::backend::Commit;
 use cc_common::op_store::{Operation, View};
 use prost::Message;
 use sha1::{Digest, Sha1};
+use tokio::sync::{Notify, watch};
 
 #[cfg(unix)]
 #[test]
@@ -763,4 +767,613 @@ async fn pending_purge_suppresses_l2_reads_authorizations_and_write_backs_until_
         cache.lookup_cached(&scope_a, ObjectKind::View, &view_id),
         Some(view_bytes)
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn l2_files_and_markers_enforce_strict_0600_via_fchmod_independent_of_initial_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // Directly verify that `create_private_file_with_initial_mode` overrides both overly
+    // restrictive (simulating umask 0o277/0o777) and overly permissive initial modes via
+    // post-create `fchmod(0o600)` without mutating process-wide umask.
+    for (name, initial_mode) in [
+        ("restrictive_0400", 0o400u32),
+        ("restrictive_0000", 0o000u32),
+        ("permissive_0644", 0o644u32),
+        ("permissive_0666", 0o666u32),
+    ] {
+        let p = dir.path().join(name);
+        let f = create_private_file_with_initial_mode(&p, true, initial_mode).unwrap();
+        let fd_mode = f.metadata().unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            fd_mode, 0o600,
+            "post-create fchmod must restore 0600 for initial mode {initial_mode:o}"
+        );
+        drop(f);
+        let path_mode = fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(path_mode, 0o600);
+    }
+
+    // Verify published L2 objects, scope auth markers, and spooled blobs all land at 0600.
+    let cache_dir = dir.path().join("cache");
+    let cache = TwoTierCache::new(cache_dir.clone(), 1024 * 1024).unwrap();
+    let scope = CacheScope::new("http://127.0.0.1:8080", "proj-perms");
+
+    let small_bytes = Bytes::from_static(b"small-blob-perms-check");
+    let small_id = git_blob_id(&small_bytes);
+    cache.put_write_through(&scope, ObjectKind::File, &small_id, small_bytes);
+    let small_path = cache.object_path(&scope, ObjectKind::File, &small_id);
+    assert_eq!(
+        fs::metadata(&small_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let marker_path = cache.inner.scoped_path(&scope, ObjectKind::File, &small_id);
+    assert_eq!(
+        fs::metadata(&marker_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    let spooled_bytes = vec![0x42u8; 64 * 1024];
+    let spooled_id = git_blob_id(&spooled_bytes);
+    let mut spooler = cache.new_write_blob_spooler(Some(spooled_bytes.len() as u64));
+    spooler.write_chunk(&spooled_bytes).await;
+    assert!(
+        spooler
+            .commit(scope.clone(), spooled_id.clone(), true)
+            .await
+    );
+    let spooled_path = cache.object_path(&scope, ObjectKind::File, &spooled_id);
+    assert_eq!(
+        fs::metadata(&spooled_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn evict_l2_to_budget_evicts_oldest_first_honors_l2_hit_recency_and_stops_at_low_watermark() {
+    let dir = tempfile::tempdir().unwrap();
+    // Zero L1 budget so lookups always go through L2 and trigger mtime refresh.
+    let cache = TwoTierCache::new(dir.path().to_path_buf(), 0).unwrap();
+    let scope = CacheScope::new("http://127.0.0.1:8080", "proj-evict");
+
+    let mut blobs = Vec::new();
+    let now = SystemTime::now();
+    for i in 0u8..5 {
+        let payload = Bytes::from(vec![i + 1; 1000]);
+        let id = git_blob_id(&payload);
+        cache.put_write_through(&scope, ObjectKind::File, &id, payload.clone());
+        let path = cache.object_path(&scope, ObjectKind::File, &id);
+        // Set distinct historical mtimes: blob 0 oldest (10 min ago) .. blob 4 newest (6 min ago).
+        let mtime = now - Duration::from_secs(600 - u64::from(i) * 60);
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        blobs.push((id, payload, path));
+    }
+
+    // Perform an L2 hit on blob 0 (originally oldest) so its mtime refreshes to ~now.
+    assert_eq!(
+        cache.lookup_cached(&scope, ObjectKind::File, &blobs[0].0),
+        Some(blobs[0].1.clone())
+    );
+
+    // Budget = 3500 bytes -> low watermark = 85% = 2975 bytes.
+    // Total = 5000 > 3500 -> must evict oldest blobs (blob 1, blob 2, blob 3 -> 3000 bytes)
+    // leaving 2000 bytes (<= 2975): blob 0 (refreshed on L2 hit) and blob 4 (newest).
+    let stats = cache.evict_l2_to_budget(3500).unwrap();
+    assert_eq!(stats.bytes_before, 5000);
+    assert_eq!(stats.bytes_after, 2000);
+    assert_eq!(stats.evicted_objects, 3);
+    assert_eq!(stats.evicted_bytes, 3000);
+    assert_eq!(stats.orphaned_markers_removed, 3);
+
+    assert!(
+        blobs[0].2.exists(),
+        "hot blob refreshed on L2 hit must survive"
+    );
+    assert!(!blobs[1].2.exists(), "oldest un-hit blob 1 must be evicted");
+    assert!(!blobs[2].2.exists(), "blob 2 must be evicted");
+    assert!(
+        !blobs[3].2.exists(),
+        "blob 3 must be evicted to reach 85% low watermark"
+    );
+    assert!(
+        blobs[4].2.exists(),
+        "newest blob 4 must survive (low watermark stop)"
+    );
+
+    let snap = cache.stats();
+    assert_eq!(snap.l2_evicted_objects, 3);
+    assert_eq!(snap.l2_evicted_bytes, 3000);
+
+    // Re-running under budget is a no-op (low watermark prevented thrashing).
+    let second = cache.evict_l2_to_budget(3500).unwrap();
+    assert_eq!(second.evicted_objects, 0);
+    assert_eq!(second.evicted_bytes, 0);
+    assert_eq!(second.bytes_after, 2000);
+
+    // Passing budget == 0 disables eviction.
+    let disabled = cache.evict_l2_to_budget(0).unwrap();
+    assert_eq!(disabled, EvictionStats::default());
+    assert!(blobs[0].2.exists() && blobs[4].2.exists());
+}
+
+#[test]
+fn evict_l2_preserves_active_tmp_staging_and_run_files_and_cleans_orphaned_markers() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = TwoTierCache::new(dir.path().to_path_buf(), 0).unwrap();
+    let scope = CacheScope::new("http://127.0.0.1:8080", "proj-orphan");
+
+    let keep_blob = Bytes::from(vec![0xaa; 500]);
+    let keep_id = git_blob_id(&keep_blob);
+    let evict_blob = Bytes::from(vec![0xbb; 1500]);
+    let evict_id = git_blob_id(&evict_blob);
+    cache.put_write_through(&scope, ObjectKind::File, &evict_id, evict_blob);
+    let evict_path = cache.object_path(&scope, ObjectKind::File, &evict_id);
+    let old = SystemTime::now() - Duration::from_secs(300);
+    fs::File::options()
+        .write(true)
+        .open(&evict_path)
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    cache.put_write_through(&scope, ObjectKind::File, &keep_id, keep_blob);
+
+    // Plant an active `.tmp` file in the object shard directory, a staging file in `staging/`,
+    // and daemon state files under `run/`: none may be touched or counted by eviction.
+    let shard_tmp = evict_path.parent().unwrap().join(".tmp.99999.1.active");
+    fs::write(&shard_tmp, vec![0xcc; 4000]).unwrap();
+    let staging_tmp = dir.path().join("staging").join(".tmp.99999.2");
+    fs::write(&staging_tmp, vec![0xdd; 4000]).unwrap();
+    let run_dir = dir.path().join("run");
+    fs::create_dir_all(&run_dir).unwrap();
+    let daemon_json = run_dir.join("daemon.json");
+    fs::write(&daemon_json, b"{}").unwrap();
+
+    // Plant a pre-existing orphaned scope auth marker whose shared object does not exist.
+    let orphan_id = vec![0xef; 20];
+    cache.authorize_scope(&scope, ObjectKind::Tree, &orphan_id);
+    let orphan_marker = cache
+        .inner
+        .scoped_path(&scope, ObjectKind::Tree, &orphan_id);
+    assert!(orphan_marker.exists());
+    assert!(cache.is_authorized(&scope, ObjectKind::Tree, &orphan_id));
+
+    // Plant a stray non-ASCII UTF-8 filename inside `scopes/` to verify `evict_l2_to_budget`
+    // handles unexpected filenames without panicking on UTF-8 char boundaries.
+    let stray_non_ascii = orphan_marker.parent().unwrap().join("éééé");
+    fs::write(&stray_non_ascii, b"").unwrap();
+
+    let evict_marker = cache.inner.scoped_path(&scope, ObjectKind::File, &evict_id);
+    let keep_marker = cache.inner.scoped_path(&scope, ObjectKind::File, &keep_id);
+    assert!(evict_marker.exists() && keep_marker.exists());
+
+    // Budget = 1000 bytes -> evicts `evict_blob` (1500) and cleans its marker, the
+    // pre-existing orphaned tree marker, and the stray non-ASCII marker while leaving
+    // `.tmp*`, `staging/`, `run/`, and `keep_blob` + its marker intact.
+    let stats = cache.evict_l2_to_budget(1000).unwrap();
+    assert_eq!(stats.bytes_before, 2000);
+    assert_eq!(stats.bytes_after, 500);
+    assert_eq!(stats.evicted_objects, 1);
+    assert_eq!(stats.orphaned_markers_removed, 3);
+    assert!(!stray_non_ascii.exists());
+
+    assert!(
+        shard_tmp.exists(),
+        "active shard .tmp file must be preserved"
+    );
+    assert!(staging_tmp.exists(), "staging file must be preserved");
+    assert!(daemon_json.exists(), "run/daemon.json must be preserved");
+    assert!(
+        cache
+            .object_path(&scope, ObjectKind::File, &keep_id)
+            .exists()
+            && keep_marker.exists(),
+        "surviving blob and its auth marker must stay intact"
+    );
+    assert!(
+        !evict_marker.exists(),
+        "evicted blob auth marker must be removed"
+    );
+    assert!(!orphan_marker.exists(), "orphaned marker must be removed");
+    assert!(
+        !cache.is_authorized(&scope, ObjectKind::File, &evict_id),
+        "in-memory authorized cache must prune removed orphaned marker"
+    );
+    assert!(
+        !cache.is_authorized(&scope, ObjectKind::Tree, &orphan_id),
+        "in-memory authorized cache must prune pre-existing orphaned marker"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn evict_l2_unlinking_blob_does_not_corrupt_in_progress_range_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = TwoTierCache::new(dir.path().to_path_buf(), 0).unwrap();
+    let scope = CacheScope::new("http://127.0.0.1:8080", "proj-live-reader");
+
+    // Create a large (> MAX_L1_OBJECT_BYTES = 4 MiB) blob so `read_cached_file_range` streams
+    // directly from an open L2 file descriptor across multiple 64 KiB frames.
+    let size = MAX_L1_OBJECT_BYTES + 256 * 1024;
+    let content: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+    let file_id = git_blob_id(&content);
+    let mut spooler = cache.new_write_blob_spooler(Some(size as u64));
+    for chunk in content.chunks(CACHE_STREAM_CHUNK_BYTES) {
+        spooler.write_chunk(chunk).await;
+    }
+    assert!(spooler.commit(scope.clone(), file_id.clone(), true).await);
+
+    let blob_path = cache.object_path(&scope, ObjectKind::File, &file_id);
+    assert!(blob_path.exists());
+
+    // Start streaming the large blob from L2 and read the first chunk to ensure the reader
+    // task holds the open file descriptor.
+    let mut rx = cache
+        .read_cached_file_range(&scope, &file_id, 0, 0)
+        .await
+        .unwrap()
+        .expect("large blob should hit L2");
+    let first = rx.recv().await.unwrap().unwrap();
+    assert!(!first.is_empty());
+
+    // Evict the blob from L2 while the range reader is mid-stream.
+    let evict_stats = cache.evict_l2_to_budget(1024).unwrap();
+    assert_eq!(evict_stats.evicted_objects, 1);
+    assert!(!blob_path.exists(), "eviction must unlink the blob path");
+
+    // The in-progress reader must finish streaming every remaining byte without error.
+    let mut assembled = first;
+    while let Some(chunk) = rx.recv().await {
+        assembled.extend_from_slice(&chunk.unwrap());
+    }
+    assert_eq!(assembled, content);
+}
+
+#[tokio::test]
+async fn spawn_l2_eviction_task_triggers_on_write_volume_and_stops_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = TwoTierCache::new(dir.path().to_path_buf(), 0).unwrap();
+    let scope = CacheScope::new("http://127.0.0.1:8080", "proj-bg-evict");
+
+    // `max_disk_bytes == 0` disables background eviction and returns `None`.
+    let (_disabled_tx, disabled_rx) = watch::channel(false);
+    assert!(
+        cache
+            .spawn_l2_eviction_task(0, disabled_rx, || {})
+            .is_none()
+    );
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let evicted_signal = Arc::new(Notify::new());
+    let evicted_signal_cb = Arc::clone(&evicted_signal);
+    let handle = cache
+        .spawn_l2_eviction_task(2000, shutdown_rx, move || {
+            evicted_signal_cb.notify_one();
+        })
+        .expect("non-zero budget should spawn background eviction task");
+
+    // Write three 1000-byte blobs (total 3000 > 2000 budget, trigger = 200 bytes) so the
+    // background task wakes early on write volume without waiting for the 60s periodic tick.
+    let now = SystemTime::now();
+    for i in 0u8..3 {
+        let payload = Bytes::from(vec![i + 10; 1000]);
+        let id = git_blob_id(&payload);
+        cache.put_write_through(&scope, ObjectKind::File, &id, payload);
+        if i == 0 {
+            let p = cache.object_path(&scope, ObjectKind::File, &id);
+            let _ = fs::File::options()
+                .write(true)
+                .open(&p)
+                .and_then(|f| f.set_modified(now - Duration::from_secs(120)));
+        }
+    }
+
+    tokio::time::timeout(Duration::from_secs(3), evicted_signal.notified())
+        .await
+        .expect("write-volume notification should wake background eviction well before 60s");
+    assert!(
+        cache.stats().l2_evicted_objects >= 1,
+        "background sweep should record evicted L2 objects"
+    );
+
+    let _ = shutdown_tx.send(true);
+    tokio::time::timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("eviction task must exit promptly on shutdown signal")
+        .expect("eviction task must not panic");
+}
+
+#[test]
+fn evict_l2_preserves_l1_resident_shared_objects_and_l1_only_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    // Each 1000-byte shared File has L1 weight 1000 + 64 (upstream_hex) + 20 (id) + 64 = 1148 bytes,
+    // so a 2500-byte L1 budget holds at most two 1000-byte blobs at once.
+    let cache = TwoTierCache::new(dir.path().to_path_buf(), 2500).unwrap();
+    let scope = CacheScope::new("http://127.0.0.1:8080", "proj-l1-hot");
+
+    let cold1 = Bytes::from(vec![1u8; 1000]);
+    let cold2 = Bytes::from(vec![2u8; 1000]);
+    let hot = Bytes::from(vec![3u8; 1000]);
+    let warm = Bytes::from(vec![4u8; 1000]);
+    let cold1_id = git_blob_id(&cold1);
+    let cold2_id = git_blob_id(&cold2);
+    let hot_id = git_blob_id(&hot);
+    let warm_id = git_blob_id(&warm);
+
+    for (id, payload) in [
+        (&cold1_id, &cold1),
+        (&cold2_id, &cold2),
+        (&hot_id, &hot),
+        (&warm_id, &warm),
+    ] {
+        cache.put_write_through(&scope, ObjectKind::File, id, payload.clone());
+    }
+    assert_eq!(cache.stats().l1_entries, 2);
+
+    // Give `hot` (resident in L1) the OLDEST L2 mtime on disk, simulating a hot L1 object whose
+    // on-disk mtime is never refreshed by L1 hits.
+    let now = SystemTime::now();
+    for (id, age_secs) in [
+        (&hot_id, 600u64),
+        (&cold1_id, 300),
+        (&cold2_id, 240),
+        (&warm_id, 60),
+    ] {
+        let p = cache.object_path(&scope, ObjectKind::File, id);
+        fs::File::options()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_modified(now - Duration::from_secs(age_secs))
+            .unwrap();
+    }
+
+    // Over-budget sweep evicts cold non-L1 entries (`cold1`, `cold2`) before L1-resident `hot`.
+    let stats = cache.evict_l2_to_budget(2500).unwrap();
+    assert_eq!(stats.evicted_objects, 2);
+    assert_eq!(stats.bytes_after, 2000);
+    assert!(
+        !cache
+            .object_path(&scope, ObjectKind::File, &cold1_id)
+            .exists()
+    );
+    assert!(
+        !cache
+            .object_path(&scope, ObjectKind::File, &cold2_id)
+            .exists()
+    );
+    assert!(
+        cache
+            .object_path(&scope, ObjectKind::File, &hot_id)
+            .exists()
+    );
+    assert!(
+        cache
+            .object_path(&scope, ObjectKind::File, &warm_id)
+            .exists()
+    );
+
+    let l1_hits_before = cache.stats().l1_hits;
+    assert_eq!(
+        cache.lookup_cached(&scope, ObjectKind::File, &hot_id),
+        Some(hot.clone())
+    );
+    assert_eq!(cache.stats().l1_hits, l1_hits_before + 1);
+
+    // When disk budget is smaller than L1, evicting L1-resident files from L2 disk still
+    // preserves their authorization so L1 RAM hits continue working.
+    let tight = cache.evict_l2_to_budget(1100).unwrap();
+    assert_eq!(tight.evicted_objects, 2);
+    assert_eq!(tight.bytes_after, 0);
+    assert_eq!(tight.orphaned_markers_removed, 0);
+    assert!(
+        !cache
+            .object_path(&scope, ObjectKind::File, &hot_id)
+            .exists()
+    );
+    assert!(
+        !cache
+            .object_path(&scope, ObjectKind::File, &warm_id)
+            .exists()
+    );
+
+    let l1_hits_before_tight = cache.stats().l1_hits;
+    let l2_hits_before_tight = cache.stats().l2_hits;
+    assert_eq!(
+        cache.lookup_cached(&scope, ObjectKind::File, &hot_id),
+        Some(hot)
+    );
+    assert_eq!(
+        cache.lookup_cached(&scope, ObjectKind::File, &warm_id),
+        Some(warm)
+    );
+    assert_eq!(cache.stats().l1_hits, l1_hits_before_tight + 2);
+    assert_eq!(cache.stats().l2_hits, l2_hits_before_tight);
+
+    // Once `hot` and `warm` are displaced from L1, a subsequent sweep cleans up their now
+    // orphaned markers and in-memory authorization entries.
+    let newer1 = Bytes::from(vec![5u8; 1000]);
+    let newer2 = Bytes::from(vec![6u8; 1000]);
+    cache.put_write_through(&scope, ObjectKind::File, &git_blob_id(&newer1), newer1);
+    cache.put_write_through(&scope, ObjectKind::File, &git_blob_id(&newer2), newer2);
+    let cleanup = cache.evict_l2_to_budget(10_000).unwrap();
+    assert_eq!(cleanup.evicted_objects, 0);
+    assert_eq!(cleanup.orphaned_markers_removed, 2);
+    assert!(!cache.is_authorized(&scope, ObjectKind::File, &hot_id));
+    assert!(!cache.is_authorized(&scope, ObjectKind::File, &warm_id));
+
+    // L1-only cached shared objects (`max_l2_object_bytes == 0` or failed L2 write) are never
+    // invalidated by under-budget eviction sweeps.
+    let dir_l1_only = tempfile::tempdir().unwrap();
+    let l1_only =
+        TwoTierCache::new_with_l2_object_cap(dir_l1_only.path().to_path_buf(), 1024 * 1024, 0)
+            .unwrap();
+    let payload = Bytes::from_static(b"l1-only-shared-blob");
+    let id = git_blob_id(&payload);
+    l1_only.put_write_through(&scope, ObjectKind::File, &id, payload.clone());
+    assert!(!l1_only.object_path(&scope, ObjectKind::File, &id).exists());
+    let under_budget = l1_only.evict_l2_to_budget(1024 * 1024).unwrap();
+    assert_eq!(under_budget.orphaned_markers_removed, 0);
+    assert!(l1_only.is_authorized(&scope, ObjectKind::File, &id));
+    assert_eq!(
+        l1_only.lookup_cached(&scope, ObjectKind::File, &id),
+        Some(payload)
+    );
+    assert_eq!(l1_only.stats().l1_hits, 1);
+}
+
+#[test]
+fn evict_l2_prioritizes_oversized_files_without_wiping_warm_entries_and_caps_object_size() {
+    assert_eq!(
+        effective_max_l2_object_bytes(0),
+        DEFAULT_MAX_L2_OBJECT_BYTES
+    );
+    assert_eq!(
+        effective_max_l2_object_bytes(10 * 1024 * 1024 * 1024),
+        DEFAULT_MAX_L2_OBJECT_BYTES
+    );
+    let cap_128_mb = effective_max_l2_object_bytes(128 * 1024 * 1024);
+    assert_eq!(cap_128_mb, (128 * 1024 * 1024 * 85) / 100);
+
+    let dir = tempfile::tempdir().unwrap();
+    // Seed 3 older warm blobs (2000 bytes each = 6000 bytes) and 1 newer oversized blob (9000
+    // bytes, larger than the 85% low watermark of 8500 bytes for a 10_000-byte disk budget).
+    let cache = TwoTierCache::new(dir.path().to_path_buf(), 0).unwrap();
+    let scope = CacheScope::new("http://127.0.0.1:8080", "proj-oversized");
+
+    let now = SystemTime::now();
+    let mut warm_paths = Vec::new();
+    for i in 0u8..3 {
+        let payload = Bytes::from(vec![i + 1; 2000]);
+        let id = git_blob_id(&payload);
+        cache.put_write_through(&scope, ObjectKind::File, &id, payload);
+        let p = cache.object_path(&scope, ObjectKind::File, &id);
+        fs::File::options()
+            .write(true)
+            .open(&p)
+            .unwrap()
+            .set_modified(now - Duration::from_secs(600 - u64::from(i) * 60))
+            .unwrap();
+        warm_paths.push(p);
+    }
+
+    let oversized = Bytes::from(vec![0xee; 9000]);
+    let oversized_id = git_blob_id(&oversized);
+    cache.put_write_through(&scope, ObjectKind::File, &oversized_id, oversized);
+    let oversized_path = cache.object_path(&scope, ObjectKind::File, &oversized_id);
+    assert!(oversized_path.exists());
+
+    // Budget = 10_000 (low watermark = 8_500): evicting the oversized blob first drops usage from
+    // 15_000 to 6_000 <= 8_500 without wiping any of the older warm entries.
+    let stats = cache.evict_l2_to_budget(10_000).unwrap();
+    assert_eq!(stats.bytes_before, 15_000);
+    assert_eq!(stats.bytes_after, 6_000);
+    assert_eq!(stats.evicted_objects, 1);
+    assert_eq!(stats.evicted_bytes, 9_000);
+    assert!(
+        !oversized_path.exists(),
+        "oversized blob must be evicted first"
+    );
+    for (idx, p) in warm_paths.iter().enumerate() {
+        assert!(
+            p.exists(),
+            "warm blob {idx} must survive oversized eviction"
+        );
+    }
+
+    // With `effective_max_l2_object_bytes(10_000)` applied, a 9000-byte blob is never written to L2.
+    let dir_capped = tempfile::tempdir().unwrap();
+    let capped = TwoTierCache::new_with_l2_object_cap(
+        dir_capped.path().to_path_buf(),
+        0,
+        effective_max_l2_object_bytes(10_000),
+    )
+    .unwrap();
+    let big = Bytes::from(vec![0xdd; 9000]);
+    let big_id = git_blob_id(&big);
+    capped.put_write_through(&scope, ObjectKind::File, &big_id, big);
+    assert!(
+        !capped
+            .object_path(&scope, ObjectKind::File, &big_id)
+            .exists(),
+        "blob exceeding low-watermark cap must skip L2 caching"
+    );
+}
+
+#[test]
+fn evict_l2_to_budget_cancellable_stops_promptly_and_resets_write_counter_before_walk() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = TwoTierCache::new(dir.path().to_path_buf(), 0).unwrap();
+    let scope = CacheScope::new("http://127.0.0.1:8080", "proj-cancel");
+
+    let mut paths = Vec::new();
+    for i in 0u8..5 {
+        let payload = Bytes::from(vec![i + 20; 1000]);
+        let id = git_blob_id(&payload);
+        cache.put_write_through(&scope, ObjectKind::File, &id, payload);
+        paths.push(cache.object_path(&scope, ObjectKind::File, &id));
+    }
+
+    // Pre-cancelled sweep exits immediately without modifying files.
+    let cancelled = cache.evict_l2_to_budget_cancellable(1000, || true).unwrap();
+    assert_eq!(cancelled, EvictionStats::default());
+    assert!(paths.iter().all(|p| p.exists()));
+
+    // `l2_bytes_written_since_sweep` is cleared BEFORE walking so concurrent writes recorded
+    // while the sweep runs (observed on poll >= 1 during the directory walk) are preserved
+    // for the next trigger instead of being zeroed out at the end of the sweep.
+    cache
+        .inner
+        .l2_bytes_written_since_sweep
+        .store(9999, Ordering::Relaxed);
+    let walk_polls = AtomicUsize::new(0);
+    let stats = cache
+        .evict_l2_to_budget_cancellable(10_000, || {
+            if walk_polls.fetch_add(1, Ordering::Relaxed) == 1 {
+                cache.inner.record_l2_bytes_written(777);
+            }
+            false
+        })
+        .unwrap();
+    assert_eq!(stats.evicted_objects, 0);
+    assert!(
+        walk_polls.load(Ordering::Relaxed) > 1,
+        "sweep should poll cancellation during walk"
+    );
+    assert_eq!(
+        cache
+            .inner
+            .l2_bytes_written_since_sweep
+            .load(Ordering::Relaxed),
+        777,
+        "bytes written concurrently during sweep must not be discarded when sweep finishes"
+    );
+
+    // Cancellation triggered mid-walk stops early without evicting any objects.
+    let mid_walk_polls = AtomicUsize::new(0);
+    let partial_walk = cache
+        .evict_l2_to_budget_cancellable(1000, || {
+            mid_walk_polls.fetch_add(1, Ordering::Relaxed) >= 3
+        })
+        .unwrap();
+    assert_eq!(partial_walk.evicted_objects, 0);
+    assert!(paths.iter().all(|p| p.exists()));
+
+    // Cancellation triggered mid-eviction stops after the already-evicted object and records
+    // partial eviction metrics accurately without deleting remaining files.
+    let partial_evict = cache
+        .evict_l2_to_budget_cancellable(1000, || paths.iter().any(|p| !p.exists()))
+        .unwrap();
+    assert_eq!(partial_evict.evicted_objects, 1);
+    assert_eq!(partial_evict.evicted_bytes, 1000);
+    assert_eq!(paths.iter().filter(|p| p.exists()).count(), 4);
+    assert_eq!(cache.stats().l2_evicted_objects, 1);
+    assert_eq!(cache.stats().l2_evicted_bytes, 1000);
 }

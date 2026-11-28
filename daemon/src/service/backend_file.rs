@@ -132,7 +132,7 @@ impl DaemonProxy {
         &self,
         request: Request<ReadFileRequest>,
     ) -> Result<Response<DaemonReadFileStream>, Status> {
-        let active = self.track_active_rpc();
+        let active = self.begin_rpc(request.metadata())?;
         let meta = request.metadata().clone();
         let req = request.into_inner();
         let scope = self.scope_for(&meta, &req.project_id)?;
@@ -237,7 +237,7 @@ impl DaemonProxy {
         &self,
         request: Request<WriteFileRequest>,
     ) -> Result<Response<WriteFileResponse>, Status> {
-        let _active = self.track_active_rpc();
+        let _active = self.begin_rpc(request.metadata())?;
         let meta = request.metadata().clone();
         let req = request.into_inner();
         let scope = self.scope_for(&meta, &req.project_id)?;
@@ -273,7 +273,7 @@ impl DaemonProxy {
         &self,
         request: Request<Streaming<WriteFileChunk>>,
     ) -> Result<Response<WriteFileResponse>, Status> {
-        let _active = self.track_active_rpc();
+        let _active = self.begin_rpc(request.metadata())?;
         let meta = request.metadata().clone();
         // Validate upstream target/allowlist and caller authorization metadata before reading
         // any inbound frames so disallowed requests fail immediately without buffering.

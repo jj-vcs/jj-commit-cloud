@@ -32,6 +32,7 @@ use std::io::{Read as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use cc_common::backend::{Commit, ReadTreeResponse};
@@ -128,6 +129,9 @@ impl TwoTierCache {
             .inner
             .shared_object_path(scope, ObjectKind::File, file_id);
         let id_vec = file_id.to_vec();
+        let inner_for_read = Arc::clone(&self.inner);
+        let scope_for_read = scope.clone();
+        let key_for_read = key;
         let l2_read = tokio::task::spawn_blocking(move || -> std::io::Result<L2FileRead> {
             let Ok(mut file) = fs::File::open(&path) else {
                 return Ok(L2FileRead::Miss);
@@ -144,8 +148,32 @@ impl TwoTierCache {
                     discard_invalid_l2_entry(&path);
                     return Ok(L2FileRead::Miss);
                 }
-                return Ok(L2FileRead::Small(Bytes::from(all)));
+                maybe_refresh_l2_mtime(&file, &path, &meta);
+                let bytes = Bytes::from(all);
+                // Promote into L1 under `scope_io_lock.read()` only while the scope stays
+                // authorized and unpurged, so concurrent orphan pruning or namespace purging
+                // cannot strand an unauthorized entry in L1.
+                let _scope_guard = inner_for_read
+                    .scope_io_lock
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner());
+                if !inner_for_read.is_pending_purge(&scope_for_read.namespace_hex)
+                    && inner_for_read.purge_epoch.load(Ordering::Acquire) == start_epoch
+                    && inner_for_read.is_authorized_in_memory(
+                        &scope_for_read,
+                        ObjectKind::File,
+                        &id_vec,
+                    )
+                {
+                    inner_for_read
+                        .l1
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .put(key_for_read, bytes.clone());
+                }
+                return Ok(L2FileRead::Small(bytes));
             }
+            maybe_refresh_l2_mtime(&file, &path, &meta);
             Ok(L2FileRead::Large {
                 file,
                 path,
@@ -165,11 +193,6 @@ impl TwoTierCache {
                 }
                 self.inner.l2_hits.fetch_add(1, Ordering::Relaxed);
                 let actual_len = bytes.len() as u64;
-                self.inner
-                    .l1
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .put(key, bytes.clone());
                 if offset > actual_len {
                     return Err(CacheRangeError::OffsetOutOfRange {
                         offset,
@@ -247,6 +270,19 @@ impl TwoTierCache {
 }
 
 impl CacheInner {
+    pub(super) fn record_l2_bytes_written(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let prev = self
+            .l2_bytes_written_since_sweep
+            .fetch_add(bytes, Ordering::Relaxed);
+        let threshold = self.l2_sweep_trigger_bytes.load(Ordering::Relaxed);
+        if threshold > 0 && prev.saturating_add(bytes) >= threshold {
+            self.l2_eviction_notify.notify_one();
+        }
+    }
+
     pub(super) fn object_path(
         &self,
         scope: &CacheScope,
@@ -346,6 +382,10 @@ impl CacheInner {
         written
     }
 }
+
+/// Minimum age before an L2 cache hit refreshes the file's mtime, preventing metadata
+/// write amplification on hot objects while preserving LRU recency ordering.
+pub(super) const L2_MTIME_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 pub(super) fn is_valid_object_id(id_bytes: &[u8]) -> bool {
     !id_bytes.is_empty() && id_bytes.len() <= MAX_OBJECT_ID_BYTES
@@ -477,15 +517,46 @@ pub(super) fn ensure_private_dir_within(root: &Path, dir: &Path) -> std::io::Res
     set_dir_private(&dir_norm)
 }
 
-pub(super) fn write_marker_private(path: &Path) -> std::io::Result<()> {
+pub(super) fn set_file_private(file: &fs::File) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        Ok(())
+    }
+}
+
+/// Creates a new file exclusively and unconditionally enforces mode `0600` via `fchmod` on the
+/// open file descriptor so restrictive or unusual process umasks cannot alter published modes.
+pub(super) fn create_private_file_with_initial_mode(
+    path: &Path,
+    read: bool,
+    initial_mode: u32,
+) -> std::io::Result<fs::File> {
     let mut opts = fs::OpenOptions::new();
-    opts.write(true).create_new(true);
+    opts.read(read).write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+        opts.mode(initial_mode);
     }
-    match opts.open(path) {
+    #[cfg(not(unix))]
+    let _ = initial_mode;
+    let file = opts.open(path)?;
+    if let Err(err) = set_file_private(&file) {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(err);
+    }
+    Ok(file)
+}
+
+pub(super) fn write_marker_private(path: &Path) -> std::io::Result<()> {
+    match create_private_file_with_initial_mode(path, false, 0o600) {
         Ok(_) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
         Err(err) => Err(err),
@@ -493,16 +564,46 @@ pub(super) fn write_marker_private(path: &Path) -> std::io::Result<()> {
 }
 
 pub(super) fn write_synced(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    let mut opts = fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut file = opts.open(path)?;
+    let mut file = create_private_file_with_initial_mode(path, false, 0o600)?;
     file.write_all(data)?;
     file.sync_all()
+}
+
+pub(super) fn maybe_refresh_l2_mtime(file: &fs::File, path: &Path, meta: &fs::Metadata) {
+    let now = SystemTime::now();
+    let needs_refresh = match meta.modified() {
+        Ok(mtime) => now
+            .duration_since(mtime)
+            .map(|age| age >= L2_MTIME_REFRESH_INTERVAL)
+            .unwrap_or(false),
+        Err(_) => true,
+    };
+    if !needs_refresh {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        let _ = path;
+        let _ = file.set_modified(now);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // `File::open` only requests `GENERIC_READ`, which lacks `FILE_WRITE_ATTRIBUTES` on
+        // Windows; reopen with `FILE_WRITE_ATTRIBUTES` only when refreshing stale mtimes.
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+        let _ = file;
+        if let Ok(attr_file) = fs::OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .open(path)
+        {
+            let _ = attr_file.set_modified(now);
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (file, path);
+    }
 }
 
 /// Returns `false` only when `id_bytes` is a 20-byte SHA-1 that differs from the Git blob hash

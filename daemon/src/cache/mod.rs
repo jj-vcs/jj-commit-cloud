@@ -18,23 +18,21 @@
 //! # Authority and Crash-Safety Ordering
 //! Shared `Tree`, `Symlink`, and `File` payloads (`objects/<upstream_hex>/...`) and scoped
 //! `Commit`, `View`, and `Operation` files (`scopes/<namespace_hex>/<scope_hex>/...`) validate
-//! before caching, write to a process-unique temp file (`0600` on Unix), call `sync_all`, and
-//! link or rename into place. Authorization markers (`0600` under `0700` dirs) are created
-//! only after L1 or L2 succeeds. Reads discard empty, torn, or invalid L2 entries.
+//! before caching, write to a process-unique temp file (`fchmod(0600)` independent of umask),
+//! call `sync_all`, and rename into place. Authorization markers (`fchmod(0600)` under `0700`
+//! dirs) are created only after L1 or L2 succeeds. Reads discard empty or invalid L2 entries.
 //!
 //! # Concurrency and Merge Invariants
-//! `Commit`, `View`, and `Operation` objects are scope-partitioned (`Commit` payloads carry
-//! unhashed `predecessors` and `external_ids` and are cached only from authoritative reads).
-//! Concurrent misses within a [`CacheScope`] coalesce via [`SingleflightGuard`] over a `watch`
-//! channel; callers with distinct credentials never coalesce or share authorization. Locks
-//! follow `scope_io_lock -> l1 -> authorized`, and `purge_namespace` bumps `purge_epoch` under
-//! `scope_io_lock.write()`. Async helpers offload blocking disk I/O onto `spawn_blocking`.
+//! `Commit`, `View`, and `Operation` objects are scope-partitioned (`Commit` omits unhashed
+//! fields on write-through). Concurrent misses coalesce via [`SingleflightGuard`]. Locks
+//! follow `scope_io_lock -> l1 -> authorized`; `purge_namespace` bumps `purge_epoch` under
+//! `scope_io_lock.write()`. Background L2 LRU eviction never holds L1 or `authorized` mutexes
+//! across filesystem walks or deletions. Async helpers offload blocking disk I/O.
 //!
 //! # Cross-Process and RPC Boundaries
 //! File blobs up to [`MAX_L1_OBJECT_BYTES`] (`4 MiB`) stay in L1 RAM as zero-copy [`Bytes`]
-//! and are SHA-1 verified on every L2 read. Larger blobs never load into RAM via
-//! `lookup_cached`: they spool through `<cache_dir>/staging` up to `max_l2_object_bytes` and
-//! stream via `read_cached_file_range` in 64 KiB chunks over a bounded `mpsc` channel.
+//! and are SHA-1 verified on every L2 read. Larger blobs spool through `<cache_dir>/staging`
+//! up to `max_l2_object_bytes` and stream via `read_cached_file_range` in 64 KiB chunks.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -50,7 +48,7 @@ use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use sha1::Digest;
 use sha2::Sha256;
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 
 mod eviction;
 mod l1;
@@ -59,7 +57,7 @@ mod spool;
 #[cfg(test)]
 mod tests;
 
-pub use eviction::PendingPurgeGuard;
+pub use eviction::{EvictionStats, PendingPurgeGuard};
 pub(crate) use l1::clone_status;
 pub use spool::BlobSpooler;
 
@@ -76,6 +74,20 @@ pub const MAX_L1_OBJECT_BYTES: usize = 4 * 1024 * 1024;
 /// Default maximum single-object payload spooled into L2 disk CAS (`512 MiB`). Larger blobs
 /// stream directly between client and upstream without caching.
 pub const DEFAULT_MAX_L2_OBJECT_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Computes the effective per-object L2 size cap for a configured `max_disk_cache_bytes` quota.
+///
+/// When `max_disk_cache_bytes == 0` (automatic L2 eviction disabled), keeps
+/// [`DEFAULT_MAX_L2_OBJECT_BYTES`]. Otherwise caps single objects at the 85% eviction low
+/// watermark so spooling one oversized blob cannot trigger a sweep that wipes older warm entries
+/// and then evicts the blob itself.
+pub fn effective_max_l2_object_bytes(max_disk_cache_bytes: u64) -> u64 {
+    if max_disk_cache_bytes == 0 {
+        DEFAULT_MAX_L2_OBJECT_BYTES
+    } else {
+        DEFAULT_MAX_L2_OBJECT_BYTES.min(eviction::l2_low_watermark_bytes(max_disk_cache_bytes))
+    }
+}
 
 /// Streaming frame size (`64 KiB`) when serving `ReadFile` hits from L1/L2 cache.
 pub const CACHE_STREAM_CHUNK_BYTES: usize = 64 * 1024;
@@ -108,6 +120,18 @@ impl ObjectKind {
             Self::File => "blobs",
             Self::View => "views",
             Self::Operation => "ops",
+        }
+    }
+
+    pub fn from_dir_name(name: &str) -> Option<Self> {
+        match name {
+            "commits" => Some(Self::Commit),
+            "trees" => Some(Self::Tree),
+            "symlinks" => Some(Self::Symlink),
+            "blobs" => Some(Self::File),
+            "views" => Some(Self::View),
+            "ops" => Some(Self::Operation),
+            _ => None,
         }
     }
 
@@ -252,6 +276,10 @@ pub struct CacheStatsSnapshot {
     pub l1_bytes: usize,
     pub l1_entries: usize,
     pub l2_write_errors: u64,
+    #[serde(default)]
+    pub l2_evicted_objects: u64,
+    #[serde(default)]
+    pub l2_evicted_bytes: u64,
 }
 
 impl CacheStatsSnapshot {
@@ -287,6 +315,11 @@ struct CacheInner {
     write_through_objects: AtomicU64,
     upstream_rpcs: AtomicU64,
     l2_write_errors: AtomicU64,
+    l2_evicted_objects: AtomicU64,
+    l2_evicted_bytes: AtomicU64,
+    l2_bytes_written_since_sweep: AtomicU64,
+    l2_sweep_trigger_bytes: AtomicU64,
+    l2_eviction_notify: Notify,
     started_at: Instant,
     last_activity_elapsed_ms: AtomicU64,
 }
@@ -361,6 +394,11 @@ impl TwoTierCache {
                 write_through_objects: AtomicU64::new(0),
                 upstream_rpcs: AtomicU64::new(0),
                 l2_write_errors: AtomicU64::new(0),
+                l2_evicted_objects: AtomicU64::new(0),
+                l2_evicted_bytes: AtomicU64::new(0),
+                l2_bytes_written_since_sweep: AtomicU64::new(0),
+                l2_sweep_trigger_bytes: AtomicU64::new(0),
+                l2_eviction_notify: Notify::new(),
                 started_at: Instant::now(),
                 last_activity_elapsed_ms: AtomicU64::new(0),
             }),
@@ -434,6 +472,8 @@ impl TwoTierCache {
             l1_bytes: l1.current_bytes,
             l1_entries: l1.map.len(),
             l2_write_errors: self.inner.l2_write_errors.load(Ordering::Relaxed),
+            l2_evicted_objects: self.inner.l2_evicted_objects.load(Ordering::Relaxed),
+            l2_evicted_bytes: self.inner.l2_evicted_bytes.load(Ordering::Relaxed),
         }
     }
 

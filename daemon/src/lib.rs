@@ -16,24 +16,23 @@
 //!
 //! # Authority and Crash-Safety Ordering
 //! jj-cc-daemon exposes `BackendService`, `OpStoreService`, and `WorkspaceService` over a
-//! `0600` per-user Unix socket inside a `0700` state directory (or loopback TCP authenticated
-//! by the random secret in `daemon.json`). Discovery-enabled daemons hold an exclusive
-//! non-blocking `daemon.instance.lock` (`0600`) across their lifetime, publish `daemon.json`
-//! atomically after binding listeners, and remove discovery files on exit only while owned by
-//! this instance (`pid` and `started_unix_secs`) and matching the bound socket inode.
+//! `0600` per-user Unix socket (canonicalized and bounded to POSIX `sun_path` limits) inside
+//! a `0700` state directory, or secret-authenticated loopback TCP. Discovery-enabled daemons
+//! hold `daemon.instance.lock` (`0600`), publish `daemon.json` (`fchmod(0600)`) with
+//! `wire_version` after binding, and remove discovery files on exit only while owned.
 //!
 //! # Concurrency and Merge Invariants
 //! Unary immutable object reads (`Commit`, `Tree`, `Symlink`, `View`, and `Operation`) cache
-//! across L1 RAM and L2 disk CAS with singleflight miss coalescing, while full cold `ReadFile`
-//! misses stream directly through `BlobSpooler` without singleflight coalescing (and writes
-//! populate the cache on success for all kinds except `Commit`). Mutable coordination RPCs
-//! (`GetOpHeads`, `UpdateOpHeads`, `ReconcileOpHeads`, `PublishOperation`, and
-//! `WorkspaceService`) forward straight to jj-cc-server so convergence stays linearizable.
+//! across L1 RAM and L2 disk CAS with singleflight miss coalescing and background L2 disk-quota
+//! LRU eviction, while full cold `ReadFile` misses stream directly through `BlobSpooler` without
+//! singleflight coalescing (and writes populate the cache on success for all kinds except
+//! `Commit`). Mutable coordination RPCs forward straight to jj-cc-server so convergence stays
+//! linearizable.
 //!
 //! # Cross-Process and RPC Boundaries
-//! Clients specify their target `server_url` per call via the `x-jj-cc-upstream` metadata
-//! header (or fall back to `--upstream`), allowing a single background daemon per user to
-//! serve multiple local workspaces and jj-vfs mounts across local and cloud servers.
+//! Clients route per call via `x-jj-cc-upstream` (or `--upstream`) and negotiate protocol
+//! compatibility via `x-jj-cc-daemon-wire-version` (mismatched or duplicate headers fail
+//! with `FAILED_PRECONDITION`, while omitted headers stay backward-compatible).
 
 #![allow(clippy::result_large_err)]
 
@@ -65,6 +64,10 @@ use crate::upstream::UpstreamPool;
 
 /// Maximum gRPC message size (`64 MiB`) matching `jj-cc-server`.
 pub use cc_common::MAX_GRPC_MESSAGE_BYTES;
+pub use cc_common::{DAEMON_WIRE_VERSION, DAEMON_WIRE_VERSION_HEADER, DAEMON_WIRE_VERSION_STR};
+
+/// Default L2 disk cache quota in MiB (`10 GiB`). `0` disables automatic L2 disk-quota eviction.
+pub const DEFAULT_MAX_DISK_CACHE_MB: u64 = 10_240;
 
 /// Metadata header carrying [`DaemonRuntimeInfo::secret`], required on the TCP listener.
 pub const DAEMON_SECRET_HEADER: &str = "x-jj-cc-daemon-secret";
@@ -81,6 +84,9 @@ pub struct DaemonRuntimeInfo {
     /// Random per-daemon secret that TCP clients send in [`DAEMON_SECRET_HEADER`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
+    /// Wire protocol version spoken by this daemon instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_version: Option<u32>,
 }
 
 impl std::fmt::Debug for DaemonRuntimeInfo {
@@ -94,6 +100,7 @@ impl std::fmt::Debug for DaemonRuntimeInfo {
             .field("default_upstream", &self.default_upstream)
             .field("started_unix_secs", &self.started_unix_secs)
             .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
+            .field("wire_version", &self.wire_version)
             .finish()
     }
 }
@@ -107,6 +114,7 @@ pub struct DaemonConfig {
     pub default_upstream: Option<String>,
     pub allowed_upstreams: Vec<String>,
     pub memory_cache_mb: usize,
+    pub max_disk_cache_mb: u64,
     pub idle_timeout_secs: u64,
     /// Whether to lock `state_dir` and maintain `daemon.json` / `daemon.stats.json`.
     /// Disabled for legacy `--socket`-only invocations without `--state-dir` so ad-hoc sockets
@@ -187,9 +195,12 @@ pub async fn run_daemon(
 
     let tcp_secret: Arc<str> = generate_daemon_secret()?.into();
 
-    let cache = Arc::new(TwoTierCache::new(
+    let max_disk_cache_bytes = config.max_disk_cache_mb.saturating_mul(1024 * 1024);
+    let max_l2_object_bytes = crate::cache::effective_max_l2_object_bytes(max_disk_cache_bytes);
+    let cache = Arc::new(TwoTierCache::new_with_l2_object_cap(
         config.cache_dir.clone(),
         config.memory_cache_mb.saturating_mul(1024 * 1024),
+        max_l2_object_bytes,
     )?);
     let upstream = Arc::new(UpstreamPool::with_allowlist(
         config.default_upstream.clone(),
@@ -246,6 +257,9 @@ pub async fn run_daemon(
 
     #[cfg(unix)]
     if let Some(sock_path) = &config.socket_path {
+        // Fail fast before creating any missing parent directory if the canonicalized path
+        // already exceeds POSIX `sun_path` limits.
+        cc_common::resolve_unix_socket_path_or_ancestors(sock_path)?;
         // Create a missing parent privately, but never change the mode of an existing
         // directory that `--socket` names.
         if let Some(parent) = sock_path.parent()
@@ -253,6 +267,8 @@ pub async fn run_daemon(
         {
             create_private_dir_all(parent)?;
         }
+        let resolved_sock_path = cc_common::resolve_unix_socket_path(sock_path)?;
+        let sock_path = resolved_sock_path.as_path();
         if let Ok(meta) = fs::symlink_metadata(sock_path) {
             use std::os::unix::fs::FileTypeExt;
             let file_type = meta.file_type();
@@ -307,6 +323,7 @@ pub async fn run_daemon(
                     default_upstream: config.default_upstream.clone(),
                     started_unix_secs,
                     secret: bound_tcp.as_ref().map(|_| tcp_secret.to_string()),
+                    wire_version: Some(DAEMON_WIRE_VERSION),
                 },
             )?;
             startup_sock_guard.disarm();
@@ -342,10 +359,17 @@ pub async fn run_daemon(
 
         const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let shutdown_tx = Arc::new(shutdown_tx);
+        let shutdown_tx_trigger = Arc::clone(&shutdown_tx);
         let shutdown_trigger = tokio::spawn(async move {
             shutdown_signal.await;
-            let _ = shutdown_tx.send(true);
+            let _ = shutdown_tx_trigger.send(true);
         });
+        let eviction_proxy = proxy.clone();
+        let eviction_task =
+            cache.spawn_l2_eviction_task(max_disk_cache_bytes, shutdown_rx.clone(), move || {
+                eviction_proxy.maybe_flush_stats()
+            });
 
         let router = build_router(&proxy, health_service.clone(), None);
         let tcp_proxy = proxy.clone();
@@ -381,7 +405,17 @@ pub async fn run_daemon(
                 tokio::time::sleep(SHUTDOWN_DRAIN_TIMEOUT).await;
             } => Ok(()),
         };
+        let _ = shutdown_tx.send(true);
         shutdown_trigger.abort();
+        if let Some(task) = eviction_task {
+            let abort_handle = task.abort_handle();
+            if tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .is_err()
+            {
+                abort_handle.abort();
+            }
+        }
 
         if let Some((info_path, _)) = &discovery_paths {
             let should_flush =
@@ -421,16 +455,24 @@ pub async fn run_daemon(
             default_upstream: config.default_upstream.clone(),
             started_unix_secs,
             secret: Some(tcp_secret.to_string()),
+            wire_version: Some(DAEMON_WIRE_VERSION),
         },
     )?;
     proxy.flush_stats_now();
 
     const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let shutdown_tx = Arc::new(shutdown_tx);
+    let shutdown_tx_trigger = Arc::clone(&shutdown_tx);
     let shutdown_trigger = tokio::spawn(async move {
         shutdown_signal.await;
-        let _ = shutdown_tx.send(true);
+        let _ = shutdown_tx_trigger.send(true);
     });
+    let eviction_proxy = proxy.clone();
+    let eviction_task =
+        cache.spawn_l2_eviction_task(max_disk_cache_bytes, shutdown_rx.clone(), move || {
+            eviction_proxy.maybe_flush_stats()
+        });
     let mut rx_tcp = shutdown_rx.clone();
     let mut rx_drain = shutdown_rx;
     let tcp_incoming = futures::stream::unfold(tcp_listener, |l| async move {
@@ -448,7 +490,17 @@ pub async fn run_daemon(
             tokio::time::sleep(SHUTDOWN_DRAIN_TIMEOUT).await;
         } => Ok(()),
     };
+    let _ = shutdown_tx.send(true);
     shutdown_trigger.abort();
+    if let Some(task) = eviction_task {
+        let abort_handle = task.abort_handle();
+        if tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .is_err()
+        {
+            abort_handle.abort();
+        }
+    }
 
     let should_flush =
         !info_path.exists() || runtime_info_is_owned(&info_path, pid, started_unix_secs);
@@ -458,30 +510,56 @@ pub async fn run_daemon(
     Ok(())
 }
 
-/// Requires [`DAEMON_SECRET_HEADER`] to match `expected` when set (the TCP listener). Unix
-/// socket clients are authenticated by the socket and state directory permissions instead.
-#[derive(Clone)]
-struct DaemonSecretCheck {
-    expected: Option<Arc<str>>,
+/// Validates the optional [`DAEMON_WIRE_VERSION_HEADER`] metadata header on inbound requests.
+///
+/// Missing headers are permitted for backward compatibility with legacy clients and unversioned
+/// health probes (including `jj cc daemon stop`). Duplicate, non-ASCII, or mismatched header
+/// values fail with `FAILED_PRECONDITION` and instruct the user to restart the daemon.
+pub fn validate_daemon_wire_version(
+    metadata: &tonic::metadata::MetadataMap,
+) -> Result<(), tonic::Status> {
+    let mut values = metadata.get_all(DAEMON_WIRE_VERSION_HEADER).iter();
+    match (values.next(), values.next()) {
+        (None, _) => Ok(()),
+        (Some(_), Some(_)) => Err(tonic::Status::failed_precondition(format!(
+            "CLI/daemon wire version mismatch: duplicate {DAEMON_WIRE_VERSION_HEADER} headers (expected {DAEMON_WIRE_VERSION_STR}); run `jj cc daemon stop` to restart the daemon"
+        ))),
+        (Some(val), None) => match val.to_str() {
+            Ok(v) if v == DAEMON_WIRE_VERSION_STR => Ok(()),
+            Ok(other) => Err(tonic::Status::failed_precondition(format!(
+                "CLI/daemon wire version mismatch: client sent wire version '{other}', but jj-cc-daemon expects '{DAEMON_WIRE_VERSION_STR}'; run `jj cc daemon stop` to restart the daemon"
+            ))),
+            Err(_) => Err(tonic::Status::failed_precondition(format!(
+                "CLI/daemon wire version mismatch: invalid non-ASCII {DAEMON_WIRE_VERSION_HEADER} header (expected {DAEMON_WIRE_VERSION_STR}); run `jj cc daemon stop` to restart the daemon"
+            ))),
+        },
+    }
 }
 
-impl tonic::service::Interceptor for DaemonSecretCheck {
+/// Validates [`DAEMON_SECRET_HEADER`] (when configured on the TCP listener) and enforces
+/// [`validate_daemon_wire_version`] on inbound requests. Unix socket clients are authenticated
+/// by socket/directory permissions and peer UID checks instead of a shared secret.
+#[derive(Clone)]
+struct DaemonRequestCheck {
+    expected_secret: Option<Arc<str>>,
+}
+
+impl tonic::service::Interceptor for DaemonRequestCheck {
     fn call(&mut self, request: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
-        let Some(expected) = &self.expected else {
-            return Ok(request);
-        };
-        let mut headers = request.metadata().get_all(DAEMON_SECRET_HEADER).iter();
-        let presented = match (headers.next(), headers.next()) {
-            (Some(v), None) => Some(v.as_bytes()),
-            _ => None,
-        };
-        if presented.is_some_and(|p| constant_time_eq(p, expected.as_bytes())) {
-            Ok(request)
-        } else {
-            Err(tonic::Status::unauthenticated(format!(
-                "missing or invalid {DAEMON_SECRET_HEADER} metadata"
-            )))
+        if let Some(expected) = &self.expected_secret {
+            let mut headers = request.metadata().get_all(DAEMON_SECRET_HEADER).iter();
+            let presented = match (headers.next(), headers.next()) {
+                (Some(v), None) => Some(v.as_bytes()),
+                _ => None,
+            };
+            if !presented.is_some_and(|p| constant_time_eq(p, expected.as_bytes())) {
+                return Err(tonic::Status::unauthenticated(format!(
+                    "missing or invalid {DAEMON_SECRET_HEADER} metadata"
+                )));
+            }
         }
+        validate_daemon_wire_version(request.metadata())?;
+        Ok(request)
     }
 }
 
@@ -509,8 +587,8 @@ fn build_router(
     >,
     required_secret: Option<Arc<str>>,
 ) -> tonic::transport::server::Router {
-    let check = DaemonSecretCheck {
-        expected: required_secret,
+    let check = DaemonRequestCheck {
+        expected_secret: required_secret,
     };
     Server::builder()
         .add_service(InterceptedService::new(health_service, check.clone()))
@@ -672,6 +750,11 @@ fn write_runtime_info(path: &Path, info: &DaemonRuntimeInfo) -> std::io::Result<
         }
         {
             let mut file = options.open(&tmp)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            }
             file.write_all(&bytes)?;
             file.sync_all()?;
         }
@@ -702,7 +785,7 @@ fn acquire_state_dir_lock(state_dir: &Path) -> std::io::Result<fs::File> {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let mode = file.metadata()?.permissions().mode() & 0o777;
+                let mode = file.metadata()?.permissions().mode() & 0o7777;
                 if mode != 0o600 {
                     file.set_permissions(fs::Permissions::from_mode(0o600))?;
                 }

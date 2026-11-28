@@ -131,7 +131,7 @@ impl DaemonProxy {
         &self,
         request: Request<ReadTreeRequest>,
     ) -> Result<Response<ReadTreeResponse>, Status> {
-        let _active = self.track_active_rpc();
+        let _active = self.begin_rpc(request.metadata())?;
         let meta = request.metadata().clone();
         let req = request.into_inner();
         let scope = self.scope_for(&meta, &req.project_id)?;
@@ -408,7 +408,7 @@ impl DaemonProxy {
         &self,
         request: Request<WriteTreeRequest>,
     ) -> Result<Response<WriteTreeResponse>, Status> {
-        let _active = self.track_active_rpc();
+        let _active = self.begin_rpc(request.metadata())?;
         let meta = request.metadata().clone();
         let req = request.into_inner();
         let scope = self.scope_for(&meta, &req.project_id)?;
