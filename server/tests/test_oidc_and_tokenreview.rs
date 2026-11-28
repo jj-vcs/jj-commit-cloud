@@ -2072,7 +2072,6 @@ async fn real_services_persist_actor_attribution_and_enforce_repo_suffix() {
         .delete_workspace(with_bearer(
             DeleteWorkspaceRequest {
                 repo_id: "1234abcd_oss-demo_coder-2".to_string(),
-                user: "alice".to_string(),
                 workspace_name: "default".to_string(),
             },
             &actor_jwt,

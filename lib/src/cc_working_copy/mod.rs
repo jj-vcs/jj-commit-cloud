@@ -24,13 +24,14 @@
 //! new workspace name before deleting the previous record.
 //!
 //! # Concurrency and Merge Invariants
-//! Keyed by `(repo_id, user, workspace_name)`. `start_mutation()` reloads the workspace
-//! name after `working_copy.lock` is acquired. `finish()` persists local state and unlocks
-//! `working_copy.lock` first, then acquires `cc_sync.lock` off-executor and reloads on-disk
-//! state before issuing bounded (`WORKSPACE_SYNC_TIMEOUT`) `UpdateWorkspace` and rename
-//! `DeleteWorkspace` RPCs. Superseded publishes are skipped (while still deleting stale
-//! renamed names absent from disk); lock, reload, or RPC errors warn without aborting local
-//! persistence. Conflicted checkouts preserve all `Merge<TreeId>` sides in `tree_ids`.
+//! Keyed by `(repo_id, workspace_name)` with `user` stored as a mutable non-key attribute.
+//! `start_mutation()` reloads the workspace name after `working_copy.lock` is acquired.
+//! `finish()` persists local state and unlocks `working_copy.lock` first, then acquires
+//! `cc_sync.lock` off-executor and reloads on-disk state before issuing bounded
+//! (`WORKSPACE_SYNC_TIMEOUT`) `UpdateWorkspace` and rename `DeleteWorkspace` RPCs. Superseded
+//! publishes are skipped (while still deleting stale renamed names absent from disk); lock,
+//! reload, or RPC errors warn without aborting local persistence. Conflicted checkouts preserve
+//! all `Merge<TreeId>` sides in `tree_ids`.
 //!
 //! # Cross-Process and RPC Boundaries
 //! Always dispatches RPCs onto `SHARED_RUNTIME` via [`crate::util::run_on_tokio`] so pooled
@@ -320,13 +321,9 @@ impl LockedWorkingCopy for LockedCommitCloudWorkingCopy {
                 _sync_lock,
                 old_name,
             } => {
-                if let Err(err) = delete_stale_renamed_workspace(
-                    config.clone(),
-                    user.clone(),
-                    old_name.clone(),
-                    sync_timeout,
-                )
-                .await
+                if let Err(err) =
+                    delete_stale_renamed_workspace(config.clone(), old_name.clone(), sync_timeout)
+                        .await
                 {
                     tracing::warn!(
                         "Failed to remove renamed workspace '{old_name}' from WorkspaceService: {err}"
@@ -549,7 +546,6 @@ async fn publish_workspace_state(
             && let Err(del_err) = client
                 .delete_workspace(DeleteWorkspaceRequest {
                     repo_id,
-                    user,
                     workspace_name: old_name.clone(),
                 })
                 .await
@@ -570,7 +566,6 @@ async fn publish_workspace_state(
 
 async fn delete_stale_renamed_workspace(
     config: CommitCloudConfig,
-    user: String,
     old_name: String,
     sync_timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -580,7 +575,6 @@ async fn delete_stale_renamed_workspace(
             client
                 .delete_workspace(DeleteWorkspaceRequest {
                     repo_id: config.repo_id,
-                    user,
                     workspace_name: old_name,
                 })
                 .await?;
@@ -613,16 +607,18 @@ impl CommitCloudWorkingCopyFactory {
     }
 }
 
-pub fn resolve_user(settings: &UserSettings) -> Result<String, WorkingCopyStateError> {
+/// Resolves the non-prescriptive mutable `WorkspaceState.user` attribute from user settings:
+/// returns `user.email` if non-empty, else falls back to `user.name`, else empty string `""`.
+pub fn resolve_user(settings: &UserSettings) -> String {
     let email = settings.user_email().trim();
     if !email.is_empty() {
-        Ok(email.to_string())
-    } else {
-        Err(WorkingCopyStateError {
-            message: "User email (user.email) is not configured in user settings. Run `jj config set --user user.email <email>`".to_string(),
-            err: "User email missing".into(),
-        })
+        return email.to_string();
     }
+    let name = settings.user_name().trim();
+    if !name.is_empty() {
+        return name.to_string();
+    }
+    String::new()
 }
 
 fn extract_tree_state(wc: &dyn WorkingCopy) -> Result<TreeStateSnapshot, WorkingCopyStateError> {
@@ -661,7 +657,7 @@ impl WorkingCopyFactory for CommitCloudWorkingCopyFactory {
         workspace_name: WorkspaceNameBuf,
         settings: &UserSettings,
     ) -> Result<Box<dyn WorkingCopy>, WorkingCopyStateError> {
-        let user = resolve_user(settings)?;
+        let user = resolve_user(settings);
         let reload_context = Some(LocalReloadContext {
             store: store.clone(),
             working_copy_path: working_copy_path.clone(),
@@ -723,7 +719,7 @@ impl WorkingCopyFactory for CommitCloudWorkingCopyFactory {
         state_path: PathBuf,
         settings: &UserSettings,
     ) -> Result<Box<dyn WorkingCopy>, WorkingCopyStateError> {
-        let user = resolve_user(settings)?;
+        let user = resolve_user(settings);
         let reload_context = Some(LocalReloadContext {
             store: store.clone(),
             working_copy_path: working_copy_path.clone(),

@@ -407,7 +407,6 @@ pub trait MetadataStore: Send + Sync {
     async fn get_workspace(
         &self,
         repo_id: &str,
-        user: &str,
         workspace_name: &str,
     ) -> StoreResult<Option<WorkspaceState>>;
     async fn put_workspace(&self, workspace: &WorkspaceState) -> StoreResult<()> {
@@ -431,13 +430,14 @@ pub trait MetadataStore: Send + Sync {
         require_operation_exists: bool,
     ) -> StoreResult<()>;
     async fn list_workspaces(&self, repo_id: &str) -> StoreResult<Vec<WorkspaceState>>;
-    /// Returns up to `limit` workspaces strictly after `after` in `(user, workspace_name)` order,
-    /// stopping early once adding another record would exceed `max_bytes` (always returning at
-    /// least one record when one exists) alongside a `has_more` flag.
+    /// Returns up to `limit` workspaces strictly after `after_workspace_name` in
+    /// `workspace_name` UTF-8 byte order, stopping early once adding another record would exceed
+    /// `max_bytes` (always returning at least one record when one exists) alongside a `has_more`
+    /// flag.
     async fn list_workspaces_page(
         &self,
         repo_id: &str,
-        after: Option<(&str, &str)>,
+        after_workspace_name: Option<&str>,
         limit: usize,
         max_bytes: Option<usize>,
     ) -> StoreResult<(Vec<WorkspaceState>, bool)> {
@@ -447,11 +447,9 @@ pub trait MetadataStore: Send + Sync {
             return Ok((Vec::new(), false));
         }
         let mut all = self.list_workspaces(repo_id).await?;
-        all.sort_by(|a, b| (&a.user, &a.workspace_name).cmp(&(&b.user, &b.workspace_name)));
-        let iter = all.into_iter().filter(|w| match after {
-            Some((after_user, after_ws)) => {
-                (w.user.as_str(), w.workspace_name.as_str()) > (after_user, after_ws)
-            }
+        all.sort_by(|a, b| a.workspace_name.cmp(&b.workspace_name));
+        let iter = all.into_iter().filter(|w| match after_workspace_name {
+            Some(after_ws) => w.workspace_name.as_str() > after_ws,
             None => true,
         });
         let mut page = Vec::new();
@@ -472,12 +470,7 @@ pub trait MetadataStore: Send + Sync {
         }
         Ok((page, has_more))
     }
-    async fn delete_workspace(
-        &self,
-        repo_id: &str,
-        user: &str,
-        workspace_name: &str,
-    ) -> StoreResult<bool>;
+    async fn delete_workspace(&self, repo_id: &str, workspace_name: &str) -> StoreResult<bool>;
 }
 
 /// Bounded read window (4 MiB) used by the default [`BlobStore::get_blob_range_stream`]

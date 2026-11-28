@@ -19,28 +19,38 @@ package commit_cloud.workspace;
 // Cloud-tracked workspace and working-copy state service backing
 // `CommitCloudWorkingCopy` and virtual filesystem workspace mounts.
 //
+// Primary Key & Identity Model:
+// - Workspace records are keyed solely by `(repo_id, workspace_name)`, matching
+//   `jj_lib`'s `View.wc_commit_ids` map and preventing collaborators on one
+//   repository from registering colliding workspace names.
+// - `WorkspaceState.user` is a mutable non-key attribute accepting arbitrary
+//   non-prescriptive human, agent, service-account, or empty identifiers (do
+//   not require email format).
+//
 // Ordering, Idempotency & Isolation Contract:
 // - Clients MUST persist any non-root `Operation` (and its `View`), non-root
 //   `Commit`, and non-empty `Tree` records before calling `UpdateWorkspace`.
 // - When `UpdateWorkspaceRequest.expected_operation_id` is omitted,
 //   `UpdateWorkspace` executes as an idempotent last-writer-wins upsert keyed
-//   by `(repo_id, user, workspace_name)` (suitable when writers serialize
-//   locally via `.jj/working_copy/working_copy.lock`). When
-//   `expected_operation_id` is set, `UpdateWorkspace` executes an atomic
-//   compare-and-swap under serializable isolation (`b""` requires the record to
-//   be absent; a 16-byte `OperationId` requires an existing record with that
-//   normalized `operation_id`), succeeding idempotently when the persisted
-//   record already matches the normalized target state and returning `ABORTED`
-//   on concurrent conflict. Because the precondition compares `operation_id`,
-//   it guards transitions that advance `operation_id`; concurrent updates that
-//   retain the same `operation_id` (such as same-operation sparse-pattern
-//   changes) both satisfy the precondition and follow last-writer-wins.
-// - `CheckWorkingCopyChanges` reads committed workspace and commit records, and
-//   `ListWorkspaces` uses keyset cursor resumption strictly after `(user,
-//   workspace_name)`.
+//   by `(repo_id, workspace_name)` (suitable when writers serialize locally via
+//   `.jj/working_copy/working_copy.lock`), updating `user` along with checkout
+//   fields. When `expected_operation_id` is set, `UpdateWorkspace` executes an
+//   atomic compare-and-swap under serializable isolation (`b""` requires the
+//   record to be absent; a 16-byte `OperationId` requires an existing record
+//   with that normalized `operation_id`), succeeding idempotently when the
+//   persisted record already equals the full normalized target `WorkspaceState`
+//   (including `user`), updating `user` and checkout fields on a valid CAS, and
+//   returning `ABORTED` on concurrent conflict. Because the precondition
+//   compares `operation_id`, it guards transitions that advance `operation_id`;
+//   concurrent updates that retain the same `operation_id` (such as
+//   same-operation sparse-pattern or `user` updates) both satisfy the
+//   precondition and follow last-writer-wins.
+// - `CheckWorkingCopyChanges` reads committed workspace and commit records for
+//   `(repo_id, workspace_name)`, and `ListWorkspaces` uses keyset cursor
+//   resumption strictly after `workspace_name` in UTF-8 / `COLLATE "C"` byte
+//   order.
 // - `DeleteWorkspace` is advisory and idempotent, returning `OK` with
-//   `existed = false` when `(repo_id, user, workspace_name)` or `repo_id` is
-//   absent.
+//   `existed = false` when `(repo_id, workspace_name)` or `repo_id` is absent.
 //
 // Status Codes:
 // - `UNAUTHENTICATED`: Server requires authentication (static Bearer token,
@@ -53,26 +63,25 @@ package commit_cloud.workspace;
 // - `NOT_FOUND`: `repo_id` is unregistered on `GetWorkspace`, `UpdateWorkspace`,
 //   `ListWorkspaces`, or `CheckWorkingCopyChanges`, or `CheckWorkingCopyChanges`
 //   targets an unknown workspace or commit. `GetWorkspace` returns `OK` with
-//   `workspace = None` when `repo_id` is registered but `(user, workspace_name)`
-//   does not exist.
+//   `workspace = None` when `repo_id` is registered but `workspace_name` does
+//   not exist.
 // - `INVALID_ARGUMENT`: Missing `workspace` payload; empty or invalid `repo_id`
 //   (`1..=128` ASCII `[A-Za-z0-9._-]`, excluding `"."` and `".."`); empty
 //   `workspace_name`, or a non-empty `user` or `workspace_name` that is
 //   whitespace-only, exceeds 256 bytes, or contains control characters
-//   (including `'\0'`; `'/'` is permitted to match upstream `jj` workspace
-//   names such as `feature/foo`, and `user == ""` is valid for single-user or
-//   unauthenticated checkouts and is matched literally as part of the key); invalid digest byte lengths on
-//   `commit_id`, `operation_id`, `expected_operation_id`, `tree_id`, or
-//   `tree_ids`; empty resolved
+//   (including `'\0'`; `'/'` is permitted in `workspace_name` to match upstream
+//   `jj` workspace names such as `feature/foo`, and `user` is non-prescriptive
+//   and accepts arbitrary human, agent, service-account, or empty `""`
+//   identifiers); invalid digest byte lengths on `commit_id`, `operation_id`,
+//   `expected_operation_id`, `tree_id`, or `tree_ids`; empty resolved
 //   `commit_id`; requests where both `tree_id` and `tree_ids` are empty, where
 //   both are non-empty and `tree_id != tree_ids[0]`, or where `tree_ids` has an
 //   even length or exceeds 1,025 terms; `conflict_labels` containing `'\n'`,
 //   having a mismatched count, or exceeding 64 KiB of combined UTF-8 bytes;
-//   malformed `RepoPath` internal strings in
-//   `sparse_patterns` (leading or trailing `'/'`, `"//"`, `'\0'`, any
-//   `'/'`-delimited component equal to `"."` or `".."`, more than 4,096
-//   entries, or more than 256 KiB of combined UTF-8 bytes); or malformed
-//   `ListWorkspacesRequest.page_token`.
+//   malformed `RepoPath` internal strings in `sparse_patterns` (leading or
+//   trailing `'/'`, `"//"`, `'\0'`, any `'/'`-delimited component equal to `"."`
+//   or `".."`, more than 4,096 entries, or more than 256 KiB of combined UTF-8
+//   bytes); or malformed `ListWorkspacesRequest.page_token`.
 // - `FAILED_PRECONDITION`: `UpdateWorkspace` specifies a non-empty, non-root
 //   `operation_id` whose `Operation` or non-root `View` has not been persisted
 //   yet, a non-`ROOT_COMMIT_ID` resolved `commit_id` absent from the
@@ -82,49 +91,53 @@ package commit_cloud.workspace;
 //   or `CheckWorkingCopyChanges`.
 // - `ABORTED`: `UpdateWorkspace` specified `expected_operation_id`, and the
 //   persisted workspace record neither matched `expected_operation_id` nor
-//   equaled the normalized target `WorkspaceState`.
+//   equaled the normalized target `WorkspaceState` (including `user`).
 service WorkspaceService {
-  // Reads persisted workspace checkout metadata for `(repo_id, user,
-  // workspace_name)`. Returns `OK` with `workspace = None` when absent.
+  // Reads persisted workspace checkout metadata for `(repo_id, workspace_name)`.
+  // Returns `OK` with `workspace = None` when absent.
   rpc GetWorkspace(GetWorkspaceRequest) returns (GetWorkspaceResponse);
 
-  // Upserts workspace checkout metadata (`commit_id`, `operation_id`, `tree_id`
-  // / `tree_ids`, `conflict_labels`, and `sparse_patterns`) after a local or
-  // VFS working-copy transaction finishes.
+  // Upserts workspace checkout metadata (`user`, `commit_id`, `operation_id`,
+  // `tree_id` / `tree_ids`, `conflict_labels`, and `sparse_patterns`) keyed by
+  // `(repo_id, workspace_name)` after a local or VFS working-copy transaction
+  // finishes.
   rpc UpdateWorkspace(UpdateWorkspaceRequest) returns (UpdateWorkspaceResponse);
 
   // Lists registered workspaces in `repo_id` ordered lexicographically by
-  // `(user, workspace_name)`, with cursor pagination via `page_size` (`0` uses
-  // the server default, clamped to a server-configured ceiling and a 2 MiB
-  // serialized page byte budget, always returning at least one record) and
-  // `page_token`.
+  // `workspace_name` (UTF-8 / `COLLATE "C"` byte order), with cursor pagination
+  // via `page_size` (`0` uses the server default, clamped to a
+  // server-configured ceiling and a 2 MiB serialized page byte budget, always
+  // returning at least one record) and `page_token`.
   rpc ListWorkspaces(ListWorkspacesRequest) returns (ListWorkspacesResponse);
 
   // Compares the workspace's recorded `Merge<TreeId>` terms against
   // `WorkspaceState.commit_id`'s root tree (synthesizing `[EMPTY_TREE_ID]` when
-  // `commit_id == ROOT_COMMIT_ID`, and preserving conflicted checkout sides).
-  // The server only sees recorded snapshots, so edits that no jj command has
-  // snapshotted yet are not detected.
+  // `commit_id == ROOT_COMMIT_ID`, and preserving conflicted checkout sides)
+  // for `(repo_id, workspace_name)`. The server only sees recorded snapshots,
+  // so edits that no jj command has snapshotted yet are not detected.
   rpc CheckWorkingCopyChanges(CheckWorkingCopyChangesRequest)
       returns (CheckWorkingCopyChangesResponse);
 
-  // Removes a workspace record from `repo_id`.
+  // Removes a workspace record keyed by `(repo_id, workspace_name)`.
   rpc DeleteWorkspace(DeleteWorkspaceRequest) returns (DeleteWorkspaceResponse);
 }
 
 message WorkspaceState {
   string repo_id = 1;
+  // Mutable non-key user identifier (optional, non-prescriptive UTF-8 string up
+  // to 256 bytes accepting human, agent, service-account, or empty identifiers).
   string user = 2;
+  // Repository-scoped workspace name (matches `View.wc_commit_ids` keys).
   string workspace_name = 3;
   // The workspace's `@` commit. Missing non-root `Operation` or non-root `View`
   // dependencies always fail first with `FAILED_PRECONDITION`. When `commit_id`
   // is non-empty, that explicit client value is authoritative (preserving
-  // multi-user `(user, workspace_name)` checkouts and two-phase VFS snapshots).
-  // When `commit_id` is empty: if `operation_id` is empty or
-  // `ROOT_OPERATION_ID`, `UpdateWorkspace` defaults `commit_id` to
-  // `ROOT_COMMIT_ID`; otherwise `UpdateWorkspace` derives `commit_id` from the
-  // persisted operation's `View.wc_commit_ids[workspace_name]` (returning
-  // `INVALID_ARGUMENT` if that `View` has no entry for `workspace_name`).
+  // two-phase VFS snapshots and explicit overrides). When `commit_id` is empty:
+  // if `operation_id` is empty or `ROOT_OPERATION_ID`, `UpdateWorkspace`
+  // defaults `commit_id` to `ROOT_COMMIT_ID`; otherwise `UpdateWorkspace`
+  // derives `commit_id` from the persisted operation's
+  // `View.wc_commit_ids[workspace_name]` (returning `INVALID_ARGUMENT` if that
+  // `View` has no entry for `workspace_name`).
   bytes commit_id = 4;
   // Last reconciled 16-byte `OperationId` (`b""` normalizes to
   // `ROOT_OPERATION_ID` in persisted and returned records).
@@ -163,8 +176,9 @@ message WorkspaceState {
 }
 
 message GetWorkspaceRequest {
+  reserved 2;
+  reserved "user";
   string repo_id = 1;
-  string user = 2;
   string workspace_name = 3;
 }
 
@@ -180,9 +194,10 @@ message UpdateWorkspaceRequest {
   // 16-byte `OperationId` (including `ROOT_OPERATION_ID`) to require that the
   // existing record's normalized `operation_id` matches (`ABORTED` on mismatch,
   // idempotent `OK` if the persisted record already equals the normalized
-  // `workspace`). Guards transitions that advance `operation_id`; concurrent
-  // updates that keep the same `operation_id` both satisfy the precondition and
-  // follow last-writer-wins.
+  // `workspace` including `user`). Guards transitions that advance
+  // `operation_id`; concurrent updates that keep the same `operation_id` both
+  // satisfy the precondition and follow last-writer-wins (updating `user` and
+  // checkout fields).
   optional bytes expected_operation_id = 2;
 }
 
@@ -203,7 +218,8 @@ message ListWorkspacesRequest {
   // clamped to a server-configured maximum).
   uint32 page_size = 2;
   // Opaque cursor from a prior `ListWorkspacesResponse.next_page_token`
-  // resuming strictly after the last `(user, workspace_name)` entry.
+  // resuming strictly after the last `workspace_name` entry in UTF-8 /
+  // `COLLATE "C"` byte order.
   string page_token = 3;
 }
 
@@ -214,8 +230,9 @@ message ListWorkspacesResponse {
 }
 
 message CheckWorkingCopyChangesRequest {
+  reserved 2;
+  reserved "user";
   string repo_id = 1;
-  string user = 2;
   string workspace_name = 3;
 }
 
@@ -235,8 +252,9 @@ message CheckWorkingCopyChangesResponse {
 }
 
 message DeleteWorkspaceRequest {
+  reserved 2;
+  reserved "user";
   string repo_id = 1;
-  string user = 2;
   string workspace_name = 3;
 }
 

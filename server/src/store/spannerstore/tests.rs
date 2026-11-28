@@ -502,10 +502,11 @@ fn validate_existing_spanner_ddl_accepts_current_and_rejects_pre_split_poc() {
         "CREATE TABLE `Projects` (ProjectId STRING(128) NOT NULL, Name STRING(256)) PRIMARY KEY(ProjectId)".to_string(),
         "CREATE TABLE Commits (ProjectId STRING(128) NOT NULL, CommitId BYTES(64) NOT NULL, ChangeId BYTES(64) NOT NULL, Generation INT64 NOT NULL, ProtoBytes BYTES(MAX) NOT NULL, InsertedAt TIMESTAMP OPTIONS (allow_commit_timestamp=true)) PRIMARY KEY(ProjectId, CommitId)".to_string(),
         "CREATE TABLE Trees (ProjectId STRING(128) NOT NULL, TreeId BYTES(64) NOT NULL, Ready BOOL NOT NULL) PRIMARY KEY(ProjectId, TreeId)".to_string(),
+        "CREATE TABLE `Workspaces` (`RepoId` STRING(128) NOT NULL, `WorkspaceName` STRING(256) NOT NULL, `User` STRING(256) NOT NULL, CommitId BYTES(64) NOT NULL, OperationId BYTES(64) NOT NULL, TreeId BYTES(64) NOT NULL, TreeIds ARRAY<BYTES(64)> NOT NULL, ConflictLabels ARRAY<STRING(MAX)> NOT NULL, SparsePatterns ARRAY<STRING(MAX)> NOT NULL) PRIMARY KEY(`RepoId`, `WorkspaceName`), INTERLEAVE IN PARENT `Repositories` ON DELETE CASCADE".to_string(),
     ];
     validate_existing_spanner_ddl(&normalized).unwrap();
 
-    // Pre-split PoC markers must fail fast with InvalidArgument.
+    // Pre-split PoC markers and pre-migration Workspaces schemas must fail fast with InvalidArgument.
     let legacy_cases = [
         (
             "legacy repos table",
@@ -532,9 +533,51 @@ fn validate_existing_spanner_ddl_accepts_current_and_rejects_pre_split_poc() {
             ],
         ),
         (
-            "legacy workspaces with user instead of UserEmail",
+            "legacy pre-split PoC lowercase workspaces",
             [
                 "CREATE TABLE workspaces (repo_id STRING(MAX) NOT NULL, user STRING(MAX) NOT NULL, workspace_name STRING(MAX) NOT NULL) PRIMARY KEY(repo_id, user, workspace_name)".to_string(),
+            ],
+        ),
+        (
+            "stale pre-migration Workspaces with UserEmail PK",
+            [
+                "CREATE TABLE Workspaces (RepoId STRING(128) NOT NULL, UserEmail STRING(256) NOT NULL, WorkspaceName STRING(256) NOT NULL) PRIMARY KEY(RepoId, UserEmail, WorkspaceName), INTERLEAVE IN PARENT Repositories ON DELETE CASCADE".to_string(),
+            ],
+        ),
+        (
+            "stale Workspaces with User embedded in PK",
+            [
+                "CREATE TABLE Workspaces (RepoId STRING(128) NOT NULL, User STRING(256) NOT NULL, WorkspaceName STRING(256) NOT NULL) PRIMARY KEY(RepoId, User, WorkspaceName), INTERLEAVE IN PARENT Repositories ON DELETE CASCADE".to_string(),
+            ],
+        ),
+        (
+            "stale Workspaces carrying both User and legacy UserEmail",
+            [
+                "CREATE TABLE Workspaces (RepoId STRING(128) NOT NULL, WorkspaceName STRING(256) NOT NULL, User STRING(256) NOT NULL, UserEmail STRING(256) NOT NULL) PRIMARY KEY(RepoId, WorkspaceName), INTERLEAVE IN PARENT Repositories ON DELETE CASCADE".to_string(),
+            ],
+        ),
+        (
+            "Workspaces missing PRIMARY KEY clause",
+            [
+                "CREATE TABLE Workspaces (RepoId STRING(128) NOT NULL, WorkspaceName STRING(256) NOT NULL, User STRING(256) NOT NULL)".to_string(),
+            ],
+        ),
+        (
+            "Workspaces with empty PRIMARY KEY()",
+            [
+                "CREATE TABLE Workspaces (RepoId STRING(128) NOT NULL, WorkspaceName STRING(256) NOT NULL, User STRING(256) NOT NULL) PRIMARY KEY()".to_string(),
+            ],
+        ),
+        (
+            "Workspaces with OPTIONS tail instead of PRIMARY KEY",
+            [
+                "CREATE TABLE Workspaces (RepoId STRING(128) NOT NULL, WorkspaceName STRING(256) NOT NULL, User STRING(256) NOT NULL) OPTIONS(RepoId, WorkspaceName)".to_string(),
+            ],
+        ),
+        (
+            "Workspaces with malformed PRIMARY KEY followed by OPTIONS parens",
+            [
+                "CREATE TABLE Workspaces (RepoId STRING(128) NOT NULL, WorkspaceName STRING(256) NOT NULL, User STRING(256) NOT NULL) PRIMARY KEY OPTIONS(RepoId, WorkspaceName)".to_string(),
             ],
         ),
     ];
@@ -544,6 +587,19 @@ fn validate_existing_spanner_ddl_accepts_current_and_rejects_pre_split_poc() {
             matches!(err, StoreError::InvalidArgument(_)),
             "{label}: expected InvalidArgument, got {err:?}"
         );
+        if label.contains("UserEmail") {
+            let msg = err.to_string();
+            assert!(
+                msg.contains("UserEmail") && msg.contains("PRIMARY KEY(RepoId, WorkspaceName)"),
+                "{label}: expected actionable UserEmail/PRIMARY KEY migration guidance, got {msg:?}"
+            );
+        } else if label.contains("User embedded in PK") {
+            let msg = err.to_string();
+            assert!(
+                msg.contains("PRIMARY KEY(RepoId, WorkspaceName)"),
+                "{label}: expected PRIMARY KEY migration guidance, got {msg:?}"
+            );
+        }
     }
 
     // Emulator GET /ddl JSON parser handles empty object and statements list.
@@ -647,16 +703,11 @@ fn delete_batch_helpers_clamp_limits_evaluate_project_binding_and_build_key_sets
         DeleteRepoProjectCheck::RepoGone
     );
 
-    let ws_mut = build_workspace_delete_mutation(
-        "repo-del",
-        &[
-            ("alice@example.com".to_string(), "ws-1".to_string()),
-            ("bob@example.com".to_string(), "ws-2".to_string()),
-        ],
-    );
+    let ws_mut =
+        build_workspace_delete_mutation("repo-del", &["ws-1".to_string(), "ws-2".to_string()]);
     let expected_ws_keys = KeySet::builder()
-        .add_key(key!["repo-del", "alice@example.com", "ws-1"])
-        .add_key(key!["repo-del", "bob@example.com", "ws-2"])
+        .add_key(key!["repo-del", "ws-1"])
+        .add_key(key!["repo-del", "ws-2"])
         .build();
     assert_eq!(ws_mut, Mutation::delete("Workspaces", expected_ws_keys));
 

@@ -290,11 +290,12 @@ async fn test_memory_register_project_and_repo_prevent_namespace_shadowing() {
 async fn test_memory_list_workspaces_page_orders_and_paginates_by_keyset() {
     let meta = MemoryMetadataStore::new();
     meta.register_repo("ws-repo", None).await.unwrap();
+    // Distinct users do not affect keyset ordering (ordered strictly by `workspace_name`).
     let keys = [
         ("bob", "ws-2"),
-        ("alice", "ws-b"),
+        ("agent-42", "ws-b"),
         ("alice", "ws-a"),
-        ("bob", "ws-1"),
+        ("", "ws-1"),
     ];
     for (user, ws_name) in keys {
         #[allow(deprecated)]
@@ -329,10 +330,10 @@ async fn test_memory_list_workspaces_page_orders_and_paginates_by_keyset() {
         p1.iter()
             .map(|w| (w.user.as_str(), w.workspace_name.as_str()))
             .collect::<Vec<_>>(),
-        vec![("alice", "ws-a"), ("alice", "ws-b")]
+        vec![("", "ws-1"), ("bob", "ws-2")]
     );
     let (p2, has_more2) = meta
-        .list_workspaces_page("ws-repo", Some(("alice", "ws-b")), 2, None)
+        .list_workspaces_page("ws-repo", Some("ws-2"), 2, None)
         .await
         .unwrap();
     assert!(!has_more2);
@@ -340,10 +341,10 @@ async fn test_memory_list_workspaces_page_orders_and_paginates_by_keyset() {
         p2.iter()
             .map(|w| (w.user.as_str(), w.workspace_name.as_str()))
             .collect::<Vec<_>>(),
-        vec![("bob", "ws-1"), ("bob", "ws-2")]
+        vec![("alice", "ws-a"), ("agent-42", "ws-b")]
     );
     let (p3, has_more3) = meta
-        .list_workspaces_page("ws-repo", Some(("bob", "ws-2")), 2, None)
+        .list_workspaces_page("ws-repo", Some("ws-b"), 2, None)
         .await
         .unwrap();
     assert!(p3.is_empty());

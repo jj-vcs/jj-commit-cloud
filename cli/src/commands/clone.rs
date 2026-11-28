@@ -31,9 +31,7 @@ use cc_lib::cc_backend::CommitCloudBackend;
 use cc_lib::cc_index_store::CommitCloudIndexStore;
 use cc_lib::cc_op_heads_store::CommitCloudOpHeadsStore;
 use cc_lib::cc_op_store::CommitCloudOpStore;
-use cc_lib::cc_working_copy::{
-    CommitCloudWorkingCopy, CommitCloudWorkingCopyFactory, resolve_user,
-};
+use cc_lib::cc_working_copy::{CommitCloudWorkingCopy, CommitCloudWorkingCopyFactory};
 use clap::Parser;
 use jj_cli::cli_util::{CommandHelper, RevisionArg};
 use jj_cli::command_error::{CommandError, cli_error, user_error};
@@ -176,31 +174,22 @@ async fn delete_remote_workspace_records(
     repo_id: &str,
     ws_name: &str,
     working_copy_type: &str,
-    users: &[String],
 ) {
     if working_copy_type == CommitCloudWorkingCopy::name() {
-        let mut seen = std::collections::HashSet::new();
-        for user in users {
-            if !seen.insert(user.as_str()) {
-                continue;
-            }
-            let server_url = server_url.to_string();
-            let repo_id = repo_id.to_string();
-            let user = user.clone();
-            let ws_name_del = ws_name.to_string();
-            let _ = cc_lib::util::run_on_tokio(async move {
-                let mut client = cc_lib::util::connect_workspace_client(server_url).await?;
-                let _ = client
-                    .delete_workspace(cc_common::workspace::DeleteWorkspaceRequest {
-                        repo_id,
-                        user,
-                        workspace_name: ws_name_del,
-                    })
-                    .await;
-                Ok(())
-            })
-            .await;
-        }
+        let server_url = server_url.to_string();
+        let repo_id = repo_id.to_string();
+        let ws_name_del = ws_name.to_string();
+        let _ = cc_lib::util::run_on_tokio(async move {
+            let mut client = cc_lib::util::connect_workspace_client(server_url).await?;
+            let _ = client
+                .delete_workspace(cc_common::workspace::DeleteWorkspaceRequest {
+                    repo_id,
+                    workspace_name: ws_name_del,
+                })
+                .await;
+            Ok(())
+        })
+        .await;
     }
 }
 
@@ -210,7 +199,6 @@ pub(crate) async fn rollback_created_remote_workspace(
     repo_id: &str,
     ws_name: &str,
     working_copy_type: &str,
-    users: &[String],
     reason: &str,
 ) {
     let ws_ref = WorkspaceName::new(ws_name);
@@ -222,7 +210,7 @@ pub(crate) async fn rollback_created_remote_workspace(
             let _ = forget_tx.commit(format!("{reason} {ws_name}")).await;
         }
     }
-    delete_remote_workspace_records(server_url, repo_id, ws_name, working_copy_type, users).await;
+    delete_remote_workspace_records(server_url, repo_id, ws_name, working_copy_type).await;
 }
 
 struct RollbackTempDirGuard(PathBuf);
@@ -256,7 +244,6 @@ pub(crate) async fn rollback_failed_init_remote_workspace(
     project_id: &str,
     ws_name: &str,
     working_copy_type: &str,
-    users: &[String],
     reason: &str,
 ) {
     let temp_root = std::env::temp_dir().join(format!("jj-cc-rollback-{}", Uuid::new_v4()));
@@ -310,13 +297,11 @@ pub(crate) async fn rollback_failed_init_remote_workspace(
             repo_id,
             ws_name,
             working_copy_type,
-            users,
             reason,
         )
         .await;
     } else {
-        delete_remote_workspace_records(server_url, repo_id, ws_name, working_copy_type, users)
-            .await;
+        delete_remote_workspace_records(server_url, repo_id, ws_name, working_copy_type).await;
     }
 }
 
@@ -399,11 +384,6 @@ pub async fn cmd_cc_clone(
     let (init_settings, _) = command_helper.settings_for_new_workspace(ui, dest_path)?;
     let signer = signer_from_settings(&init_settings)
         .map_err(|e| user_error(format!("Failed to initialize signature signer: {e:?}")))?;
-    let init_user = if args.working_copy_type == CommitCloudWorkingCopy::name() {
-        Some(resolve_user(&init_settings).map_err(|e| user_error(e.message))?)
-    } else {
-        None
-    };
 
     if remote_workspace_exists(&args.server, &args.repo_id, &ws_name, false).await? {
         return Err(user_error(format!(
@@ -484,7 +464,6 @@ pub async fn cmd_cc_clone(
             Err(e) => {
                 let (repo_id, project_id) = attached_ids.lock().unwrap().clone();
                 if !repo_id.is_empty() {
-                    let rollback_users: Vec<String> = init_user.into_iter().collect();
                     rollback_failed_init_remote_workspace(
                         &init_settings,
                         &args.server,
@@ -492,7 +471,6 @@ pub async fn cmd_cc_clone(
                         &project_id,
                         &ws_name,
                         &args.working_copy_type,
-                        &rollback_users,
                         "forget failed clone workspace",
                     )
                     .await;
@@ -505,17 +483,12 @@ pub async fn cmd_cc_clone(
 
         let mut rollback_repo = init_repo;
         let mut rollback_settings = init_settings.clone();
-        let mut rollback_users: Vec<String> = init_user.into_iter().collect();
 
         let post_init_res: Result<(), CommandError> = async {
             // Reload settings and workspace at dest_path so CWD's repository config never leaks
             // into the clone.
             let (clone_settings, _) = command_helper.settings_for_new_workspace(ui, dest_path)?;
             rollback_settings = clone_settings.clone();
-            if args.working_copy_type == CommitCloudWorkingCopy::name() {
-                rollback_users
-                    .push(resolve_user(&clone_settings).map_err(|e| user_error(e.message))?);
-            }
             let workspace = command_helper.load_workspace_at(dest_path, &clone_settings)?;
             let repo = workspace.repo_loader().load_at_head(None).await?;
             rollback_repo = repo.clone();
@@ -564,7 +537,6 @@ pub async fn cmd_cc_clone(
                 &args.repo_id,
                 &ws_name,
                 &args.working_copy_type,
-                &rollback_users,
                 "forget failed clone workspace",
             )
             .await;
@@ -784,7 +756,6 @@ mod tests {
             &project_id,
             "failed-ws",
             CommitCloudWorkingCopy::name(),
-            &["alice@example.com".to_string()],
             "forget failed init workspace",
         )
         .await;
@@ -809,7 +780,6 @@ mod tests {
             Ok(client
                 .get_workspace(cc_common::workspace::GetWorkspaceRequest {
                     repo_id: repo_id_check,
-                    user: "alice@example.com".to_string(),
                     workspace_name: "failed-ws".to_string(),
                 })
                 .await?
@@ -835,7 +805,6 @@ mod tests {
             &project_id,
             "never-published-ws",
             CommitCloudWorkingCopy::name(),
-            &["alice@example.com".to_string()],
             "forget failed init workspace",
         )
         .await;

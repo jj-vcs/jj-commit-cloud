@@ -181,18 +181,19 @@ impl SqliteMetadataStore {
             if expected_op.is_some() {
                 let row = tx
                     .query_row(
-                        "SELECT commit_id, operation_id, tree_id, tree_ids_json, conflict_labels_json, sparse_patterns_json
+                        "SELECT user, commit_id, operation_id, tree_id, tree_ids_json, conflict_labels_json, sparse_patterns_json
                          FROM workspaces
-                         WHERE repo_id = ?1 AND user_email = ?2 AND workspace_name = ?3",
-                        params![ws.repo_id, ws.user, ws.workspace_name],
+                         WHERE repo_id = ?1 AND workspace_name = ?2",
+                        params![ws.repo_id, ws.workspace_name],
                         |r| {
                             Ok((
-                                r.get::<_, Vec<u8>>(0)?,
+                                r.get::<_, String>(0)?,
                                 r.get::<_, Vec<u8>>(1)?,
                                 r.get::<_, Vec<u8>>(2)?,
-                                r.get::<_, String>(3)?,
+                                r.get::<_, Vec<u8>>(3)?,
                                 r.get::<_, String>(4)?,
                                 r.get::<_, String>(5)?,
+                                r.get::<_, String>(6)?,
                             ))
                         },
                     )
@@ -202,6 +203,7 @@ impl SqliteMetadataStore {
                     })?;
                 let existing = match row {
                     Some((
+                        existing_user,
                         commit_id,
                         operation_id,
                         tree_id,
@@ -227,7 +229,7 @@ impl SqliteMetadataStore {
                             })?;
                         Some(WorkspaceState {
                             repo_id: ws.repo_id.clone(),
-                            user: ws.user.clone(),
+                            user: existing_user,
                             workspace_name: ws.workspace_name.clone(),
                             commit_id,
                             operation_id,
@@ -257,12 +259,12 @@ impl SqliteMetadataStore {
             })?;
             tx.execute(
                 "INSERT OR REPLACE INTO workspaces
-                 (repo_id, user_email, workspace_name, commit_id, operation_id, tree_id, tree_ids_json, conflict_labels_json, sparse_patterns_json)
+                 (repo_id, workspace_name, user, commit_id, operation_id, tree_id, tree_ids_json, conflict_labels_json, sparse_patterns_json)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     ws.repo_id,
-                    ws.user,
                     ws.workspace_name,
+                    ws.user,
                     ws.commit_id,
                     ws.operation_id,
                     ws.tree_id,
@@ -281,27 +283,26 @@ impl SqliteMetadataStore {
     pub(super) async fn get_workspace_impl(
         &self,
         repo_id: &str,
-        user: &str,
         workspace_name: &str,
     ) -> StoreResult<Option<WorkspaceState>> {
         let repo_id = repo_id.to_string();
-        let user = user.to_string();
         let workspace_name = workspace_name.to_string();
         self.with_read_conn(move |conn| {
             let row = conn
                 .query_row(
-                    "SELECT commit_id, operation_id, tree_id, tree_ids_json, conflict_labels_json, sparse_patterns_json
+                    "SELECT user, commit_id, operation_id, tree_id, tree_ids_json, conflict_labels_json, sparse_patterns_json
                      FROM workspaces
-                     WHERE repo_id = ?1 AND user_email = ?2 AND workspace_name = ?3",
-                    params![repo_id, user, workspace_name],
+                     WHERE repo_id = ?1 AND workspace_name = ?2",
+                    params![repo_id, workspace_name],
                     |r| {
                         Ok((
-                            r.get::<_, Vec<u8>>(0)?,
+                            r.get::<_, String>(0)?,
                             r.get::<_, Vec<u8>>(1)?,
                             r.get::<_, Vec<u8>>(2)?,
-                            r.get::<_, String>(3)?,
+                            r.get::<_, Vec<u8>>(3)?,
                             r.get::<_, String>(4)?,
                             r.get::<_, String>(5)?,
+                            r.get::<_, String>(6)?,
                         ))
                     },
                 )
@@ -310,6 +311,7 @@ impl SqliteMetadataStore {
 
             row.map(
                 |(
+                    user,
                     commit_id,
                     operation_id,
                     tree_id,
@@ -383,10 +385,10 @@ impl SqliteMetadataStore {
         self.with_read_conn(move |conn| {
             let mut stmt = conn
                 .prepare(
-                    "SELECT user_email, workspace_name, commit_id, operation_id, tree_id, tree_ids_json, conflict_labels_json, sparse_patterns_json
+                    "SELECT user, workspace_name, commit_id, operation_id, tree_id, tree_ids_json, conflict_labels_json, sparse_patterns_json
                      FROM workspaces
                      WHERE repo_id = ?1
-                     ORDER BY user_email ASC, workspace_name ASC",
+                     ORDER BY workspace_name ASC",
                 )
                 .map_err(|e| {
                     StoreError::Backend(format!("SQLite prepare list_workspaces failed: {e}"))
@@ -418,7 +420,7 @@ impl SqliteMetadataStore {
     pub(super) async fn list_workspaces_page_impl(
         &self,
         repo_id: &str,
-        after: Option<(&str, &str)>,
+        after_workspace_name: Option<&str>,
         limit: usize,
         max_bytes: Option<usize>,
     ) -> StoreResult<(Vec<WorkspaceState>, bool)> {
@@ -426,18 +428,18 @@ impl SqliteMetadataStore {
             return Ok((Vec::new(), false));
         }
         let repo_id = repo_id.to_string();
-        let after = after.map(|(u, w)| (u.to_string(), w.to_string()));
+        let after = after_workspace_name.map(ToOwned::to_owned);
         let limit_i64 = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
         self.with_read_conn(move |conn| match after {
-            Some((after_user, after_ws)) => {
+            Some(after_ws) => {
                 let mut stmt = conn
                     .prepare(
-                        "SELECT user_email, workspace_name, commit_id, operation_id, tree_id, tree_ids_json, conflict_labels_json, sparse_patterns_json
+                        "SELECT user, workspace_name, commit_id, operation_id, tree_id, tree_ids_json, conflict_labels_json, sparse_patterns_json
                          FROM workspaces
                          WHERE repo_id = ?1
-                           AND (user_email, workspace_name) > (?2, ?3)
-                         ORDER BY user_email ASC, workspace_name ASC
-                         LIMIT ?4",
+                           AND workspace_name > ?2
+                         ORDER BY workspace_name ASC
+                         LIMIT ?3",
                     )
                     .map_err(|e| {
                         StoreError::Backend(format!(
@@ -445,7 +447,7 @@ impl SqliteMetadataStore {
                         ))
                     })?;
                 let rows = stmt
-                    .query_map(params![repo_id, after_user, after_ws, limit_i64], |r| {
+                    .query_map(params![repo_id, after_ws, limit_i64], |r| {
                         Ok((
                             r.get::<_, String>(0)?,
                             r.get::<_, String>(1)?,
@@ -467,10 +469,10 @@ impl SqliteMetadataStore {
             None => {
                 let mut stmt = conn
                     .prepare(
-                        "SELECT user_email, workspace_name, commit_id, operation_id, tree_id, tree_ids_json, conflict_labels_json, sparse_patterns_json
+                        "SELECT user, workspace_name, commit_id, operation_id, tree_id, tree_ids_json, conflict_labels_json, sparse_patterns_json
                          FROM workspaces
                          WHERE repo_id = ?1
-                         ORDER BY user_email ASC, workspace_name ASC
+                         ORDER BY workspace_name ASC
                          LIMIT ?2",
                     )
                     .map_err(|e| {
@@ -505,17 +507,15 @@ impl SqliteMetadataStore {
     pub(super) async fn delete_workspace_impl(
         &self,
         repo_id: &str,
-        user: &str,
         workspace_name: &str,
     ) -> StoreResult<bool> {
         let repo_id = repo_id.to_string();
-        let user = user.to_string();
         let workspace_name = workspace_name.to_string();
         self.with_write_conn(move |conn| {
             let removed = conn
                 .execute(
-                    "DELETE FROM workspaces WHERE repo_id = ?1 AND user_email = ?2 AND workspace_name = ?3",
-                    params![repo_id, user, workspace_name],
+                    "DELETE FROM workspaces WHERE repo_id = ?1 AND workspace_name = ?2",
+                    params![repo_id, workspace_name],
                 )
                 .map_err(|e| StoreError::Backend(format!("SQLite delete_workspace failed: {e}")))?;
             Ok(removed > 0)

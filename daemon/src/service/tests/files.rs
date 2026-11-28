@@ -1535,7 +1535,6 @@ async fn write_file_stream_cancels_upstream_with_rst_stream_and_reuses_channel()
         .get_workspace(req_with_upstream(
             GetWorkspaceRequest {
                 repo_id: "repo".to_string(),
-                user: String::new(),
                 workspace_name: "default".to_string(),
             },
             &upstream_url,

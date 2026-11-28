@@ -72,7 +72,7 @@ fn strip_ascii_keyword_prefix<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
     }
 }
 
-fn parse_create_table_ddl(stmt: &str) -> Option<(String, HashSet<String>)> {
+fn parse_create_table_ddl(stmt: &str) -> Option<(String, HashSet<String>, Vec<String>)> {
     let rest = strip_ascii_keyword_prefix(stmt, "CREATE")?;
     let mut rest = strip_ascii_keyword_prefix(rest, "TABLE")?;
     if let Some(after_if) = strip_ascii_keyword_prefix(rest, "IF")
@@ -131,7 +131,9 @@ fn parse_create_table_ddl(stmt: &str) -> Option<(String, HashSet<String>)> {
             _ => {}
         }
     }
-    let cols_block = &body[..close_idx?];
+    let close_pos = close_idx?;
+    let cols_block = &body[..close_pos];
+    let tail = &body[close_pos + 1..];
 
     let mut columns = HashSet::new();
     let mut paren_depth = 0usize;
@@ -190,16 +192,46 @@ fn parse_create_table_ddl(stmt: &str) -> Option<(String, HashSet<String>)> {
         }
     }
     push_item(&cols_block[item_start..]);
-    Some((table_name, columns))
+
+    let pk_cols = parse_primary_key_cols(tail);
+    Some((table_name, columns, pk_cols))
 }
 
-/// Rejects pre-split PoC Spanner databases before `--spanner-auto-migrate` runs
-/// `CREATE TABLE IF NOT EXISTS`, matching [`crate::store::SqliteMetadataStore`]'s fail-fast guard.
+fn parse_primary_key_cols(tail: &str) -> Vec<String> {
+    let Some(after_primary) = strip_ascii_keyword_prefix(tail, "PRIMARY") else {
+        return Vec::new();
+    };
+    let Some(after_key) = strip_ascii_keyword_prefix(after_primary, "KEY") else {
+        return Vec::new();
+    };
+    let Some(rest) = after_key.trim_start().strip_prefix('(') else {
+        return Vec::new();
+    };
+    let Some(close) = rest.find(')') else {
+        return Vec::new();
+    };
+    rest[..close]
+        .split(',')
+        .filter_map(|part| {
+            let trimmed = part.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let first = trimmed.split_ascii_whitespace().next().unwrap_or("");
+            let col = first.trim_matches('`').to_ascii_lowercase();
+            (!col.is_empty()).then_some(col)
+        })
+        .collect()
+}
+
+/// Rejects pre-split PoC Spanner databases and pre-migration `Workspaces` schemas before
+/// `--spanner-auto-migrate` runs `CREATE TABLE IF NOT EXISTS`, matching
+/// [`crate::store::SqliteMetadataStore`]'s fail-fast guard.
 pub(super) fn validate_existing_spanner_ddl(existing_statements: &[String]) -> StoreResult<()> {
-    let mut tables: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut tables: HashMap<String, (HashSet<String>, Vec<String>)> = HashMap::new();
     for stmt in existing_statements {
-        if let Some((table_name, cols)) = parse_create_table_ddl(stmt) {
-            tables.insert(table_name, cols);
+        if let Some((table_name, cols, pk_cols)) = parse_create_table_ddl(stmt) {
+            tables.insert(table_name, (cols, pk_cols));
         }
     }
 
@@ -210,6 +242,16 @@ pub(super) fn validate_existing_spanner_ddl(existing_statements: &[String]) -> S
                  provision a fresh Spanner database before starting jj-cc-server with --spanner-auto-migrate"
             )));
         }
+    }
+
+    if let Some((ws_cols, _)) = tables.get("workspaces")
+        && ws_cols.contains("useremail")
+    {
+        return Err(StoreError::InvalidArgument(
+            "detected incompatible Spanner database ('Workspaces' table contains legacy 'UserEmail' column); \
+             migrate 'Workspaces' to PRIMARY KEY(RepoId, WorkspaceName) with mutable non-key 'User' before starting jj-cc-server"
+                .to_string(),
+        ));
     }
 
     const REQUIRED_COLUMNS: &[(&str, &[&str])] = &[
@@ -227,19 +269,29 @@ pub(super) fn validate_existing_spanner_ddl(existing_statements: &[String]) -> S
         ("trees", &["projectid", "treeid", "ready"]),
         ("operations", &["repoid", "operationid", "protobytes"]),
         ("views", &["repoid", "viewid", "protobytes"]),
-        ("workspaces", &["repoid", "useremail", "workspacename"]),
+        ("workspaces", &["repoid", "workspacename", "user"]),
     ];
     for (table, required_cols) in REQUIRED_COLUMNS {
-        if let Some(existing_cols) = tables.get(*table) {
+        if let Some((existing_cols, _)) = tables.get(*table) {
             for col in *required_cols {
                 if !existing_cols.contains(*col) {
                     return Err(StoreError::InvalidArgument(format!(
-                        "detected incompatible pre-split PoC Spanner database ('{table}' table lacks '{col}' column); \
-                         provision a fresh Spanner database before starting jj-cc-server with --spanner-auto-migrate"
+                        "detected incompatible Spanner database ('{table}' table lacks '{col}' column); \
+                         provision a fresh Spanner database or migrate the schema before starting jj-cc-server with --spanner-auto-migrate"
                     )));
                 }
             }
         }
+    }
+
+    if let Some((_, ws_pk)) = tables.get("workspaces")
+        && ws_pk.as_slice() != ["repoid", "workspacename"]
+    {
+        return Err(StoreError::InvalidArgument(format!(
+            "detected incompatible Spanner database ('Workspaces' table has PRIMARY KEY({}), expected PRIMARY KEY(RepoId, WorkspaceName)); \
+             migrate 'Workspaces' before starting jj-cc-server",
+            ws_pk.join(", ")
+        )));
     }
     Ok(())
 }

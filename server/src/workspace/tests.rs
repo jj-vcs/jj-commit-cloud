@@ -52,7 +52,6 @@ async fn test_workspace_conflict_labels_sqlite_cas_cursor_and_advisory_delete() 
     let del = sqlite_svc
         .delete_workspace(Request::new(DeleteWorkspaceRequest {
             repo_id: "missing-repo".to_string(),
-            user: "alice@example.com".to_string(),
             workspace_name: "default".to_string(),
         }))
         .await
@@ -100,7 +99,6 @@ async fn test_workspace_conflict_labels_sqlite_cas_cursor_and_advisory_delete() 
     let fetched = sqlite_svc
         .get_workspace(Request::new(GetWorkspaceRequest {
             repo_id: "ws-repo".to_string(),
-            user: "alice@example.com".to_string(),
             workspace_name: "default".to_string(),
         }))
         .await
@@ -109,6 +107,7 @@ async fn test_workspace_conflict_labels_sqlite_cas_cursor_and_advisory_delete() 
         .workspace
         .unwrap();
     assert_eq!(fetched.conflict_labels, ws.conflict_labels);
+    assert_eq!(fetched.user, "alice@example.com");
 
     // MemoryMetadataStore CAS must reject stale expected_operation_id when conflict_labels differ.
     let mem_store = Arc::new(CompositeStore::in_memory());
@@ -148,19 +147,38 @@ async fn test_workspace_conflict_labels_sqlite_cas_cursor_and_advisory_delete() 
         .unwrap_err();
     assert_eq!(stale_cas.code(), Code::Aborted);
 
-    // Cursor decoding accepts any valid UTF-8 `(user, workspace_name)` pair (including
-    // slashes and legacy persisted values) so pagination never dead-ends, while rejecting
-    // malformed hex, truncated length prefixes, and invalid UTF-8 with `InvalidArgument`.
-    for (u, w) in [("bad\x01user", "ws"), ("ok", "../ws"), ("ok", "a/b")] {
-        let cursor = encode_workspace_cursor(u, w);
-        assert_eq!(
-            decode_workspace_cursor(&cursor).unwrap(),
-            (u.to_string(), w.to_string())
-        );
+    // Cursor decoding accepts any non-empty NUL-free valid UTF-8 `workspace_name` (including
+    // slashes and legacy persisted values) so pagination never dead-ends, while rejecting empty,
+    // legacy v1, unprefixed hex, NUL-containing, malformed hex, oversized, and invalid UTF-8
+    // tokens with `InvalidArgument`.
+    for w in ["bad\x01ws", "../ws", "a/b", "default"] {
+        let cursor = encode_workspace_cursor(w);
+        assert!(cursor.starts_with(WORKSPACE_CURSOR_PREFIX));
+        assert_eq!(decode_workspace_cursor(&cursor).unwrap(), w);
     }
-    for bad_cursor in ["not-hex", "0001", "000000ff61", "00000001ff"] {
+    let oversized_unprefixed = "61".repeat((MAX_CURSOR_HEX_LEN / 2) + 1);
+    let oversized_prefixed = format!("{WORKSPACE_CURSOR_PREFIX}{oversized_unprefixed}");
+    for bad_cursor in [
+        "",
+        WORKSPACE_CURSOR_PREFIX,
+        "not-hex",
+        "v2:not-hex",
+        "v2:abc",
+        "v2:ff",
+        "00000005616c6963657773",
+        "0001",
+        "64656661756c74",
+        "v2:00",
+        "v2:610062",
+        oversized_unprefixed.as_str(),
+        oversized_prefixed.as_str(),
+    ] {
         let err = decode_workspace_cursor(bad_cursor).unwrap_err();
-        assert_eq!(err.code(), Code::InvalidArgument);
+        assert_eq!(
+            err.code(),
+            Code::InvalidArgument,
+            "expected InvalidArgument for cursor {bad_cursor:?}"
+        );
     }
 }
 
@@ -255,7 +273,6 @@ async fn test_sqlite_store_cas_and_concurrent_race() {
     let persisted = svc
         .get_workspace(Request::new(GetWorkspaceRequest {
             repo_id: "repo-1".to_string(),
-            user: "alice".to_string(),
             workspace_name: "ws".to_string(),
         }))
         .await
@@ -316,7 +333,6 @@ async fn test_check_working_copy_changes_conflicted_three_term_trees() {
     let matching = svc
         .check_working_copy_changes(Request::new(CheckWorkingCopyChangesRequest {
             repo_id: "repo-1".to_string(),
-            user: "alice".to_string(),
             workspace_name: "conflicted-ws".to_string(),
         }))
         .await
@@ -346,7 +362,6 @@ async fn test_check_working_copy_changes_conflicted_three_term_trees() {
     let diverged = svc
         .check_working_copy_changes(Request::new(CheckWorkingCopyChangesRequest {
             repo_id: "repo-1".to_string(),
-            user: "alice".to_string(),
             workspace_name: "conflicted-ws".to_string(),
         }))
         .await
@@ -779,12 +794,12 @@ async fn test_list_workspaces_keyset_pagination_and_byte_budget() {
         assert!(empty.next_page_token.is_empty());
 
         let entries = [
-            ("carol", "ws-1"),
+            ("carol", "ws-c1"),
             ("alice", "ws-b"),
             ("bob", "ws-2"),
             ("alice", "ws-a"),
-            ("bob", "ws-1"),
-            ("carol", "ws-2"),
+            ("agent-42", "ws-1"),
+            ("", "ws-c2"),
         ];
         for (user, ws_name) in entries {
             let mut ws = base_ws(ws_name);
@@ -827,12 +842,12 @@ async fn test_list_workspaces_keyset_pagination_and_byte_budget() {
         assert_eq!(
             collected,
             vec![
+                ("agent-42".to_string(), "ws-1".to_string()),
+                ("bob".to_string(), "ws-2".to_string()),
                 ("alice".to_string(), "ws-a".to_string()),
                 ("alice".to_string(), "ws-b".to_string()),
-                ("bob".to_string(), "ws-1".to_string()),
-                ("bob".to_string(), "ws-2".to_string()),
-                ("carol".to_string(), "ws-1".to_string()),
-                ("carol".to_string(), "ws-2".to_string()),
+                ("carol".to_string(), "ws-c1".to_string()),
+                ("".to_string(), "ws-c2".to_string()),
             ]
         );
 
@@ -841,7 +856,7 @@ async fn test_list_workspaces_keyset_pagination_and_byte_budget() {
             .list_workspaces(Request::new(ListWorkspacesRequest {
                 repo_id: "repo-page".to_string(),
                 page_size: 10,
-                page_token: encode_workspace_cursor("carol", "ws-2"),
+                page_token: encode_workspace_cursor("ws-c2"),
             }))
             .await
             .unwrap()
@@ -965,7 +980,6 @@ async fn test_legacy_cursor_pagination_and_slash_workspace_names() {
         let fetched = svc
             .get_workspace(Request::new(GetWorkspaceRequest {
                 repo_id: "repo-1".to_string(),
-                user: "carol".to_string(),
                 workspace_name: "team/feature/bar".to_string(),
             }))
             .await
@@ -977,7 +991,6 @@ async fn test_legacy_cursor_pagination_and_slash_workspace_names() {
         let check = svc
             .check_working_copy_changes(Request::new(CheckWorkingCopyChangesRequest {
                 repo_id: "repo-1".to_string(),
-                user: "carol".to_string(),
                 workspace_name: "team/feature/bar".to_string(),
             }))
             .await
@@ -988,7 +1001,6 @@ async fn test_legacy_cursor_pagination_and_slash_workspace_names() {
         let del = svc
             .delete_workspace(Request::new(DeleteWorkspaceRequest {
                 repo_id: "repo-1".to_string(),
-                user: "carol".to_string(),
                 workspace_name: "team/feature/bar".to_string(),
             }))
             .await
@@ -1074,7 +1086,6 @@ async fn test_conflict_labels_legacy_normalization_and_view_commit_derivation() 
     let fetched_empty = svc
         .get_workspace(Request::new(GetWorkspaceRequest {
             repo_id: "repo-1".to_string(),
-            user: "alice".to_string(),
             workspace_name: "ws-all-empty-labels".to_string(),
         }))
         .await
@@ -1103,7 +1114,6 @@ async fn test_conflict_labels_legacy_normalization_and_view_commit_derivation() 
     let fetched_partial = svc
         .get_workspace(Request::new(GetWorkspaceRequest {
             repo_id: "repo-1".to_string(),
-            user: "alice".to_string(),
             workspace_name: "ws-partial-labels".to_string(),
         }))
         .await
@@ -1214,7 +1224,6 @@ async fn test_conflict_labels_legacy_normalization_and_view_commit_derivation() 
     let fetched_derived = svc
         .get_workspace(Request::new(GetWorkspaceRequest {
             repo_id: "repo-1".to_string(),
-            user: "alice".to_string(),
             workspace_name: "derived-ws".to_string(),
         }))
         .await
@@ -1628,13 +1637,9 @@ async fn test_update_workspace_rejects_delete_and_reregister_between_op_lookup_a
         async fn get_workspace(
             &self,
             repo_id: &str,
-            user: &str,
             workspace_name: &str,
         ) -> StoreResult<Option<WorkspaceState>> {
-            let res = self
-                .inner
-                .get_workspace(repo_id, user, workspace_name)
-                .await?;
+            let res = self.inner.get_workspace(repo_id, workspace_name).await?;
             if res.is_some() {
                 self.maybe_swap(&self.swap_on_workspace).await?;
             }
@@ -1669,15 +1674,8 @@ async fn test_update_workspace_rejects_delete_and_reregister_between_op_lookup_a
         async fn list_workspaces(&self, repo_id: &str) -> StoreResult<Vec<WorkspaceState>> {
             self.inner.list_workspaces(repo_id).await
         }
-        async fn delete_workspace(
-            &self,
-            repo_id: &str,
-            user: &str,
-            workspace_name: &str,
-        ) -> StoreResult<bool> {
-            self.inner
-                .delete_workspace(repo_id, user, workspace_name)
-                .await
+        async fn delete_workspace(&self, repo_id: &str, workspace_name: &str) -> StoreResult<bool> {
+            self.inner.delete_workspace(repo_id, workspace_name).await
         }
     }
 
@@ -1787,7 +1785,7 @@ async fn test_update_workspace_rejects_delete_and_reregister_between_op_lookup_a
         );
         assert!(
             inner
-                .get_workspace("repo-race", "alice", "ws-race")
+                .get_workspace("repo-race", "ws-race")
                 .await
                 .unwrap()
                 .is_none(),
@@ -1844,7 +1842,6 @@ async fn test_update_workspace_rejects_delete_and_reregister_between_op_lookup_a
         let err = svc
             .check_working_copy_changes(Request::new(CheckWorkingCopyChangesRequest {
                 repo_id: "repo-check-race".to_string(),
-                user: "alice".to_string(),
                 workspace_name: "ws-check".to_string(),
             }))
             .await
@@ -1925,11 +1922,216 @@ async fn test_update_workspace_rejects_delete_and_reregister_between_op_lookup_a
         );
         assert!(
             inner
-                .get_workspace("repo-same-proj", "alice", "ws-same-proj")
+                .get_workspace("repo-same-proj", "ws-same-proj")
                 .await
                 .unwrap()
                 .is_none(),
             "dangling workspace referencing deleted operation must not be persisted"
         );
+    }
+}
+
+#[tokio::test]
+async fn test_workspace_pk_repo_and_name_with_mutable_non_key_user() {
+    let dir = tempfile::tempdir().unwrap();
+    let sqlite_store = Arc::new(CompositeStore::new(
+        Arc::new(SqliteMetadataStore::open(&dir.path().join("mutable_user.db")).unwrap()),
+        Arc::new(MemoryBlobStore::new()),
+    ));
+    let mem_store = Arc::new(CompositeStore::in_memory());
+
+    for store in [mem_store, sqlite_store] {
+        store
+            .register_repo_in_project("repo-1", Some("proj-1"), None)
+            .await
+            .unwrap();
+        let op1 = vec![0x11; cc_common::OPERATION_ID_LENGTH];
+        let op2 = vec![0x22; cc_common::OPERATION_ID_LENGTH];
+        for op_id in [&op1, &op2] {
+            store
+                .put_operation(
+                    "repo-1",
+                    op_id,
+                    &cc_common::op_store::Operation {
+                        view_id: cc_common::ROOT_VIEW_ID_BYTES.to_vec(),
+                        parents: vec![cc_common::ROOT_OPERATION_ID_BYTES.to_vec()],
+                        metadata: None,
+                        commit_predecessors: Vec::new(),
+                        commit_predecessors_set: true,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+
+        let metrics = ServerMetrics::new();
+        let svc = CommitCloudWorkspaceService::with_metrics(store, metrics.clone());
+
+        // Arbitrary non-email user identifiers (agent, service-account, empty, email)
+        // are accepted, and overwriting the same `(repo_id, workspace_name)` with different
+        // `user` values updates the single record in place without creating duplicates.
+        for (idx, user_id) in ["alice@example.com", "agent-42", "sa-runner-01", ""]
+            .iter()
+            .enumerate()
+        {
+            let mut ws = base_ws("shared-ws");
+            ws.user = (*user_id).to_string();
+            let resp = svc
+                .update_workspace(Request::new(UpdateWorkspaceRequest {
+                    workspace: Some(ws.clone()),
+                    expected_operation_id: None,
+                }))
+                .await
+                .unwrap_or_else(|e| panic!("user {user_id:?} (idx {idx}) should succeed: {e}"))
+                .into_inner();
+            assert_eq!(resp.workspace.as_ref().unwrap().user, *user_id);
+
+            let fetched = svc
+                .get_workspace(Request::new(GetWorkspaceRequest {
+                    repo_id: "repo-1".to_string(),
+                    workspace_name: "shared-ws".to_string(),
+                }))
+                .await
+                .unwrap()
+                .into_inner()
+                .workspace
+                .unwrap();
+            assert_eq!(fetched.user, *user_id);
+            assert_eq!(metrics.snapshot().active_workspaces, 1);
+        }
+        let listed = svc
+            .list_workspaces(Request::new(ListWorkspacesRequest {
+                repo_id: "repo-1".to_string(),
+                page_size: 10,
+                page_token: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .workspaces;
+        assert_eq!(
+            listed.len(),
+            1,
+            "overwriting user must not create colliding records"
+        );
+
+        // CAS UpdateWorkspace respects `user`:
+        // - Create-only CAS fails with ABORTED when workspace already exists under another user.
+        let mut cas_ws = base_ws("cas-ws");
+        cas_ws.user = "agent-42".to_string();
+        cas_ws.operation_id = op1.clone();
+        svc.update_workspace(Request::new(UpdateWorkspaceRequest {
+            workspace: Some(cas_ws.clone()),
+            expected_operation_id: Some(Vec::new()),
+        }))
+        .await
+        .unwrap();
+        // Same-state retry (including same `user`) is idempotent.
+        svc.update_workspace(Request::new(UpdateWorkspaceRequest {
+            workspace: Some(cas_ws.clone()),
+            expected_operation_id: Some(Vec::new()),
+        }))
+        .await
+        .unwrap();
+
+        let mut different_user_same_op = cas_ws.clone();
+        different_user_same_op.user = "sa-runner-01".to_string();
+        // Create-only CAS with different `user` must ABORT (not treated as idempotent retry).
+        assert_eq!(
+            svc.update_workspace(Request::new(UpdateWorkspaceRequest {
+                workspace: Some(different_user_same_op.clone()),
+                expected_operation_id: Some(Vec::new()),
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+            Code::Aborted
+        );
+        // Stale expected_operation_id with different `user` must ABORT.
+        assert_eq!(
+            svc.update_workspace(Request::new(UpdateWorkspaceRequest {
+                workspace: Some(different_user_same_op.clone()),
+                expected_operation_id: Some(op2.clone()),
+            }))
+            .await
+            .unwrap_err()
+            .code(),
+            Code::Aborted
+        );
+        // Valid CAS matching `op1` updates `user` (even on same `operation_id`).
+        svc.update_workspace(Request::new(UpdateWorkspaceRequest {
+            workspace: Some(different_user_same_op.clone()),
+            expected_operation_id: Some(op1.clone()),
+        }))
+        .await
+        .unwrap();
+        let after_user_cas = svc
+            .get_workspace(Request::new(GetWorkspaceRequest {
+                repo_id: "repo-1".to_string(),
+                workspace_name: "cas-ws".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .workspace
+            .unwrap();
+        assert_eq!(after_user_cas.user, "sa-runner-01");
+        assert_eq!(after_user_cas.operation_id, op1);
+
+        // Advancing `operation_id` and `user` together via CAS persists both.
+        let mut advanced = different_user_same_op;
+        advanced.user = "alice@example.com".to_string();
+        advanced.operation_id = op2.clone();
+        svc.update_workspace(Request::new(UpdateWorkspaceRequest {
+            workspace: Some(advanced),
+            expected_operation_id: Some(op1),
+        }))
+        .await
+        .unwrap();
+        let after_advance = svc
+            .get_workspace(Request::new(GetWorkspaceRequest {
+                repo_id: "repo-1".to_string(),
+                workspace_name: "cas-ws".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .workspace
+            .unwrap();
+        assert_eq!(after_advance.user, "alice@example.com");
+        assert_eq!(after_advance.operation_id, op2);
+
+        // CheckWorkingCopyChanges and DeleteWorkspace operate purely by `(repo_id, workspace_name)`.
+        let ch = svc
+            .check_working_copy_changes(Request::new(CheckWorkingCopyChangesRequest {
+                repo_id: "repo-1".to_string(),
+                workspace_name: "cas-ws".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!ch.has_changes);
+
+        let del = svc
+            .delete_workspace(Request::new(DeleteWorkspaceRequest {
+                repo_id: "repo-1".to_string(),
+                workspace_name: "cas-ws".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(del.existed);
+        assert!(
+            svc.get_workspace(Request::new(GetWorkspaceRequest {
+                repo_id: "repo-1".to_string(),
+                workspace_name: "cas-ws".to_string(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .workspace
+            .is_none()
+        );
+        assert_eq!(metrics.snapshot().active_workspaces, 1);
     }
 }

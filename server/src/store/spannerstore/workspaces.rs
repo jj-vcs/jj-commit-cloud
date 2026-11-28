@@ -51,10 +51,10 @@ impl SpannerMetadataStore {
             builder
                 .set("RepoId")
                 .to(&workspace.repo_id)
-                .set("UserEmail")
-                .to(&workspace.user)
                 .set("WorkspaceName")
                 .to(&workspace.workspace_name)
+                .set("User")
+                .to(&workspace.user)
                 .set("CommitId")
                 .to(&workspace.commit_id)
                 .set("OperationId")
@@ -126,17 +126,17 @@ impl SpannerMetadataStore {
             };
 
             let stmt = Statement::builder(
-                "SELECT CommitId, OperationId, TreeId, TreeIds, ConflictLabels, SparsePatterns
+                "SELECT User, CommitId, OperationId, TreeId, TreeIds, ConflictLabels, SparsePatterns
                  FROM Workspaces
-                 WHERE RepoId = @repo_id AND UserEmail = @user AND WorkspaceName = @ws_name",
+                 WHERE RepoId = @repo_id AND WorkspaceName = @ws_name",
             )
             .add_param("repo_id", &ws.repo_id)
-            .add_param("user", &ws.user)
             .add_param("ws_name", &ws.workspace_name)
             .build();
             let rs = tx.execute_query(stmt).await?;
             let existing = match drain_first_row(rs).await? {
                 Some(row) => {
+                    let existing_user: String = row.get("User")?;
                     let commit_id: Vec<u8> = row.get("CommitId")?;
                     let operation_id: Vec<u8> = row.get("OperationId")?;
                     let tree_id: Vec<u8> = row.get("TreeId")?;
@@ -148,7 +148,7 @@ impl SpannerMetadataStore {
                     let sparse_patterns: Vec<String> = row.get("SparsePatterns")?;
                     Some(WorkspaceState {
                         repo_id: ws.repo_id.clone(),
-                        user: ws.user.clone(),
+                        user: existing_user,
                         workspace_name: ws.workspace_name.clone(),
                         commit_id,
                         operation_id,
@@ -194,16 +194,14 @@ impl SpannerMetadataStore {
     pub(super) async fn get_workspace_impl(
         &self,
         repo_id: &str,
-        user: &str,
         workspace_name: &str,
     ) -> StoreResult<Option<WorkspaceState>> {
         let stmt = Statement::builder(
-            "SELECT CommitId, OperationId, TreeId, TreeIds, ConflictLabels, SparsePatterns
+            "SELECT User, CommitId, OperationId, TreeId, TreeIds, ConflictLabels, SparsePatterns
              FROM Workspaces
-             WHERE RepoId = @repo_id AND UserEmail = @user AND WorkspaceName = @ws",
+             WHERE RepoId = @repo_id AND WorkspaceName = @ws",
         )
         .add_param("repo_id", repo_id)
-        .add_param("user", user)
         .add_param("ws", workspace_name)
         .build();
 
@@ -212,6 +210,7 @@ impl SpannerMetadataStore {
         let Some(row) = rs.next().await.transpose().map_err(map_spanner_err)? else {
             return Ok(None);
         };
+        let user: String = row.get("User").map_err(map_spanner_err)?;
         let commit_id: Vec<u8> = row.get("CommitId").map_err(map_spanner_err)?;
         let operation_id: Vec<u8> = row.get("OperationId").map_err(map_spanner_err)?;
         let tree_id: Vec<u8> = row.get("TreeId").map_err(map_spanner_err)?;
@@ -225,7 +224,7 @@ impl SpannerMetadataStore {
         #[allow(deprecated)]
         let ws = WorkspaceState {
             repo_id: repo_id.to_string(),
-            user: user.to_string(),
+            user,
             workspace_name: workspace_name.to_string(),
             commit_id,
             operation_id,
@@ -243,10 +242,10 @@ impl SpannerMetadataStore {
         repo_id: &str,
     ) -> StoreResult<Vec<WorkspaceState>> {
         let stmt = Statement::builder(
-            "SELECT UserEmail, WorkspaceName, CommitId, OperationId, TreeId, TreeIds, ConflictLabels, SparsePatterns
+            "SELECT User, WorkspaceName, CommitId, OperationId, TreeId, TreeIds, ConflictLabels, SparsePatterns
              FROM Workspaces
              WHERE RepoId = @repo_id
-             ORDER BY UserEmail ASC, WorkspaceName ASC",
+             ORDER BY WorkspaceName ASC",
         )
         .add_param("repo_id", repo_id)
         .build();
@@ -263,7 +262,7 @@ impl SpannerMetadataStore {
     pub(super) async fn list_workspaces_page_impl(
         &self,
         repo_id: &str,
-        after: Option<(&str, &str)>,
+        after_workspace_name: Option<&str>,
         limit: usize,
         max_bytes: Option<usize>,
     ) -> StoreResult<(Vec<WorkspaceState>, bool)> {
@@ -271,28 +270,24 @@ impl SpannerMetadataStore {
             return Ok((Vec::new(), false));
         }
         let fetch_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
-        let stmt = match after {
-            Some((after_user, after_ws)) => Statement::builder(
-                "SELECT UserEmail, WorkspaceName, CommitId, OperationId, TreeId, TreeIds, ConflictLabels, SparsePatterns
+        let stmt = match after_workspace_name {
+            Some(after_ws) => Statement::builder(
+                "SELECT User, WorkspaceName, CommitId, OperationId, TreeId, TreeIds, ConflictLabels, SparsePatterns
                  FROM Workspaces
                  WHERE RepoId = @repo_id
-                   AND (
-                     UserEmail > @after_user
-                     OR (UserEmail = @after_user AND WorkspaceName > @after_ws)
-                   )
-                 ORDER BY UserEmail ASC, WorkspaceName ASC
+                   AND WorkspaceName > @after_ws
+                 ORDER BY WorkspaceName ASC
                  LIMIT @limit",
             )
             .add_param("repo_id", repo_id)
-            .add_param("after_user", after_user)
             .add_param("after_ws", after_ws)
             .add_param("limit", fetch_limit)
             .build(),
             None => Statement::builder(
-                "SELECT UserEmail, WorkspaceName, CommitId, OperationId, TreeId, TreeIds, ConflictLabels, SparsePatterns
+                "SELECT User, WorkspaceName, CommitId, OperationId, TreeId, TreeIds, ConflictLabels, SparsePatterns
                  FROM Workspaces
                  WHERE RepoId = @repo_id
-                 ORDER BY UserEmail ASC, WorkspaceName ASC
+                 ORDER BY WorkspaceName ASC
                  LIMIT @limit",
             )
             .add_param("repo_id", repo_id)
@@ -325,20 +320,17 @@ impl SpannerMetadataStore {
     pub(super) async fn delete_workspace_impl(
         &self,
         repo_id: &str,
-        user: &str,
         workspace_name: &str,
     ) -> StoreResult<bool> {
         let repo_id = repo_id.to_string();
-        let user = user.to_string();
         let workspace_name = workspace_name.to_string();
 
         self.run_rw_tx(async move |tx| {
             let stmt = Statement::builder(
                 "DELETE FROM Workspaces
-                 WHERE RepoId = @repo_id AND UserEmail = @user AND WorkspaceName = @ws",
+                 WHERE RepoId = @repo_id AND WorkspaceName = @ws",
             )
             .add_param("repo_id", &repo_id)
-            .add_param("user", &user)
             .add_param("ws", &workspace_name)
             .build();
             let rows_deleted = tx.execute_update(stmt).await?;

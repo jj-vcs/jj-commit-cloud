@@ -26,7 +26,7 @@ use cc_common::workspace::{
     ListWorkspacesRequest,
 };
 use cc_lib::StoreFactoriesExt as _;
-use cc_lib::cc_working_copy::{CommitCloudWorkingCopy, resolve_user};
+use cc_lib::cc_working_copy::CommitCloudWorkingCopy;
 use cc_lib::util::{CommitCloudConfig, connect_workspace_client, run_on_tokio};
 use clap::{Parser, Subcommand};
 use jj_cli::cli_util::{CommandHelper, find_workspace_dir};
@@ -60,9 +60,6 @@ pub enum WorkspaceSubcommands {
         /// Workspace name to inspect (defaults to active workspace name)
         #[arg(long)]
         workspace_name: Option<String>,
-        /// Optional user email owner (defaults to current `user.email`)
-        #[arg(long)]
-        user: Option<String>,
         /// Optional workspace directory (defaults to current directory)
         #[arg(long)]
         repo_dir: Option<PathBuf>,
@@ -72,9 +69,6 @@ pub enum WorkspaceSubcommands {
     Delete {
         /// Workspace name to remove
         workspace_name: String,
-        /// Optional user email owner (defaults to current `user.email`)
-        #[arg(long)]
-        user: Option<String>,
         /// Optional workspace directory (defaults to current directory)
         #[arg(long)]
         repo_dir: Option<PathBuf>,
@@ -124,8 +118,8 @@ fn resolve_target_settings(
 }
 
 /// Reads the local workspace name from `.jj/working_copy` metadata without invoking
-/// `CommitCloudWorkingCopyFactory` (so `jj cc workspace status --user <email>` works inside
-/// non-default workspaces even when `user.email` is not configured).
+/// `CommitCloudWorkingCopyFactory` (so `jj cc workspace status` works inside non-default
+/// workspaces without touching remote sync).
 fn load_local_workspace_name(
     command_helper: &CommandHelper,
     ws_root: Option<&Path>,
@@ -258,22 +252,32 @@ pub async fn cmd_cc_workspace(
                     } else {
                         ""
                     };
-                    println!(
-                        "{} ({}): commit={} op={} tree={}{}",
-                        ws.workspace_name,
-                        ws.user,
-                        short_hex(&ws.commit_id, 12),
-                        short_hex(&ws.operation_id, 12),
-                        short_hex(primary_tree_id(&ws), 12),
-                        conflict_suffix,
-                    );
+                    if ws.user.is_empty() {
+                        println!(
+                            "{}: commit={} op={} tree={}{}",
+                            ws.workspace_name,
+                            short_hex(&ws.commit_id, 12),
+                            short_hex(&ws.operation_id, 12),
+                            short_hex(primary_tree_id(&ws), 12),
+                            conflict_suffix,
+                        );
+                    } else {
+                        println!(
+                            "{} ({}): commit={} op={} tree={}{}",
+                            ws.workspace_name,
+                            ws.user,
+                            short_hex(&ws.commit_id, 12),
+                            short_hex(&ws.operation_id, 12),
+                            short_hex(primary_tree_id(&ws), 12),
+                            conflict_suffix,
+                        );
+                    }
                 }
             }
             Ok(())
         }
         WorkspaceSubcommands::Status {
             workspace_name,
-            user,
             repo_dir,
         } => {
             let ws_root = repo_dir
@@ -281,27 +285,20 @@ pub async fn cmd_cc_workspace(
                 .map(|dir| resolve_repo_dir(command_helper, dir))
                 .transpose()?;
             let cfg = load_repo_config(command_helper, ws_root.as_deref())?;
-            let target_settings = resolve_target_settings(ui, command_helper, ws_root.as_deref())?;
-            let effective_settings = target_settings
-                .as_ref()
-                .unwrap_or_else(|| command_helper.settings());
-            let resolved_user = match user {
-                Some(u) => {
-                    let trimmed = u.trim();
-                    if trimmed.is_empty() {
-                        return Err(user_error("--user must not be empty or whitespace"));
-                    }
-                    trimmed.to_string()
-                }
-                None => resolve_user(effective_settings).map_err(|e| user_error(e.message))?,
-            };
             let resolved_ws_name = match workspace_name {
                 Some(name) => validate_workspace_name(name, "--workspace-name")?,
-                None => load_local_workspace_name(
-                    command_helper,
-                    ws_root.as_deref(),
-                    effective_settings,
-                )?,
+                None => {
+                    let target_settings =
+                        resolve_target_settings(ui, command_helper, ws_root.as_deref())?;
+                    let effective_settings = target_settings
+                        .as_ref()
+                        .unwrap_or_else(|| command_helper.settings());
+                    load_local_workspace_name(
+                        command_helper,
+                        ws_root.as_deref(),
+                        effective_settings,
+                    )?
+                }
             };
             let ws_name = resolved_ws_name.clone();
             let server_url = cfg.server_url;
@@ -312,7 +309,6 @@ pub async fn cmd_cc_workspace(
                 let ws = client
                     .get_workspace(GetWorkspaceRequest {
                         repo_id: repo_id.clone(),
-                        user: resolved_user.clone(),
                         workspace_name: ws_name.clone(),
                     })
                     .await?
@@ -322,7 +318,6 @@ pub async fn cmd_cc_workspace(
                     client
                         .check_working_copy_changes(CheckWorkingCopyChangesRequest {
                             repo_id,
-                            user: resolved_user,
                             workspace_name: ws_name,
                         })
                         .await
@@ -341,7 +336,9 @@ pub async fn cmd_cc_workspace(
                 )));
             };
             println!("Workspace: {}", ws.workspace_name);
-            println!("  User:      {}", ws.user);
+            if !ws.user.is_empty() {
+                println!("  User:      {}", ws.user);
+            }
             println!("  Commit:    {}", hex::encode(&ws.commit_id));
             println!("  Operation: {}", hex::encode(&ws.operation_id));
             if ws.tree_ids.len() > 1 {
@@ -361,7 +358,6 @@ pub async fn cmd_cc_workspace(
         }
         WorkspaceSubcommands::Delete {
             workspace_name,
-            user,
             repo_dir,
         } => {
             let ws_name = validate_workspace_name(workspace_name, "Workspace name")?;
@@ -370,20 +366,6 @@ pub async fn cmd_cc_workspace(
                 .map(|dir| resolve_repo_dir(command_helper, dir))
                 .transpose()?;
             let cfg = load_repo_config(command_helper, ws_root.as_deref())?;
-            let target_settings = resolve_target_settings(ui, command_helper, ws_root.as_deref())?;
-            let effective_settings = target_settings
-                .as_ref()
-                .unwrap_or_else(|| command_helper.settings());
-            let resolved_user = match user {
-                Some(u) => {
-                    let trimmed = u.trim();
-                    if trimmed.is_empty() {
-                        return Err(user_error("--user must not be empty or whitespace"));
-                    }
-                    trimmed.to_string()
-                }
-                None => resolve_user(effective_settings).map_err(|e| user_error(e.message))?,
-            };
             let ws_name_rpc = ws_name.clone();
             let server_url = cfg.server_url;
             let repo_id = cfg.repo_id;
@@ -393,7 +375,6 @@ pub async fn cmd_cc_workspace(
                 let res = client
                     .delete_workspace(DeleteWorkspaceRequest {
                         repo_id,
-                        user: resolved_user,
                         workspace_name: ws_name_rpc,
                     })
                     .await?

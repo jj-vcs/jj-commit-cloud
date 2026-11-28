@@ -15,8 +15,8 @@
 -- Native PostgreSQL 17 DDL for jj-commit-cloud.
 -- Shared immutable DAG objects (commits, trees, tree_entries, symlinks, project_blobs)
 -- scope under projects(project_id), while per-repository mutable coordination
--- (op_heads, views, operations, workspaces) cascades cleanly on repository deletion.
--- Ordered text columns (tree_entries.name, workspaces.user_email, workspaces.workspace_name)
+-- (op_heads, views, operations, workspaces) cascades on repository deletion.
+-- Ordered text columns (tree_entries.name, workspaces.workspace_name)
 -- declare COLLATE "C" so B-tree indexes and keyset pagination match Rust UTF-8 byte order
 -- regardless of database locale.
 
@@ -135,8 +135,8 @@ CREATE TABLE IF NOT EXISTS operations (
 
 CREATE TABLE IF NOT EXISTS workspaces (
   repo_id TEXT NOT NULL REFERENCES repositories(repo_id) ON DELETE CASCADE,
-  user_email TEXT COLLATE "C" NOT NULL,
   workspace_name TEXT COLLATE "C" NOT NULL,
+  "user" TEXT NOT NULL,
   operation_id BYTEA NOT NULL,
   commit_id BYTEA NOT NULL,
   tree_ids BYTEA[] NOT NULL,
@@ -144,5 +144,5 @@ CREATE TABLE IF NOT EXISTS workspaces (
   sparse_patterns TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
   sparse_patterns_set BOOLEAN NOT NULL DEFAULT FALSE,
   updated_at BIGINT NOT NULL,
-  PRIMARY KEY (repo_id, user_email, workspace_name)
+  PRIMARY KEY (repo_id, workspace_name)
 );

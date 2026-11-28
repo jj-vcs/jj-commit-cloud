@@ -92,8 +92,8 @@ CREATE TABLE IF NOT EXISTS operations(
 
 CREATE TABLE IF NOT EXISTS workspaces(
   repo_id TEXT NOT NULL,
-  user_email TEXT NOT NULL,
   workspace_name TEXT NOT NULL,
+  user TEXT NOT NULL,
   commit_id BLOB NOT NULL,
   operation_id BLOB NOT NULL,
   tree_id BLOB NOT NULL,
@@ -104,4 +104,4 @@ CREATE TABLE IF NOT EXISTS workspaces(
   DEFAULT
     '[]',
     sparse_patterns_json TEXT NOT NULL,
-  PRIMARY KEY(repo_id, user_email, workspace_name));
+  PRIMARY KEY(repo_id, workspace_name));

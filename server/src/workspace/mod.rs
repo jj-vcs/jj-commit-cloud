@@ -24,7 +24,8 @@
 //! `View.wc_commit_ids[workspace_name]` when `commit_id` is empty.
 //!
 //! # Concurrency and Merge Invariants
-//! Keyed by `(repo_id, user, workspace_name)`. Upserts are idempotent across retries, and
+//! Keyed by `(repo_id, workspace_name)`, matching `jj_lib`'s `View.wc_commit_ids` map, with
+//! `user` stored as a mutable non-key attribute. Upserts are idempotent across retries, and
 //! `DeleteWorkspace` is advisory because active workspaces upsert their record on finish.
 //!
 //! # Cross-Process and RPC Boundaries
@@ -58,6 +59,7 @@ const MAX_CONFLICT_LABELS_BYTES: usize = 64 * 1024;
 const MAX_SPARSE_PATTERNS: usize = 4096;
 const MAX_SPARSE_PATTERNS_BYTES: usize = 256 * 1024;
 const MAX_CURSOR_HEX_LEN: usize = 16 * 1024;
+const WORKSPACE_CURSOR_PREFIX: &str = "v2:";
 
 fn validate_repo_id(repo_id: &str) -> Result<(), Status> {
     if repo_id.is_empty()
@@ -75,7 +77,7 @@ fn validate_repo_id(repo_id: &str) -> Result<(), Status> {
     Ok(())
 }
 
-fn validate_key_segment(val: &str, field: &str, allow_empty: bool) -> Result<(), Status> {
+fn validate_workspace_field(val: &str, field: &str, allow_empty: bool) -> Result<(), Status> {
     if val.is_empty() {
         return if allow_empty {
             Ok(())
@@ -112,38 +114,37 @@ fn validate_sparse_pattern(pat: &str) -> Result<(), Status> {
     Ok(())
 }
 
-fn encode_workspace_cursor(user: &str, workspace_name: &str) -> String {
-    let mut buf = Vec::with_capacity(4 + user.len() + workspace_name.len());
-    buf.extend_from_slice(&(user.len() as u32).to_be_bytes());
-    buf.extend_from_slice(user.as_bytes());
-    buf.extend_from_slice(workspace_name.as_bytes());
-    hex::encode(buf)
+fn encode_workspace_cursor(workspace_name: &str) -> String {
+    format!(
+        "{WORKSPACE_CURSOR_PREFIX}{}",
+        hex::encode(workspace_name.as_bytes())
+    )
 }
 
-fn decode_workspace_cursor(token: &str) -> Result<(String, String), Status> {
-    if token.len() > MAX_CURSOR_HEX_LEN {
+fn decode_workspace_cursor(token: &str) -> Result<String, Status> {
+    // Version prefix rejects legacy v1 raw-hex cursors (`u32_be(user.len()) || user || ws`)
+    // whose leading NUL bytes would otherwise parse as UTF-8 and replay page 1.
+    let Some(hex_payload) = token.strip_prefix(WORKSPACE_CURSOR_PREFIX) else {
+        return Err(Status::invalid_argument(
+            "malformed ListWorkspaces page_token",
+        ));
+    };
+    if hex_payload.is_empty() || hex_payload.len() > MAX_CURSOR_HEX_LEN {
         return Err(Status::invalid_argument(
             "malformed ListWorkspaces page_token",
         ));
     }
-    let raw = hex::decode(token)
+    let raw = hex::decode(hex_payload)
         .map_err(|_| Status::invalid_argument("malformed ListWorkspaces page_token"))?;
-    if raw.len() < 4 {
+    let decoded = String::from_utf8(raw)
+        .map_err(|_| Status::invalid_argument("malformed ListWorkspaces page_token"))?;
+    // Reject NUL bytes up front so PostgreSQL (`TEXT` forbids 0x00) and other backends agree.
+    if decoded.is_empty() || decoded.contains('\0') {
         return Err(Status::invalid_argument(
             "malformed ListWorkspaces page_token",
         ));
     }
-    let user_len = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
-    if raw.len() - 4 < user_len {
-        return Err(Status::invalid_argument(
-            "malformed ListWorkspaces page_token",
-        ));
-    }
-    let user = String::from_utf8(raw[4..4 + user_len].to_vec())
-        .map_err(|_| Status::invalid_argument("malformed ListWorkspaces page_token"))?;
-    let ws = String::from_utf8(raw[4 + user_len..].to_vec())
-        .map_err(|_| Status::invalid_argument("malformed ListWorkspaces page_token"))?;
-    Ok((user, ws))
+    Ok(decoded)
 }
 
 #[derive(Clone)]
@@ -180,11 +181,10 @@ impl WorkspaceService for CommitCloudWorkspaceService {
     ) -> Result<Response<GetWorkspaceResponse>, Status> {
         let req = request.into_inner();
         validate_repo_id(&req.repo_id)?;
-        validate_key_segment(&req.user, "user", true)?;
-        validate_key_segment(&req.workspace_name, "workspace_name", false)?;
+        validate_workspace_field(&req.workspace_name, "workspace_name", false)?;
         let workspace = self
             .store
-            .get_workspace(&req.repo_id, &req.user, &req.workspace_name)
+            .get_workspace(&req.repo_id, &req.workspace_name)
             .await?;
         Ok(Response::new(GetWorkspaceResponse { workspace }))
     }
@@ -215,8 +215,8 @@ impl WorkspaceService for CommitCloudWorkspaceService {
             self.enforce_actor_repo_suffix,
             &ws.repo_id,
         )?;
-        validate_key_segment(&ws.user, "user", true)?;
-        validate_key_segment(&ws.workspace_name, "workspace_name", false)?;
+        validate_workspace_field(&ws.user, "user", true)?;
+        validate_workspace_field(&ws.workspace_name, "workspace_name", false)?;
 
         if ws.tree_id.is_empty() && ws.tree_ids.is_empty() {
             return Err(Status::invalid_argument(
@@ -464,7 +464,7 @@ impl WorkspaceService for CommitCloudWorkspaceService {
             .put_workspace_cas_for_project(&project_id, &ws, expected_operation_id.as_deref())
             .await?;
         self.metrics
-            .record_workspace_upsert(&ws.repo_id, &ws.user, &ws.workspace_name);
+            .record_workspace_upsert(&ws.repo_id, &ws.workspace_name);
         Ok(Response::new(UpdateWorkspaceResponse {
             success: true,
             workspace: Some(ws),
@@ -488,21 +488,18 @@ impl WorkspaceService for CommitCloudWorkspaceService {
             (req.page_size as usize).min(MAX_LIST_WORKSPACES_PAGE_SIZE)
         };
 
-        let cursor_ref = cursor
-            .as_ref()
-            .map(|(user, ws)| (user.as_str(), ws.as_str()));
         let (workspaces, has_more) = self
             .store
             .list_workspaces_page(
                 &req.repo_id,
-                cursor_ref,
+                cursor.as_deref(),
                 limit,
                 Some(MAX_LIST_WORKSPACES_RESPONSE_BYTES),
             )
             .await?;
         let next_page_token = if has_more {
             let last = workspaces.last().expect("page has at least one record");
-            encode_workspace_cursor(&last.user, &last.workspace_name)
+            encode_workspace_cursor(&last.workspace_name)
         } else {
             String::new()
         };
@@ -519,16 +516,15 @@ impl WorkspaceService for CommitCloudWorkspaceService {
     ) -> Result<Response<CheckWorkingCopyChangesResponse>, Status> {
         let req = request.into_inner();
         validate_repo_id(&req.repo_id)?;
-        validate_key_segment(&req.user, "user", true)?;
-        validate_key_segment(&req.workspace_name, "workspace_name", false)?;
+        validate_workspace_field(&req.workspace_name, "workspace_name", false)?;
         let (project_id, ws) = self
             .store
-            .get_workspace_with_project(&req.repo_id, &req.user, &req.workspace_name)
+            .get_workspace_with_project(&req.repo_id, &req.workspace_name)
             .await?;
         let ws = ws.ok_or_else(|| {
             Status::not_found(format!(
-                "workspace '{}' for user '{}' not found in repo '{}'",
-                req.workspace_name, req.user, req.repo_id
+                "workspace '{}' not found in repo '{}'",
+                req.workspace_name, req.repo_id
             ))
         })?;
 
@@ -584,18 +580,17 @@ impl WorkspaceService for CommitCloudWorkspaceService {
             self.enforce_actor_repo_suffix,
             &req.repo_id,
         )?;
-        validate_key_segment(&req.user, "user", true)?;
-        validate_key_segment(&req.workspace_name, "workspace_name", false)?;
+        validate_workspace_field(&req.workspace_name, "workspace_name", false)?;
         info!(
-            "Delete workspace '{}' for user '{}' in repo '{}'",
-            req.workspace_name, req.user, req.repo_id
+            "Delete workspace '{}' in repo '{}'",
+            req.workspace_name, req.repo_id
         );
         let existed = self
             .store
-            .delete_workspace(&req.repo_id, &req.user, &req.workspace_name)
+            .delete_workspace(&req.repo_id, &req.workspace_name)
             .await?;
         self.metrics
-            .record_workspace_deleted(&req.repo_id, &req.user, &req.workspace_name);
+            .record_workspace_deleted(&req.repo_id, &req.workspace_name);
         Ok(Response::new(DeleteWorkspaceResponse { existed }))
     }
 }

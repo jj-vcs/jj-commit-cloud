@@ -28,9 +28,7 @@ use cc_lib::cc_backend::CommitCloudBackend;
 use cc_lib::cc_index_store::CommitCloudIndexStore;
 use cc_lib::cc_op_heads_store::CommitCloudOpHeadsStore;
 use cc_lib::cc_op_store::CommitCloudOpStore;
-use cc_lib::cc_working_copy::{
-    CommitCloudWorkingCopy, CommitCloudWorkingCopyFactory, resolve_user,
-};
+use cc_lib::cc_working_copy::CommitCloudWorkingCopyFactory;
 use clap::Parser;
 use jj_cli::cli_util::CommandHelper;
 use jj_cli::command_error::{CommandError, user_error};
@@ -140,11 +138,6 @@ pub async fn cmd_cc_init(
     let (user_settings, _) = command_helper.settings_for_new_workspace(ui, dest_path)?;
     let signer = signer_from_settings(&user_settings)
         .map_err(|e| user_error(format!("Failed to initialize signature signer: {e:?}")))?;
-    let init_user = if args.working_copy_type == CommitCloudWorkingCopy::name() {
-        Some(resolve_user(&user_settings).map_err(|e| user_error(e.message))?)
-    } else {
-        None
-    };
 
     let should_create = args.create || args.repo_id.is_none();
     if let Some(existing_repo_id) = args.repo_id.as_deref()
@@ -236,7 +229,6 @@ pub async fn cmd_cc_init(
             Err(e) => {
                 let (repo_id, project_id) = allocated_ids.lock().unwrap().clone();
                 if !repo_id.is_empty() {
-                    let rollback_users: Vec<String> = init_user.into_iter().collect();
                     rollback_failed_init_remote_workspace(
                         &user_settings,
                         &args.server,
@@ -244,7 +236,6 @@ pub async fn cmd_cc_init(
                         &project_id,
                         &args.workspace_name,
                         &args.working_copy_type,
-                        &rollback_users,
                         "forget failed init workspace",
                     )
                     .await;
@@ -264,14 +255,12 @@ pub async fn cmd_cc_init(
                     .load_at_head(None)
                     .await
                     .unwrap_or(repo);
-                let rollback_users: Vec<String> = init_user.into_iter().collect();
                 rollback_created_remote_workspace(
                     &latest_rollback_repo,
                     &args.server,
                     &repo_id,
                     &args.workspace_name,
                     &args.working_copy_type,
-                    &rollback_users,
                     "forget failed init workspace",
                 )
                 .await;

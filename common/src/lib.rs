@@ -27,7 +27,8 @@
 //! Object writes (`Commit`, `Tree`, `File`, `Symlink`, `View`, `Operation`) are immutable
 //! and idempotent because identifiers derive from canonical content hashes. `UpdateOpHeads`
 //! preserves concurrent sibling operation heads, and `UpdateWorkspace` is an idempotent
-//! `(repo_id, user, workspace_name)` upsert preserving full `Merge<TreeId>` conflict terms.
+//! `(repo_id, workspace_name)` upsert (with mutable non-key `user`) preserving full
+//! `Merge<TreeId>` conflict terms.
 //!
 //! # Cross-Process and RPC Boundaries
 //! [`FILE_STREAM_CHUNK_SIZE`] (64 KiB) defines the shared streaming chunk target for file

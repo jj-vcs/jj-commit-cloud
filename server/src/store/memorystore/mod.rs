@@ -107,7 +107,7 @@ pub struct MemoryMetadataStore {
     views: Mutex<HashMap<RepoId, HashMap<ViewId, View>>>,
     ops: Mutex<HashMap<RepoId, BTreeMap<OpId, StoredOperation>>>,
     op_heads: Mutex<HashMap<RepoId, Vec<OpId>>>,
-    workspaces: Mutex<HashMap<RepoId, BTreeMap<(String, String), WorkspaceState>>>,
+    workspaces: Mutex<HashMap<RepoId, BTreeMap<String, WorkspaceState>>>,
 }
 
 impl MemoryMetadataStore {
@@ -380,7 +380,7 @@ impl MemoryMetadataStore {
         }
         let mut workspaces = self.workspaces.lock().unwrap();
         let repo_map = workspaces.entry(workspace.repo_id.clone()).or_default();
-        let key = (workspace.user.clone(), workspace.workspace_name.clone());
+        let key = workspace.workspace_name.clone();
         if crate::store::check_workspace_cas_precondition(
             repo_map.get(&key),
             workspace,

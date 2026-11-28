@@ -717,13 +717,12 @@ impl MetadataStore for MemoryMetadataStore {
     async fn get_workspace(
         &self,
         repo_id: &str,
-        user: &str,
         workspace_name: &str,
     ) -> StoreResult<Option<WorkspaceState>> {
         let workspaces = self.workspaces.lock().unwrap();
         Ok(workspaces
             .get(repo_id)
-            .and_then(|m| m.get(&(user.to_string(), workspace_name.to_string())))
+            .and_then(|m| m.get(workspace_name))
             .cloned())
     }
 
@@ -761,7 +760,7 @@ impl MetadataStore for MemoryMetadataStore {
     async fn list_workspaces_page(
         &self,
         repo_id: &str,
-        after: Option<(&str, &str)>,
+        after_workspace_name: Option<&str>,
         limit: usize,
         max_bytes: Option<usize>,
     ) -> StoreResult<(Vec<WorkspaceState>, bool)> {
@@ -775,13 +774,10 @@ impl MetadataStore for MemoryMetadataStore {
         let mut page = Vec::new();
         let mut response_bytes = 0usize;
         let mut has_more = false;
-        let iter: Box<dyn Iterator<Item = &WorkspaceState> + '_> = match after {
-            Some((after_user, after_ws)) => Box::new(
+        let iter: Box<dyn Iterator<Item = &WorkspaceState> + '_> = match after_workspace_name {
+            Some(after_ws) => Box::new(
                 repo_map
-                    .range((
-                        Bound::Excluded((after_user.to_string(), after_ws.to_string())),
-                        Bound::Unbounded,
-                    ))
+                    .range::<str, _>((Bound::Excluded(after_ws), Bound::Unbounded))
                     .map(|(_, ws)| ws),
             ),
             None => Box::new(repo_map.values()),
@@ -802,16 +798,11 @@ impl MetadataStore for MemoryMetadataStore {
         Ok((page, has_more))
     }
 
-    async fn delete_workspace(
-        &self,
-        repo_id: &str,
-        user: &str,
-        workspace_name: &str,
-    ) -> StoreResult<bool> {
+    async fn delete_workspace(&self, repo_id: &str, workspace_name: &str) -> StoreResult<bool> {
         let mut workspaces = self.workspaces.lock().unwrap();
         Ok(workspaces
             .get_mut(repo_id)
-            .and_then(|m| m.remove(&(user.to_string(), workspace_name.to_string())))
+            .and_then(|m| m.remove(workspace_name))
             .is_some())
     }
 }

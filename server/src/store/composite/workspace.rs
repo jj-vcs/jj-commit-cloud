@@ -31,14 +31,11 @@ impl CompositeStore {
     pub async fn get_workspace(
         &self,
         repo_id: &str,
-        user: &str,
         workspace_name: &str,
     ) -> StoreResult<Option<WorkspaceState>> {
         self.ensure_repo_registered(repo_id, "reading workspaces")
             .await?;
-        self.metadata
-            .get_workspace(repo_id, user, workspace_name)
-            .await
+        self.metadata.get_workspace(repo_id, workspace_name).await
     }
 
     /// Reads a workspace together with its verified owning `project_id`, failing with
@@ -47,16 +44,12 @@ impl CompositeStore {
     pub async fn get_workspace_with_project(
         &self,
         repo_id: &str,
-        user: &str,
         workspace_name: &str,
     ) -> StoreResult<(String, Option<WorkspaceState>)> {
         let project_id = self
             .resolve_repo_project(repo_id, "reading workspaces")
             .await?;
-        let ws = self
-            .metadata
-            .get_workspace(repo_id, user, workspace_name)
-            .await?;
+        let ws = self.metadata.get_workspace(repo_id, workspace_name).await?;
         let actual = self.metadata.get_repo_project_id(repo_id).await?;
         verify_optional_repo_project(
             repo_id,
@@ -122,23 +115,18 @@ impl CompositeStore {
     pub async fn list_workspaces_page(
         &self,
         repo_id: &str,
-        after: Option<(&str, &str)>,
+        after_workspace_name: Option<&str>,
         limit: usize,
         max_bytes: Option<usize>,
     ) -> StoreResult<(Vec<WorkspaceState>, bool)> {
         self.ensure_repo_registered(repo_id, "listing workspaces")
             .await?;
         self.metadata
-            .list_workspaces_page(repo_id, after, limit, max_bytes)
+            .list_workspaces_page(repo_id, after_workspace_name, limit, max_bytes)
             .await
     }
 
-    pub async fn delete_workspace(
-        &self,
-        repo_id: &str,
-        user: &str,
-        workspace_name: &str,
-    ) -> StoreResult<bool> {
+    pub async fn delete_workspace(&self, repo_id: &str, workspace_name: &str) -> StoreResult<bool> {
         match self
             .ensure_repo_registered(repo_id, "deleting workspaces")
             .await
@@ -148,7 +136,7 @@ impl CompositeStore {
             Err(err) => return Err(err),
         }
         self.metadata
-            .delete_workspace(repo_id, user, workspace_name)
+            .delete_workspace(repo_id, workspace_name)
             .await
     }
 }
@@ -193,7 +181,8 @@ pub(crate) fn check_workspace_cas_precondition(
     if let Some(cur) = existing {
         let cur_op = normalize_op(&cur.operation_id);
         let target_op = normalize_op(&target.operation_id);
-        if cur.commit_id == target.commit_id
+        if cur.user == target.user
+            && cur.commit_id == target.commit_id
             && cur_op == target_op
             && cur.tree_ids == target.tree_ids
             && cur.sparse_patterns == target.sparse_patterns
@@ -203,8 +192,8 @@ pub(crate) fn check_workspace_cas_precondition(
         }
         if exp.is_empty() {
             return Err(StoreError::CasConflict(format!(
-                "workspace '{}' for user '{}' already exists in repo '{}'",
-                target.workspace_name, target.user, target.repo_id
+                "workspace '{}' already exists in repo '{}'",
+                target.workspace_name, target.repo_id
             )));
         }
         if cur_op != exp {
@@ -218,8 +207,8 @@ pub(crate) fn check_workspace_cas_precondition(
         }
     } else if !exp.is_empty() {
         return Err(StoreError::CasConflict(format!(
-            "workspace '{}' for user '{}' does not exist in repo '{}'",
-            target.workspace_name, target.user, target.repo_id
+            "workspace '{}' does not exist in repo '{}'",
+            target.workspace_name, target.repo_id
         )));
     }
     Ok(false)

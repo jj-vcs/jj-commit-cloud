@@ -897,12 +897,9 @@ impl MetadataStore for FaultyCommitMeta {
     async fn get_workspace(
         &self,
         repo_id: &str,
-        user: &str,
         workspace_name: &str,
     ) -> crate::store::StoreResult<Option<cc_common::workspace::WorkspaceState>> {
-        self.inner
-            .get_workspace(repo_id, user, workspace_name)
-            .await
+        self.inner.get_workspace(repo_id, workspace_name).await
     }
     async fn put_workspace_cas(
         &self,
@@ -938,12 +935,9 @@ impl MetadataStore for FaultyCommitMeta {
     async fn delete_workspace(
         &self,
         repo_id: &str,
-        user: &str,
         workspace_name: &str,
     ) -> crate::store::StoreResult<bool> {
-        self.inner
-            .delete_workspace(repo_id, user, workspace_name)
-            .await
+        self.inner.delete_workspace(repo_id, workspace_name).await
     }
 }
 

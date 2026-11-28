@@ -81,38 +81,56 @@ fn init_local_fixture(
 }
 
 #[test]
-fn test_resolve_user_requires_non_empty_user_email_in_settings() {
+fn test_resolve_user_falls_back_from_email_to_name_to_empty() {
     let default_settings =
         UserSettings::from_config_and_home_dir(StackedConfig::with_defaults(), None).unwrap();
-    let err =
-        resolve_user(&default_settings).expect_err("empty default user.email must fail closed");
-    assert!(
-        err.message.contains("user.email"),
-        "error should guide user to set user.email: {}",
-        err.message
-    );
+    assert_eq!(resolve_user(&default_settings), "");
 
     let mut blank_cfg = StackedConfig::with_defaults();
     blank_cfg.add_layer(
         jj_lib::config::ConfigLayer::parse(
             jj_lib::config::ConfigSource::User,
-            "user.email = \"   \"\n",
+            "user.email = \"   \"\nuser.name = \"   \"\n",
         )
         .unwrap(),
     );
     let blank_settings = UserSettings::from_config_and_home_dir(blank_cfg, None).unwrap();
-    assert!(resolve_user(&blank_settings).is_err());
+    assert_eq!(resolve_user(&blank_settings), "");
 
+    // Falls back to `user.name` (accepting arbitrary non-email agent/service-account IDs).
+    let mut name_only_cfg = StackedConfig::with_defaults();
+    name_only_cfg.add_layer(
+        jj_lib::config::ConfigLayer::parse(
+            jj_lib::config::ConfigSource::User,
+            "user.email = \"\"\nuser.name = \"  agent-42  \"\n",
+        )
+        .unwrap(),
+    );
+    let name_only_settings = UserSettings::from_config_and_home_dir(name_only_cfg, None).unwrap();
+    assert_eq!(resolve_user(&name_only_settings), "agent-42");
+
+    // Prefers `user.email` when non-empty (without enforcing email syntax).
     let mut valid_cfg = StackedConfig::with_defaults();
     valid_cfg.add_layer(
         jj_lib::config::ConfigLayer::parse(
             jj_lib::config::ConfigSource::User,
-            "user.email = \"  alice@example.com  \"\n",
+            "user.email = \"  alice@example.com  \"\nuser.name = \"Alice\"\n",
         )
         .unwrap(),
     );
     let valid_settings = UserSettings::from_config_and_home_dir(valid_cfg, None).unwrap();
-    assert_eq!(resolve_user(&valid_settings).unwrap(), "alice@example.com");
+    assert_eq!(resolve_user(&valid_settings), "alice@example.com");
+
+    let mut sa_cfg = StackedConfig::with_defaults();
+    sa_cfg.add_layer(
+        jj_lib::config::ConfigLayer::parse(
+            jj_lib::config::ConfigSource::User,
+            "user.email = \"sa-runner-01\"\n",
+        )
+        .unwrap(),
+    );
+    let sa_settings = UserSettings::from_config_and_home_dir(sa_cfg, None).unwrap();
+    assert_eq!(resolve_user(&sa_settings), "sa-runner-01");
 }
 
 #[test]
@@ -868,7 +886,6 @@ fn test_sync_from_ephemeral_tokio_runtime_does_not_poison_pooled_channel() {
             client
                 .delete_workspace(DeleteWorkspaceRequest {
                     repo_id: "repo-ephemeral".to_string(),
-                    user: "alice@example.com".to_string(),
                     workspace_name: "probe-ws".to_string(),
                 })
                 .await?;

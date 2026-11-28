@@ -1098,18 +1098,32 @@ async fn test_postgres_workspaces_cas_collation_and_delete() {
     assert!(matches!(stale_err, StoreError::CasConflict(_)));
 
     assert_eq!(
-        store
-            .get_workspace(&repo_id, "alice@example.com", "ws-main")
-            .await
-            .unwrap(),
-        Some(ws1_v2)
+        store.get_workspace(&repo_id, "ws-main").await.unwrap(),
+        Some(ws1_v2.clone())
     );
 
-    // Add workspaces testing COLLATE "C" ordering across (user_email, workspace_name).
+    // Updating the mutable non-key `user` via valid CAS updates in place and rejects stale CAS.
+    let mut ws1_reassigned = ws1_v2;
+    ws1_reassigned.user = "agent-42".to_string();
+    let stale_user_err = store
+        .put_workspace_cas(&ws1_reassigned, Some(&op1))
+        .await
+        .unwrap_err();
+    assert!(matches!(stale_user_err, StoreError::CasConflict(_)));
+    store
+        .put_workspace_cas(&ws1_reassigned, Some(&op2))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_workspace(&repo_id, "ws-main").await.unwrap(),
+        Some(ws1_reassigned)
+    );
+
+    // Add workspaces testing COLLATE "C" ordering strictly by `workspace_name` across distinct users.
     for (user, ws_name) in [
         ("Bob@example.com", "z"),
-        ("alice@example.com", "ws.dot"),
-        ("alice@example.com", "ws-dash"),
+        ("sa-runner-01", "ws.dot"),
+        ("", "ws-dash"),
     ] {
         let mut w = ws1.clone();
         w.user = user.to_string();
@@ -1124,30 +1138,19 @@ async fn test_postgres_workspaces_cas_collation_and_delete() {
     assert_eq!(
         keys,
         vec![
-            ("Bob@example.com".to_string(), "z".to_string()),
-            ("alice@example.com".to_string(), "ws-dash".to_string()),
-            ("alice@example.com".to_string(), "ws-main".to_string()),
+            ("".to_string(), "ws-dash".to_string()),
+            ("agent-42".to_string(), "ws-main".to_string()),
             ("alice@example.com".to_string(), "ws-race".to_string()),
-            ("alice@example.com".to_string(), "ws.dot".to_string()),
+            ("sa-runner-01".to_string(), "ws.dot".to_string()),
+            ("Bob@example.com".to_string(), "z".to_string()),
         ]
     );
 
-    // Delete workspace returns true once, false thereafter.
+    assert!(store.delete_workspace(&repo_id, "ws-main").await.unwrap());
+    assert!(!store.delete_workspace(&repo_id, "ws-main").await.unwrap());
     assert!(
         store
-            .delete_workspace(&repo_id, "alice@example.com", "ws-main")
-            .await
-            .unwrap()
-    );
-    assert!(
-        !store
-            .delete_workspace(&repo_id, "alice@example.com", "ws-main")
-            .await
-            .unwrap()
-    );
-    assert!(
-        store
-            .get_workspace(&repo_id, "alice@example.com", "ws-main")
+            .get_workspace(&repo_id, "ws-main")
             .await
             .unwrap()
             .is_none()
@@ -1179,15 +1182,15 @@ async fn test_postgres_list_workspaces_page_keyset_pagination() {
         (Vec::new(), false)
     );
 
-    // Populate keys covering empty user, ASCII case/punctuation `COLLATE "C"` order, and
-    // multiple workspaces per user.
+    // Populate keys covering empty user, non-email agent/service-account users, and ASCII
+    // case/punctuation `COLLATE "C"` order strictly on `workspace_name`.
     let entries = [
         ("alice@example.com", "ws.dot"),
         ("", "anon-b"),
         ("Bob@example.com", "z"),
-        ("alice@example.com", "ws-dash"),
+        ("agent-42", "ws-dash"),
         ("", "anon-a"),
-        ("alice@example.com", "ws_under"),
+        ("sa-runner-01", "ws_under"),
         ("Bob@example.com", "A"),
     ];
     let root_op = cc_common::ROOT_OPERATION_ID_BYTES.to_vec();
@@ -1228,13 +1231,13 @@ async fn test_postgres_list_workspaces_page_keyset_pagination() {
     }
 
     let expected_keys = vec![
+        ("Bob@example.com".to_string(), "A".to_string()),
         ("".to_string(), "anon-a".to_string()),
         ("".to_string(), "anon-b".to_string()),
-        ("Bob@example.com".to_string(), "A".to_string()),
-        ("Bob@example.com".to_string(), "z".to_string()),
-        ("alice@example.com".to_string(), "ws-dash".to_string()),
+        ("agent-42".to_string(), "ws-dash".to_string()),
         ("alice@example.com".to_string(), "ws.dot".to_string()),
-        ("alice@example.com".to_string(), "ws_under".to_string()),
+        ("sa-runner-01".to_string(), "ws_under".to_string()),
+        ("Bob@example.com".to_string(), "z".to_string()),
     ];
 
     let all = meta.list_workspaces(&repo_id).await.unwrap();
@@ -1247,20 +1250,15 @@ async fn test_postgres_list_workspaces_page_keyset_pagination() {
     // Paginate through the full set with page sizes 1, 2, 3, and 7 (exact boundary).
     for page_size in [1usize, 2, 3, 7] {
         let mut collected = Vec::new();
-        let mut cursor: Option<(String, String)> = None;
+        let mut cursor: Option<String> = None;
         loop {
             let (page, has_more) = meta
-                .list_workspaces_page(
-                    &repo_id,
-                    cursor.as_ref().map(|(u, w)| (u.as_str(), w.as_str())),
-                    page_size,
-                    None,
-                )
+                .list_workspaces_page(&repo_id, cursor.as_deref(), page_size, None)
                 .await
                 .unwrap();
             assert!(page.len() <= page_size);
             if let Some(last) = page.last() {
-                cursor = Some((last.user.clone(), last.workspace_name.clone()));
+                cursor = Some(last.workspace_name.clone());
             }
             collected.extend(page);
             if !has_more {
@@ -1273,9 +1271,9 @@ async fn test_postgres_list_workspaces_page_keyset_pagination() {
         );
     }
 
-    // Cursor with empty user advances cleanly past `("", "anon-a")`, and past-the-end returns empty.
+    // Cursor advances past `"anon-a"`, and past-the-end returns empty.
     let (after_anon_a, has_more_after_anon_a) = meta
-        .list_workspaces_page(&repo_id, Some(("", "anon-a")), 2, None)
+        .list_workspaces_page(&repo_id, Some("anon-a"), 2, None)
         .await
         .unwrap();
     assert!(has_more_after_anon_a);
@@ -1285,17 +1283,17 @@ async fn test_postgres_list_workspaces_page_keyset_pagination() {
         .collect();
     assert_eq!(
         after_anon_a_keys,
-        vec![("", "anon-b"), ("Bob@example.com", "A")]
+        vec![("", "anon-b"), ("agent-42", "ws-dash")]
     );
 
     assert_eq!(
-        meta.list_workspaces_page(&repo_id, Some(("alice@example.com", "ws_under")), 5, None)
+        meta.list_workspaces_page(&repo_id, Some("z"), 5, None)
             .await
             .unwrap(),
         (Vec::new(), false)
     );
     assert_eq!(
-        meta.list_workspaces_page(&repo_id, Some(("alice@example.com", "ws-dash")), 0, None)
+        meta.list_workspaces_page(&repo_id, Some("ws-dash"), 0, None)
             .await
             .unwrap(),
         (Vec::new(), false)
@@ -1740,7 +1738,7 @@ async fn test_postgres_project_checked_writes_prevent_cross_project_toctou() {
         Err(StoreError::FailedPrecondition(_))
     ));
     assert!(
-        meta.get_workspace(&repo_id, "dev@example.com", "default")
+        meta.get_workspace(&repo_id, "default")
             .await
             .unwrap()
             .is_none()
@@ -1750,9 +1748,7 @@ async fn test_postgres_project_checked_writes_prevent_cross_project_toctou() {
         .await
         .unwrap();
     assert_eq!(
-        meta.get_workspace(&repo_id, "dev@example.com", "default")
-            .await
-            .unwrap(),
+        meta.get_workspace(&repo_id, "default").await.unwrap(),
         Some(ws.clone())
     );
 
@@ -1872,4 +1868,106 @@ async fn test_postgres_update_op_heads_retry_does_not_resurrect_superseded_and_p
         meta.get_op_heads(&repo_prune).await.unwrap(),
         Some(vec![op_desc])
     );
+}
+
+fn url_with_search_path(base_url: &str, schema: &str) -> String {
+    let trimmed = base_url.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("postgres://") || lower.starts_with("postgresql://") {
+        let sep = if trimmed.contains('?') { '&' } else { '?' };
+        format!("{trimmed}{sep}options=-c%20search_path%3D{schema}")
+    } else {
+        format!("{trimmed} options='-c search_path={schema}'")
+    }
+}
+
+#[tokio::test]
+async fn test_postgres_rejects_legacy_and_mismatched_workspaces_schemas() {
+    let Some(url) =
+        pg_url_or_skip("test_postgres_rejects_legacy_and_mismatched_workspaces_schemas")
+    else {
+        return;
+    };
+    let require = std::env::var("JJ_CC_REQUIRE_POSTGRES")
+        .ok()
+        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "YES"));
+
+    let (client, connection) = match tokio_postgres::connect(&url, tokio_postgres::NoTls).await {
+        Ok(pair) => pair,
+        Err(err) if require => {
+            panic!("PostgreSQL connect failed with JJ_CC_REQUIRE_POSTGRES set: {err}")
+        }
+        Err(err) => {
+            eprintln!(
+                "skipping test_postgres_rejects_legacy_and_mismatched_workspaces_schemas: {err}"
+            );
+            return;
+        }
+    };
+    let conn_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let cases = [
+        (
+            "legacy_user_email",
+            "CREATE TABLE workspaces (
+                repo_id TEXT NOT NULL,
+                user_email TEXT NOT NULL,
+                workspace_name TEXT COLLATE \"C\" NOT NULL,
+                PRIMARY KEY (repo_id, user_email, workspace_name)
+            );",
+        ),
+        (
+            "legacy_3col_user_pk",
+            "CREATE TABLE workspaces (
+                repo_id TEXT NOT NULL,
+                \"user\" TEXT NOT NULL,
+                workspace_name TEXT COLLATE \"C\" NOT NULL,
+                PRIMARY KEY (repo_id, \"user\", workspace_name)
+            );",
+        ),
+        (
+            "missing_user_col",
+            "CREATE TABLE workspaces (
+                repo_id TEXT NOT NULL,
+                workspace_name TEXT COLLATE \"C\" NOT NULL,
+                PRIMARY KEY (repo_id, workspace_name)
+            );",
+        ),
+    ];
+
+    for (label, table_ddl) in cases {
+        let schema = unique_id("cc_ws_guard");
+        client
+            .batch_execute(&format!(
+                "CREATE SCHEMA {schema}; SET search_path TO {schema}; {table_ddl} SET search_path TO public;"
+            ))
+            .await
+            .unwrap();
+
+        let connect_res = PostgresMetadataStore::connect(&PostgresConnectConfig {
+            url: url_with_search_path(&url, &schema),
+            max_conns: 2,
+            auto_migrate: true,
+            ..Default::default()
+        })
+        .await;
+
+        let _ = client
+            .batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE;"))
+            .await;
+
+        let err = match connect_res {
+            Ok(_) => panic!("{label}: expected InvalidArgument, but connect succeeded"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, StoreError::InvalidArgument(_)),
+            "{label}: expected InvalidArgument for incompatible workspaces schema, got {err:?}"
+        );
+    }
+
+    drop(client);
+    let _ = conn_task.await;
 }

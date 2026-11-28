@@ -137,48 +137,34 @@ fn nearest_rank_percentile(sorted: &[f64], quantile: f64) -> f64 {
 
 #[derive(Default)]
 struct ActiveWorkspaceTracker {
-    // Nested `repo_id -> user -> workspace_name` maps allow zero-allocation `&str` lookups on
+    // Nested `repo_id -> workspace_name` maps allow zero-allocation `&str` lookups on
     // steady-state `UpdateWorkspace` and `DeleteWorkspace` calls.
-    by_repo: HashMap<String, HashMap<String, HashSet<String>>>,
+    by_repo: HashMap<String, HashSet<String>>,
     total: usize,
 }
 
 impl ActiveWorkspaceTracker {
-    fn upsert(&mut self, repo_id: &str, user: &str, workspace_name: &str) -> i64 {
-        if let Some(users) = self.by_repo.get_mut(repo_id) {
-            if let Some(workspaces) = users.get_mut(user) {
-                if !workspaces.contains(workspace_name) && self.total < MAX_TRACKED_WORKSPACES {
-                    workspaces.insert(workspace_name.to_string());
-                    self.total += 1;
-                }
-            } else if self.total < MAX_TRACKED_WORKSPACES {
-                let mut workspaces = HashSet::new();
+    fn upsert(&mut self, repo_id: &str, workspace_name: &str) -> i64 {
+        if let Some(workspaces) = self.by_repo.get_mut(repo_id) {
+            if !workspaces.contains(workspace_name) && self.total < MAX_TRACKED_WORKSPACES {
                 workspaces.insert(workspace_name.to_string());
-                users.insert(user.to_string(), workspaces);
                 self.total += 1;
             }
         } else if self.total < MAX_TRACKED_WORKSPACES {
             let mut workspaces = HashSet::new();
             workspaces.insert(workspace_name.to_string());
-            let mut users = HashMap::new();
-            users.insert(user.to_string(), workspaces);
-            self.by_repo.insert(repo_id.to_string(), users);
+            self.by_repo.insert(repo_id.to_string(), workspaces);
             self.total += 1;
         }
         self.total as i64
     }
 
-    fn remove_workspace(&mut self, repo_id: &str, user: &str, workspace_name: &str) -> i64 {
-        if let Some(users) = self.by_repo.get_mut(repo_id) {
-            if let Some(workspaces) = users.get_mut(user) {
-                if workspaces.remove(workspace_name) {
-                    self.total = self.total.saturating_sub(1);
-                }
-                if workspaces.is_empty() {
-                    users.remove(user);
-                }
+    fn remove_workspace(&mut self, repo_id: &str, workspace_name: &str) -> i64 {
+        if let Some(workspaces) = self.by_repo.get_mut(repo_id) {
+            if workspaces.remove(workspace_name) {
+                self.total = self.total.saturating_sub(1);
             }
-            if users.is_empty() {
+            if workspaces.is_empty() {
                 self.by_repo.remove(repo_id);
             }
         }
@@ -186,9 +172,8 @@ impl ActiveWorkspaceTracker {
     }
 
     fn remove_repo(&mut self, repo_id: &str) -> i64 {
-        if let Some(removed_users) = self.by_repo.remove(repo_id) {
-            let count: usize = removed_users.values().map(HashSet::len).sum();
-            self.total = self.total.saturating_sub(count);
+        if let Some(removed_workspaces) = self.by_repo.remove(repo_id) {
+            self.total = self.total.saturating_sub(removed_workspaces.len());
         }
         self.total as i64
     }
@@ -302,25 +287,25 @@ impl ServerMetrics {
         sum as f64 / COMMIT_RATE_WINDOW_SECS as f64
     }
 
-    pub fn record_workspace_upsert(&self, repo_id: &str, user: &str, workspace_name: &str) {
+    pub fn record_workspace_upsert(&self, repo_id: &str, workspace_name: &str) {
         let mut tracker = self
             .inner
             .workspace_tracker
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let active = tracker.upsert(repo_id, user, workspace_name);
+        let active = tracker.upsert(repo_id, workspace_name);
         self.inner
             .active_workspaces
             .store(active, Ordering::Relaxed);
     }
 
-    pub fn record_workspace_deleted(&self, repo_id: &str, user: &str, workspace_name: &str) {
+    pub fn record_workspace_deleted(&self, repo_id: &str, workspace_name: &str) {
         let mut tracker = self
             .inner
             .workspace_tracker
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let active = tracker.remove_workspace(repo_id, user, workspace_name);
+        let active = tracker.remove_workspace(repo_id, workspace_name);
         self.inner
             .active_workspaces
             .store(active, Ordering::Relaxed);
@@ -710,16 +695,16 @@ mod tests {
     #[test]
     fn active_workspaces_tracks_idempotent_upserts_deletes_and_repo_deletion() {
         let metrics = ServerMetrics::new();
-        metrics.record_workspace_upsert("repo-a", "alice", "default");
-        metrics.record_workspace_upsert("repo-a", "alice", "default");
+        metrics.record_workspace_upsert("repo-a", "default");
+        metrics.record_workspace_upsert("repo-a", "default");
         assert_eq!(metrics.snapshot().active_workspaces, 1);
 
-        metrics.record_workspace_upsert("repo-a", "bob", "ws-2");
-        metrics.record_workspace_upsert("repo-b", "alice", "default");
+        metrics.record_workspace_upsert("repo-a", "ws-2");
+        metrics.record_workspace_upsert("repo-b", "default");
         assert_eq!(metrics.snapshot().active_workspaces, 3);
 
-        metrics.record_workspace_deleted("repo-a", "alice", "default");
-        metrics.record_workspace_deleted("repo-a", "nonexistent", "ws");
+        metrics.record_workspace_deleted("repo-a", "default");
+        metrics.record_workspace_deleted("repo-a", "nonexistent");
         assert_eq!(metrics.snapshot().active_workspaces, 2);
 
         metrics.record_repository_deleted("repo-a");

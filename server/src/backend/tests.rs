@@ -1505,7 +1505,7 @@ async fn test_delete_repository_rpc_validation_precondition_and_metrics() {
     }))
     .await
     .unwrap();
-    metrics.record_workspace_upsert("repo-del", "alice", "default");
+    metrics.record_workspace_upsert("repo-del", "default");
     assert_eq!(metrics.snapshot().active_workspaces, 1);
 
     // Mismatched project_id returns FAILED_PRECONDITION and leaves workspace gauge intact.

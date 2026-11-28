@@ -1088,8 +1088,9 @@ fn postgres_schema_ddl_has_required_tables_collation_cascade_and_commit_seq() {
         "CREATE TABLE IF NOT EXISTS views",
         "CREATE TABLE IF NOT EXISTS operations",
         "CREATE TABLE IF NOT EXISTS workspaces",
-        "user_email TEXT COLLATE \"C\" NOT NULL",
+        "\"user\" TEXT NOT NULL",
         "workspace_name TEXT COLLATE \"C\" NOT NULL",
+        "PRIMARY KEY (repo_id, workspace_name)",
         "ON DELETE CASCADE",
     ] {
         assert!(
@@ -1097,6 +1098,10 @@ fn postgres_schema_ddl_has_required_tables_collation_cascade_and_commit_seq() {
             "postgres_schema.sql missing expected DDL fragment: {needle}"
         );
     }
+    assert!(
+        !POSTGRES_SCHEMA.contains("user_email"),
+        "postgres_schema.sql must not reference legacy user_email column"
+    );
 }
 
 #[tokio::test]

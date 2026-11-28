@@ -223,13 +223,38 @@ fn test_check_workspace_cas_precondition_normalizes_legacy_empty_operation_id_on
         .unwrap()
     );
 
-    // A genuinely different target with create-only precondition still conflicts.
+    // A genuinely different target (commit_id or mutable non-key user) with create-only
+    // precondition still conflicts.
     let mut different_target = normalized_retry.clone();
     different_target.commit_id = vec![0xab; 20];
     assert!(matches!(
         check_workspace_cas_precondition(Some(&legacy_existing), &different_target, Some(&[])),
         Err(StoreError::CasConflict(_))
     ));
+
+    let mut different_user = normalized_retry.clone();
+    different_user.user = "agent-42".to_string();
+    assert!(matches!(
+        check_workspace_cas_precondition(Some(&legacy_existing), &different_user, Some(&[])),
+        Err(StoreError::CasConflict(_))
+    ));
+    assert!(matches!(
+        check_workspace_cas_precondition(
+            Some(&legacy_existing),
+            &different_user,
+            Some(&[0x99; 16])
+        ),
+        Err(StoreError::CasConflict(_))
+    ));
+    // Updating `user` with a matching expected_operation_id proceeds with the write (`Ok(false)`).
+    assert!(
+        !check_workspace_cas_precondition(
+            Some(&legacy_existing),
+            &different_user,
+            Some(&cc_common::ROOT_OPERATION_ID_BYTES),
+        )
+        .unwrap()
+    );
 }
 
 #[tokio::test]
@@ -715,12 +740,9 @@ async fn test_op_heads_tx_rejects_dangling_head_when_operation_missing_or_repo_r
         async fn get_workspace(
             &self,
             repo_id: &str,
-            user: &str,
             workspace_name: &str,
         ) -> StoreResult<Option<WorkspaceState>> {
-            self.inner
-                .get_workspace(repo_id, user, workspace_name)
-                .await
+            self.inner.get_workspace(repo_id, workspace_name).await
         }
         async fn put_workspace_cas(
             &self,
@@ -751,15 +773,8 @@ async fn test_op_heads_tx_rejects_dangling_head_when_operation_missing_or_repo_r
         async fn list_workspaces(&self, repo_id: &str) -> StoreResult<Vec<WorkspaceState>> {
             self.inner.list_workspaces(repo_id).await
         }
-        async fn delete_workspace(
-            &self,
-            repo_id: &str,
-            user: &str,
-            workspace_name: &str,
-        ) -> StoreResult<bool> {
-            self.inner
-                .delete_workspace(repo_id, user, workspace_name)
-                .await
+        async fn delete_workspace(&self, repo_id: &str, workspace_name: &str) -> StoreResult<bool> {
+            self.inner.delete_workspace(repo_id, workspace_name).await
         }
     }
 
@@ -1156,7 +1171,7 @@ async fn test_op_heads_tx_rejects_dangling_head_when_operation_missing_or_repo_r
         );
         assert!(
             raw_meta
-                .get_workspace("repo-dangling", "alice", "ws-race")
+                .get_workspace("repo-dangling", "ws-race")
                 .await
                 .unwrap()
                 .is_none(),
@@ -1181,7 +1196,7 @@ async fn test_op_heads_tx_rejects_dangling_head_when_operation_missing_or_repo_r
         relaxed.put_workspace(&ws_with_op).await.unwrap();
         assert!(
             raw_meta
-                .get_workspace("repo-dangling", "alice", "ws-race")
+                .get_workspace("repo-dangling", "ws-race")
                 .await
                 .unwrap()
                 .is_some(),

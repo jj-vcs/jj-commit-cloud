@@ -709,7 +709,6 @@ async fn uncached_rpcs_reject_duplicate_and_non_ascii_authorization_before_upstr
     };
     let sample_get_ws = || GetWorkspaceRequest {
         repo_id: "repo-1".to_string(),
-        user: "alice@example.com".to_string(),
         workspace_name: "default".to_string(),
     };
     let sample_update_ws = || {
@@ -1121,7 +1120,6 @@ async fn grpc_timeout_forwarded_on_uncached_rpcs_and_omitted_on_coalesced_fetche
     let mut ws_req = req_with_upstream(
         GetWorkspaceRequest {
             repo_id: "proj".to_string(),
-            user: "alice".to_string(),
             workspace_name: "default".to_string(),
         },
         &url,

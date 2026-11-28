@@ -531,46 +531,217 @@ async fn test_spanner_shared_project_deduplicates_objects_and_paginates_list_com
 
     // Verify interleaved `Workspaces` persistence on Spanner (including multi-tree conflict roots).
     let ws_op_id = vec![0x11; 16];
-    store
-        .put_operation(
-            "agent-1",
-            &ws_op_id,
-            &Operation {
-                view_id: cc_common::ROOT_VIEW_ID_BYTES.to_vec(),
-                parents: vec![cc_common::ROOT_OPERATION_ID_BYTES.to_vec()],
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
+    let ws_op_id_2 = vec![0x22; 16];
+    for op_id in [&ws_op_id, &ws_op_id_2] {
+        store
+            .put_operation(
+                "agent-1",
+                op_id,
+                &Operation {
+                    view_id: cc_common::ROOT_VIEW_ID_BYTES.to_vec(),
+                    parents: vec![cc_common::ROOT_OPERATION_ID_BYTES.to_vec()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
     #[allow(deprecated)]
     let ws = cc_common::workspace::WorkspaceState {
         repo_id: "agent-1".to_string(),
         user: "bot@example.com".to_string(),
         workspace_name: "sandbox-01".to_string(),
         commit_id: vec![0x05; 20],
-        operation_id: ws_op_id,
+        operation_id: ws_op_id.clone(),
         tree_id: vec![0xaa; 20],
         sparse_patterns: vec!["crates/core".to_string(), "crates/api".to_string()],
         tree_ids: vec![vec![0xaa; 20], vec![0xbb; 20], vec![0xcc; 20]],
         conflict_labels: Vec::new(),
         sparse_patterns_set: true,
     };
-    store.put_workspace(&ws).await.unwrap();
+    // Create-only CAS succeeds on insert and is idempotent on exact retry.
+    store.put_workspace_cas(&ws, Some(&[])).await.unwrap();
+    store.put_workspace_cas(&ws, Some(&[])).await.unwrap();
     let fetched_ws = store
-        .get_workspace("agent-1", "bot@example.com", "sandbox-01")
+        .get_workspace("agent-1", "sandbox-01")
         .await
         .unwrap()
         .unwrap();
     assert_eq!(fetched_ws, ws);
+
+    // Create-only CAS with a differing mutable `user` must return CasConflict rather than
+    // succeeding as an idempotent retry, and stale-op CAS changing `user` also conflicts.
+    let mut updated_user_ws = ws.clone();
+    updated_user_ws.user = "agent-42".to_string();
+    assert!(matches!(
+        store.put_workspace_cas(&updated_user_ws, Some(&[])).await,
+        Err(StoreError::CasConflict(_))
+    ));
+    assert!(matches!(
+        store
+            .put_workspace_cas(&updated_user_ws, Some(&ws_op_id_2))
+            .await,
+        Err(StoreError::CasConflict(_))
+    ));
+    assert_eq!(
+        store.get_workspace("agent-1", "sandbox-01").await.unwrap(),
+        Some(ws.clone())
+    );
+
+    // Valid-op CAS updates `user` in place without creating a second record (both on the same
+    // operation_id and when advancing operation_id together with `user`).
+    store
+        .put_workspace_cas(&updated_user_ws, Some(&ws_op_id))
+        .await
+        .unwrap();
+    let fetched_updated = store
+        .get_workspace("agent-1", "sandbox-01")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fetched_updated, updated_user_ws);
     assert_eq!(store.list_workspaces("agent-1").await.unwrap().len(), 1);
+
+    let mut advanced_ws = updated_user_ws;
+    advanced_ws.user = "alice@example.com".to_string();
+    advanced_ws.operation_id = ws_op_id_2.clone();
+    assert!(matches!(
+        store
+            .put_workspace_cas(&advanced_ws, Some(&ws_op_id_2))
+            .await,
+        Err(StoreError::CasConflict(_))
+    ));
+    store
+        .put_workspace_cas(&advanced_ws, Some(&ws_op_id))
+        .await
+        .unwrap();
+    store
+        .put_workspace_cas(&advanced_ws, Some(&ws_op_id))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_workspace("agent-1", "sandbox-01").await.unwrap(),
+        Some(advanced_ws)
+    );
+    assert_eq!(store.list_workspaces("agent-1").await.unwrap().len(), 1);
+
     assert!(
         store
-            .delete_workspace("agent-1", "bot@example.com", "sandbox-01")
+            .delete_workspace("agent-1", "sandbox-01")
             .await
             .unwrap()
     );
     assert!(store.list_workspaces("agent-1").await.unwrap().is_empty());
+
+    // Verify `list_workspaces_page` keyset pagination orders strictly by `WorkspaceName ASC`
+    // across varied `user` values, handles exact page boundaries, and returns empty pages past
+    // the end.
+    assert_eq!(
+        store
+            .list_workspaces_page("agent-1", None, 0, None)
+            .await
+            .unwrap(),
+        (Vec::new(), false)
+    );
+    let page_entries = [
+        ("Bob@example.com", "z"),
+        ("alice@example.com", "ws.dot"),
+        ("", "anon-b"),
+        ("agent-42", "ws-dash"),
+        ("", "anon-a"),
+        ("Bob@example.com", "A"),
+    ];
+    for (user, ws_name) in page_entries {
+        let mut entry_ws = ws.clone();
+        entry_ws.user = user.to_string();
+        entry_ws.workspace_name = ws_name.to_string();
+        store.put_workspace(&entry_ws).await.unwrap();
+    }
+    let expected_ws_keys = vec![
+        ("Bob@example.com".to_string(), "A".to_string()),
+        ("".to_string(), "anon-a".to_string()),
+        ("".to_string(), "anon-b".to_string()),
+        ("agent-42".to_string(), "ws-dash".to_string()),
+        ("alice@example.com".to_string(), "ws.dot".to_string()),
+        ("Bob@example.com".to_string(), "z".to_string()),
+    ];
+    let all_ws = store.list_workspaces("agent-1").await.unwrap();
+    let all_ws_keys: Vec<(String, String)> = all_ws
+        .iter()
+        .map(|w| (w.user.clone(), w.workspace_name.clone()))
+        .collect();
+    assert_eq!(all_ws_keys, expected_ws_keys);
+
+    for page_size in [1usize, 2, 3, 4, 6] {
+        let mut collected = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let (page, has_more) = store
+                .list_workspaces_page("agent-1", cursor.as_deref(), page_size, None)
+                .await
+                .unwrap();
+            assert!(page.len() <= page_size);
+            if let Some(last) = page.last() {
+                cursor = Some(last.workspace_name.clone());
+            }
+            collected.extend(page);
+            if !has_more {
+                break;
+            }
+        }
+        assert_eq!(
+            collected, all_ws,
+            "keyset pagination mismatch for page_size={page_size}"
+        );
+    }
+
+    let (after_anon_a, has_more_after_anon_a) = store
+        .list_workspaces_page("agent-1", Some("anon-a"), 2, None)
+        .await
+        .unwrap();
+    assert!(has_more_after_anon_a);
+    let after_anon_a_keys: Vec<(&str, &str)> = after_anon_a
+        .iter()
+        .map(|w| (w.user.as_str(), w.workspace_name.as_str()))
+        .collect();
+    assert_eq!(
+        after_anon_a_keys,
+        vec![("", "anon-b"), ("agent-42", "ws-dash")]
+    );
+
+    let (last_page, has_more_last) = store
+        .list_workspaces_page("agent-1", Some("ws.dot"), 1, None)
+        .await
+        .unwrap();
+    assert!(!has_more_last);
+    assert_eq!(
+        last_page
+            .iter()
+            .map(|w| (w.user.as_str(), w.workspace_name.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("Bob@example.com", "z")]
+    );
+    assert_eq!(
+        store
+            .list_workspaces_page("agent-1", Some("z"), 5, None)
+            .await
+            .unwrap(),
+        (Vec::new(), false)
+    );
+    assert_eq!(
+        store
+            .list_workspaces_page("agent-1", Some("zz"), 5, None)
+            .await
+            .unwrap(),
+        (Vec::new(), false)
+    );
+    let (byte_capped, has_more_capped) = store
+        .list_workspaces_page("agent-1", None, 10, Some(1))
+        .await
+        .unwrap();
+    assert_eq!(byte_capped.len(), 1);
+    assert_eq!(byte_capped[0].workspace_name, "A");
+    assert!(has_more_capped);
 }
 
 #[tokio::test]

@@ -203,6 +203,79 @@ pub(super) fn configure_writer_connection(conn: &mut Connection) -> StoreResult<
         }
     }
 
+    // Reject pre-migration or incompatible `workspaces` tables before `CREATE TABLE IF NOT EXISTS`
+    // leaves a stale schema intact (e.g. legacy `user_email`, missing `user`, or a 3-column
+    // `PRIMARY KEY(repo_id, user, workspace_name)` that would let `INSERT OR REPLACE` insert
+    // duplicate rows for the same `(repo_id, workspace_name)` whenever `user` changes).
+    let workspaces_exists: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND LOWER(name) = 'workspaces')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| {
+            StoreError::Backend(format!("failed to inspect SQLite workspaces table: {e}"))
+        })?;
+    if workspaces_exists {
+        let mut stmt = tx
+            .prepare("SELECT name, pk FROM pragma_table_info('workspaces')")
+            .map_err(|e| {
+                StoreError::Backend(format!("failed to inspect SQLite workspaces columns: {e}"))
+            })?;
+        let mut has_user_email = false;
+        let mut has_user = false;
+        let mut pk_cols: Vec<(i64, String)> = Vec::new();
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|e| {
+                StoreError::Backend(format!("failed to query SQLite workspaces columns: {e}"))
+            })?;
+        for row in rows {
+            let (name, pk) = row.map_err(|e| {
+                StoreError::Backend(format!("failed to read SQLite workspaces column info: {e}"))
+            })?;
+            let lower = name.to_ascii_lowercase();
+            if lower == "user_email" {
+                has_user_email = true;
+            } else if lower == "user" {
+                has_user = true;
+            }
+            if pk > 0 {
+                pk_cols.push((pk, lower));
+            }
+        }
+        drop(stmt);
+
+        if has_user_email {
+            return Err(StoreError::InvalidArgument(
+                "detected incompatible SQLite database ('workspaces' table uses legacy 'user_email' \
+                 column); use a new --sqlite-path or migrate 'workspaces' to \
+                 PRIMARY KEY(repo_id, workspace_name) with non-key 'user' before starting jj-cc-server"
+                    .to_string(),
+            ));
+        }
+        if !has_user {
+            return Err(StoreError::InvalidArgument(
+                "detected incompatible SQLite database ('workspaces' table lacks 'user' column); \
+                 use a new --sqlite-path or migrate 'workspaces' to \
+                 PRIMARY KEY(repo_id, workspace_name) with non-key 'user' before starting jj-cc-server"
+                    .to_string(),
+            ));
+        }
+        pk_cols.sort_by_key(|(pk, _)| *pk);
+        let pk_names: Vec<&str> = pk_cols.iter().map(|(_, name)| name.as_str()).collect();
+        if pk_names != ["repo_id", "workspace_name"] {
+            return Err(StoreError::InvalidArgument(format!(
+                "detected incompatible SQLite database ('workspaces' table has PRIMARY KEY({}), \
+                 expected PRIMARY KEY(repo_id, workspace_name)); use a new --sqlite-path or \
+                 migrate 'workspaces' before starting jj-cc-server",
+                pk_names.join(", ")
+            )));
+        }
+    }
+
     tx.execute_batch(SQLITE_SCHEMA)
         .map_err(|e| StoreError::Backend(format!("failed to initialize SQLite schema: {e}")))?;
 

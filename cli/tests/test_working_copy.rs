@@ -99,7 +99,6 @@ async fn test_commit_cloud_working_copy_syncs_state_sparse_patterns_and_cli_comm
         let ws = client
             .get_workspace(GetWorkspaceRequest {
                 repo_id: repo_clone.clone(),
-                user: "ws.tester@example.com".to_string(),
                 workspace_name: "default".to_string(),
             })
             .await?
@@ -109,7 +108,6 @@ async fn test_commit_cloud_working_copy_syncs_state_sparse_patterns_and_cli_comm
         let ch = client
             .check_working_copy_changes(CheckWorkingCopyChangesRequest {
                 repo_id: repo_clone,
-                user: "ws.tester@example.com".to_string(),
                 workspace_name: "default".to_string(),
             })
             .await?
@@ -281,7 +279,6 @@ async fn test_commit_cloud_working_copy_preserves_conflicted_merge_trees_in_work
         let ws = client
             .get_workspace(GetWorkspaceRequest {
                 repo_id: cfg.repo_id.clone(),
-                user: "ws.tester@example.com".to_string(),
                 workspace_name: "default".to_string(),
             })
             .await?
@@ -291,7 +288,6 @@ async fn test_commit_cloud_working_copy_preserves_conflicted_merge_trees_in_work
         let ch = client
             .check_working_copy_changes(CheckWorkingCopyChangesRequest {
                 repo_id: cfg.repo_id,
-                user: "ws.tester@example.com".to_string(),
                 workspace_name: "default".to_string(),
             })
             .await?
@@ -378,7 +374,6 @@ async fn test_snapshot_only_command_keeps_workspace_commit_current() {
             let ws = client
                 .get_workspace(GetWorkspaceRequest {
                     repo_id: cfg.repo_id.clone(),
-                    user: "ws.tester@example.com".to_string(),
                     workspace_name: "default".to_string(),
                 })
                 .await?
@@ -388,7 +383,6 @@ async fn test_snapshot_only_command_keeps_workspace_commit_current() {
             let ch = client
                 .check_working_copy_changes(CheckWorkingCopyChangesRequest {
                     repo_id: cfg.repo_id,
-                    user: "ws.tester@example.com".to_string(),
                     workspace_name: "default".to_string(),
                 })
                 .await?
@@ -644,12 +638,9 @@ async fn test_delete_workspace_succeeds() {
         .await
         .expect("Failed to connect to WorkspaceService");
 
-    let user = "test.user@example.com".to_string();
-
     let response = client
         .get_workspace(GetWorkspaceRequest {
             repo_id: repo_id.clone(),
-            user: user.clone(),
             workspace_name: "default".to_string(),
         })
         .await
@@ -660,7 +651,6 @@ async fn test_delete_workspace_succeeds() {
     let del_resp = client
         .delete_workspace(DeleteWorkspaceRequest {
             repo_id: repo_id.clone(),
-            user: user.clone(),
             workspace_name: "default".to_string(),
         })
         .await
@@ -671,7 +661,6 @@ async fn test_delete_workspace_succeeds() {
     let response = client
         .get_workspace(GetWorkspaceRequest {
             repo_id: repo_id.clone(),
-            user: user.clone(),
             workspace_name: "default".to_string(),
         })
         .await
@@ -707,7 +696,6 @@ async fn test_delete_workspace_nonexistent_returns_false() {
     let del_resp = client
         .delete_workspace(DeleteWorkspaceRequest {
             repo_id: repo_id.clone(),
-            user: "test.user@example.com".to_string(),
             workspace_name: "nonexistent_workspace".to_string(),
         })
         .await
@@ -721,7 +709,6 @@ async fn test_delete_workspace_nonexistent_returns_false() {
     let del_resp2 = client
         .delete_workspace(DeleteWorkspaceRequest {
             repo_id: "nonexistent_repo".to_string(),
-            user: "test.user@example.com".to_string(),
             workspace_name: "default".to_string(),
         })
         .await
@@ -756,7 +743,6 @@ async fn test_check_working_copy_changes_succeeds() {
     let response = client
         .check_working_copy_changes(CheckWorkingCopyChangesRequest {
             repo_id,
-            user: "test.user@example.com".to_string(),
             workspace_name: "default".to_string(),
         })
         .await
@@ -789,7 +775,6 @@ async fn test_check_working_copy_changes_nonexistent_workspace_fails() {
     let result = client
         .check_working_copy_changes(CheckWorkingCopyChangesRequest {
             repo_id,
-            user: "test.user@example.com".to_string(),
             workspace_name: "nonexistent".to_string(),
         })
         .await;
@@ -892,7 +877,6 @@ async fn test_workspace_cas_conflicts_sparse_pagination_and_preconditions() {
     let fetched_empty_sparse = client
         .get_workspace(GetWorkspaceRequest {
             repo_id: repo_id.clone(),
-            user: "agent@example.com".to_string(),
             workspace_name: "agent-1".to_string(),
         })
         .await
@@ -986,7 +970,6 @@ async fn test_workspace_cas_conflicts_sparse_pagination_and_preconditions() {
     let check_resp = client
         .check_working_copy_changes(CheckWorkingCopyChangesRequest {
             repo_id: repo_id.clone(),
-            user: "agent@example.com".to_string(),
             workspace_name: "agent-1".to_string(),
         })
         .await
@@ -1061,7 +1044,6 @@ async fn test_working_copy_sparse_after_snapshot_rename_and_unregistered_repo_no
         client
             .get_workspace(GetWorkspaceRequest {
                 repo_id: "missing-repo".to_string(),
-                user: "test.user@example.com".to_string(),
                 workspace_name: "default".to_string(),
             })
             .await
@@ -1085,7 +1067,6 @@ async fn test_working_copy_sparse_after_snapshot_rename_and_unregistered_repo_no
         client
             .check_working_copy_changes(CheckWorkingCopyChangesRequest {
                 repo_id: "missing-repo".to_string(),
-                user: "test.user@example.com".to_string(),
                 workspace_name: "default".to_string(),
             })
             .await
@@ -1121,7 +1102,6 @@ async fn test_working_copy_sparse_after_snapshot_rename_and_unregistered_repo_no
     let after_sparse = client
         .get_workspace(GetWorkspaceRequest {
             repo_id: repo_id.clone(),
-            user: "test.user@example.com".to_string(),
             workspace_name: "default".to_string(),
         })
         .await
@@ -1145,7 +1125,6 @@ async fn test_working_copy_sparse_after_snapshot_rename_and_unregistered_repo_no
     let clean_check = client
         .check_working_copy_changes(CheckWorkingCopyChangesRequest {
             repo_id: repo_id.clone(),
-            user: "test.user@example.com".to_string(),
             workspace_name: "default".to_string(),
         })
         .await
@@ -1161,7 +1140,6 @@ async fn test_working_copy_sparse_after_snapshot_rename_and_unregistered_repo_no
     let old_ws = client
         .get_workspace(GetWorkspaceRequest {
             repo_id: repo_id.clone(),
-            user: "test.user@example.com".to_string(),
             workspace_name: "default".to_string(),
         })
         .await
@@ -1172,7 +1150,6 @@ async fn test_working_copy_sparse_after_snapshot_rename_and_unregistered_repo_no
     let new_ws = client
         .get_workspace(GetWorkspaceRequest {
             repo_id: repo_id.clone(),
-            user: "test.user@example.com".to_string(),
             workspace_name: "renamed-ws".to_string(),
         })
         .await
@@ -1263,7 +1240,6 @@ async fn test_working_copy_real_conflicted_checkout_and_slash_workspace_name() {
     let ws_state = client
         .get_workspace(GetWorkspaceRequest {
             repo_id: repo_id.clone(),
-            user: "test.user@example.com".to_string(),
             workspace_name: "default".to_string(),
         })
         .await
@@ -1281,7 +1257,6 @@ async fn test_working_copy_real_conflicted_checkout_and_slash_workspace_name() {
     let check_resp = client
         .check_working_copy_changes(CheckWorkingCopyChangesRequest {
             repo_id: repo_id.clone(),
-            user: "test.user@example.com".to_string(),
             workspace_name: "default".to_string(),
         })
         .await
@@ -1301,7 +1276,6 @@ async fn test_working_copy_real_conflicted_checkout_and_slash_workspace_name() {
     let old_ws = client
         .get_workspace(GetWorkspaceRequest {
             repo_id: repo_id.clone(),
-            user: "test.user@example.com".to_string(),
             workspace_name: "default".to_string(),
         })
         .await
@@ -1312,7 +1286,6 @@ async fn test_working_copy_real_conflicted_checkout_and_slash_workspace_name() {
     let renamed_ws = client
         .get_workspace(GetWorkspaceRequest {
             repo_id,
-            user: "test.user@example.com".to_string(),
             workspace_name: "feature/conflict-test".to_string(),
         })
         .await
@@ -1478,14 +1451,14 @@ async fn test_cc_workspace_rejects_traversal_and_nonexistent_repo_dir() {
 }
 
 #[tokio::test]
-async fn test_working_copy_fails_without_user_identity() {
+async fn test_working_copy_accepts_non_email_and_empty_user_identity() {
     let dir = tempfile::tempdir().expect("tempdir");
     let xdg = dir.path().join("xdg");
     fs::create_dir_all(&xdg).unwrap();
     let server = testutils::spawn_server().await;
 
-    // 1. Missing user.email with empty config and cleared env vars fails closed (no fallback).
-    let dest_missing = dir.path().join("ws_no_identity");
+    // Missing `user.email` and `user.name` succeeds and stores `user == ""`.
+    let dest_empty = dir.path().join("ws_no_identity");
     let mut cmd = server.jj_cmd();
     cmd.env("XDG_CONFIG_HOME", &xdg)
         .env_remove("JJ_USER")
@@ -1503,23 +1476,59 @@ async fn test_working_copy_fails_without_user_identity() {
             "user.email=''",
             "--config",
             "user.name=''",
-            dest_missing.to_str().unwrap(),
-        ]);
-    let output = cmd.assert().failure();
-    let stderr = String::from_utf8_lossy(&output.get_output().stderr);
-    assert!(
-        stderr.contains("user.email") || stderr.contains("User email"),
-        "stderr should mention missing user.email, got: {stderr}"
-    );
-    assert!(
-        !dest_missing.exists(),
-        "failed init without user.email must not leave destination behind"
-    );
+            dest_empty.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
 
-    // 2. Explicit `--config user.email=''` must override `JJ_EMAIL` instead of reading env directly.
-    let dest_override = dir.path().join("ws_env_override");
-    let mut override_cmd = server.jj_cmd();
-    override_cmd
+    let empty_cfg = CommitCloudConfig::load_from_store(&dest_empty).unwrap();
+    let mut client = WorkspaceServiceClient::connect(server.url().to_string())
+        .await
+        .expect("Failed to connect to WorkspaceService");
+    let empty_ws = client
+        .get_workspace(GetWorkspaceRequest {
+            repo_id: empty_cfg.repo_id.clone(),
+            workspace_name: "default".to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .workspace
+        .expect("workspace with empty user must persist");
+    assert_eq!(empty_ws.user, "");
+
+    // `jj cc workspace list` and `status` omit empty `user`.
+    let mut list_cmd = server.jj_cmd();
+    list_cmd
+        .current_dir(&dest_empty)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .env_remove("JJ_USER")
+        .env_remove("JJ_EMAIL")
+        .env_remove("USER")
+        .args(["cc", "workspace", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("default: commit="))
+        .stdout(predicate::str::contains("()").not());
+
+    let mut status_cmd = server.jj_cmd();
+    status_cmd
+        .current_dir(&dest_empty)
+        .env("XDG_CONFIG_HOME", &xdg)
+        .env_remove("JJ_USER")
+        .env_remove("JJ_EMAIL")
+        .env_remove("USER")
+        .args(["cc", "workspace", "status"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Workspace: default"))
+        .stdout(predicate::str::contains("User:").not());
+
+    // Empty `user.email` falls back to non-email `user.name` (e.g., `agent-42`) even when
+    // `JJ_EMAIL` is set in the environment.
+    let dest_agent = dir.path().join("ws_agent_identity");
+    let mut agent_cmd = server.jj_cmd();
+    agent_cmd
         .env("XDG_CONFIG_HOME", &xdg)
         .env("JJ_EMAIL", "env.bypass@example.com")
         .args([
@@ -1532,41 +1541,55 @@ async fn test_working_copy_fails_without_user_identity() {
             "test-project",
             "--config",
             "user.email=''",
-            dest_override.to_str().unwrap(),
-        ]);
-    let override_out = override_cmd.assert().failure();
-    let override_stderr = String::from_utf8_lossy(&override_out.get_output().stderr);
-    assert!(
-        override_stderr.contains("user.email") || override_stderr.contains("User email"),
-        "explicit empty user.email config must fail closed even when JJ_EMAIL is set, got: {override_stderr}"
-    );
-    assert!(!dest_override.exists());
-
-    // 3. Loading an existing commit_cloud working copy with `--config user.email=''` also fails closed.
-    let ws_valid = dir.path().join("ws_valid");
-    jj_cmd(&server, dir.path(), &xdg)
-        .args([
-            "cc",
-            "init",
-            "--create",
-            "--server",
-            server.url(),
-            "--project-id",
-            "test-project",
-            ws_valid.to_str().unwrap(),
+            "--config",
+            "user.name='agent-42'",
+            dest_agent.to_str().unwrap(),
         ])
         .assert()
         .success();
 
-    let load_out = jj_cmd(&server, &ws_valid, &xdg)
-        .args(["--config", "user.email=''", "status"])
+    let agent_cfg = CommitCloudConfig::load_from_store(&dest_agent).unwrap();
+    let agent_ws = client
+        .get_workspace(GetWorkspaceRequest {
+            repo_id: agent_cfg.repo_id,
+            workspace_name: "default".to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .workspace
+        .expect("agent workspace must persist");
+    assert_eq!(agent_ws.user, "agent-42");
+
+    // Loading and snapshotting an existing `commit_cloud` working copy under a different `user`
+    // succeeds and updates the mutable non-key `user` attribute in place without creating duplicates.
+    fs::write(dest_empty.join("owner-update.txt"), "updated by runner\n").unwrap();
+    jj_cmd(&server, &dest_empty, &xdg)
+        .args(["--config", "user.email='sa-runner-01'", "status"])
         .assert()
-        .failure();
-    let load_stderr = String::from_utf8_lossy(&load_out.get_output().stderr);
-    assert!(
-        load_stderr.contains("user.email") || load_stderr.contains("User email"),
-        "loading commit_cloud working copy without user.email must fail closed, got: {load_stderr}"
-    );
+        .success();
+    let updated_ws = client
+        .get_workspace(GetWorkspaceRequest {
+            repo_id: empty_cfg.repo_id.clone(),
+            workspace_name: "default".to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .workspace
+        .expect("workspace must still exist after user update");
+    assert_eq!(updated_ws.user, "sa-runner-01");
+    let listed_empty = client
+        .list_workspaces(ListWorkspacesRequest {
+            repo_id: empty_cfg.repo_id,
+            page_size: 10,
+            page_token: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .workspaces;
+    assert_eq!(listed_empty.len(), 1);
 }
 
 #[tokio::test]
@@ -1609,22 +1632,16 @@ async fn test_cc_workspace_status_reads_non_default_name_without_user_email() {
         .assert()
         .success();
 
-    // Run `jj cc workspace status --user <email>` inside the non-default workspace with an empty
-    // XDG_CONFIG_HOME and no `JJ_EMAIL`/`user.email`: must resolve `ws-1234` from `.jj/working_copy`
-    // metadata rather than silently falling back to `"default"`.
+    // Inside the non-default workspace with empty XDG_CONFIG_HOME and no `JJ_EMAIL`/`user.email`,
+    // `jj cc workspace status` must resolve `ws-1234` from `.jj/working_copy` metadata rather
+    // than falling back to `"default"`.
     let mut cmd = server.jj_cmd();
     cmd.current_dir(&ws_clone)
         .env("XDG_CONFIG_HOME", &xdg_empty)
         .env_remove("JJ_USER")
         .env_remove("JJ_EMAIL")
         .env_remove("USER")
-        .args([
-            "cc",
-            "workspace",
-            "status",
-            "--user",
-            "ws.tester@example.com",
-        ])
+        .args(["cc", "workspace", "status"])
         .assert()
         .success()
         .stdout(predicate::str::contains("Workspace: ws-1234"))
@@ -1644,8 +1661,6 @@ async fn test_cc_workspace_status_reads_non_default_name_without_user_email() {
             "cc",
             "workspace",
             "status",
-            "--user",
-            "ws.tester@example.com",
             "--repo-dir",
             ws_clone.to_str().unwrap(),
         ])
@@ -1663,13 +1678,7 @@ async fn test_cc_workspace_status_reads_non_default_name_without_user_email() {
         .env_remove("JJ_USER")
         .env_remove("JJ_EMAIL")
         .env_remove("USER")
-        .args([
-            "cc",
-            "workspace",
-            "status",
-            "--user",
-            "ws.tester@example.com",
-        ])
+        .args(["cc", "workspace", "status"])
         .assert()
         .failure()
         .stderr(predicate::str::contains(

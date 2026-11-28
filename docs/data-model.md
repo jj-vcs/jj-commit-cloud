@@ -65,7 +65,7 @@ A view captures what a repository sees at a specific operation: its visible head
 
 ### Workspace
 
-A workspace record in [workspace.proto](../common/proto/workspace.proto) tracks an attached local or virtual checkout keyed by `(repo_id, user, workspace_name)`. It records the checkout's materialized `commit_id`, `operation_id`, root `tree_ids` (preserving every side of a `Merge<TreeId>` when a conflicted commit is checked out alongside legacy `tree_id`), `conflict_labels`, and active `sparse_patterns` with `sparse_patterns_set` (distinguishing an explicit empty `jj sparse set --clear` checkout from an omitted field), letting tools and agent orchestrators inspect workspace health across machines.
+A workspace record in [workspace.proto](../common/proto/workspace.proto) tracks an attached local or virtual checkout keyed by `(repo_id, workspace_name)`, matching jj's `View.wc_commit_ids` map. The `user` field is a mutable non-key attribute accepting human, agent, service-account, or empty identifiers. Each record stores the materialized `commit_id`, `operation_id`, root `tree_ids`, `conflict_labels`, and `sparse_patterns`, letting tools and orchestrators inspect workspace health across machines. `tree_ids` preserves every side of a conflicted `Merge<TreeId>` checkout alongside the legacy `tree_id` field, and `sparse_patterns_set` distinguishes an explicit empty `jj sparse set --clear` checkout from an omitted field.
 
 ### Commit
 
@@ -132,7 +132,7 @@ flowchart TD
     classDef storage fill:#e8f5e9,stroke:#2e7d32,color:#000;
 
     Repos["Repositories (Top-Level)<br/>PK: (RepoId)<br/>ProjectId & OpHeads"]:::oplog
-    Workspaces["Workspaces (Interleaved)<br/>PK: (RepoId, UserEmail,<br/>WorkspaceName)"]:::oplog
+    Workspaces["Workspaces (Interleaved)<br/>PK: (RepoId, WorkspaceName)<br/>Non-Key: User"]:::oplog
     OpsViews["Operations & Views<br/>(Top-Level)<br/>PK: (RepoId, Id)"]:::oplog
 
     Projects["Projects (Top-Level)<br/>PK: (ProjectId)"]:::cas

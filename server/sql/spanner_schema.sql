@@ -101,15 +101,15 @@ CREATE TABLE IF NOT EXISTS Operations(
 
 CREATE TABLE IF NOT EXISTS Workspaces(
   RepoId STRING(128) NOT NULL,
-  UserEmail STRING(256) NOT NULL,
   WorkspaceName STRING(256) NOT NULL,
+  User STRING(256) NOT NULL,
   CommitId BYTES(64) NOT NULL,
   OperationId BYTES(64) NOT NULL,
   TreeId BYTES(64) NOT NULL,
   TreeIds ARRAY < BYTES(64) > NOT NULL,
   ConflictLabels ARRAY < STRING(MAX) > NOT NULL,
   SparsePatterns ARRAY < STRING(MAX) > NOT NULL)
-  PRIMARY KEY(RepoId, UserEmail, WorkspaceName),
+  PRIMARY KEY(RepoId, WorkspaceName),
   INTERLEAVE IN PARENT Repositories
 ON DELETE CASCADE;
 

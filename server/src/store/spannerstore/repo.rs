@@ -166,7 +166,7 @@ impl SpannerMetadataStore {
                     // children and `Repositories` atomically in this single transaction;
                     // otherwise delete `batch_limit` child rows and continue draining.
                     let ws_stmt = Statement::builder(
-                        "SELECT UserEmail, WorkspaceName FROM Workspaces
+                        "SELECT WorkspaceName FROM Workspaces
                          WHERE RepoId = @repo_id
                          LIMIT @limit",
                     )
@@ -176,9 +176,8 @@ impl SpannerMetadataStore {
                     let mut ws_rs = tx.execute_query(ws_stmt).await?;
                     let mut ws_keys = Vec::new();
                     while let Some(row) = ws_rs.next().await.transpose()? {
-                        let user: String = row.get("UserEmail")?;
                         let ws_name: String = row.get("WorkspaceName")?;
-                        ws_keys.push((user, ws_name));
+                        ws_keys.push(ws_name);
                     }
                     if ws_keys.len() > batch_limit_usize {
                         ws_keys.truncate(batch_limit_usize);

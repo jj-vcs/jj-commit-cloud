@@ -41,13 +41,13 @@ fn test_sqlite_concurrent_legacy_column_migration_succeeds() {
             );
             CREATE TABLE workspaces (
                 repo_id TEXT NOT NULL,
-                user_email TEXT NOT NULL,
                 workspace_name TEXT NOT NULL,
+                user TEXT NOT NULL,
                 commit_id BLOB NOT NULL,
                 operation_id BLOB NOT NULL,
                 tree_id BLOB NOT NULL,
                 sparse_patterns_json TEXT NOT NULL,
-                PRIMARY KEY (repo_id, user_email, workspace_name)
+                PRIMARY KEY (repo_id, workspace_name)
             );
             CREATE TABLE operations (
                 repo_id TEXT NOT NULL,
@@ -462,8 +462,8 @@ async fn test_sqlite_list_workspaces_page_and_negative_commit_sync_token_rejecti
     assert!(ids.is_empty());
     assert!(!has_more);
 
-    // Keyset pagination on workspaces orders by (user_email ASC, workspace_name ASC).
-    for (user, ws_name) in [("carol", "z"), ("alice", "b"), ("bob", "a"), ("alice", "a")] {
+    // Keyset pagination on workspaces orders strictly by `workspace_name ASC` regardless of `user`.
+    for (user, ws_name) in [("carol", "z"), ("agent-42", "b"), ("bob", "a"), ("", "c")] {
         #[allow(deprecated)]
         meta.put_workspace(&WorkspaceState {
             repo_id: "ws-repo".to_string(),
@@ -480,6 +480,23 @@ async fn test_sqlite_list_workspaces_page_and_negative_commit_sync_token_rejecti
         .await
         .unwrap();
     }
+    // Upserting the same `(repo_id, workspace_name)` with a different `user` updates `user`
+    // in place instead of inserting a duplicate row.
+    #[allow(deprecated)]
+    meta.put_workspace(&WorkspaceState {
+        repo_id: "ws-repo".to_string(),
+        user: "sa-runner-01".to_string(),
+        workspace_name: "a".to_string(),
+        commit_id: cc_common::ROOT_COMMIT_ID_BYTES.to_vec(),
+        operation_id: cc_common::ROOT_OPERATION_ID_BYTES.to_vec(),
+        tree_id: cc_common::EMPTY_TREE_ID_BYTES.to_vec(),
+        tree_ids: vec![cc_common::EMPTY_TREE_ID_BYTES.to_vec()],
+        conflict_labels: Vec::new(),
+        sparse_patterns: vec![String::new()],
+        sparse_patterns_set: true,
+    })
+    .await
+    .unwrap();
     assert_eq!(
         meta.list_workspaces_page("ws-repo", None, 0, None)
             .await
@@ -495,10 +512,10 @@ async fn test_sqlite_list_workspaces_page_and_negative_commit_sync_token_rejecti
         p1.iter()
             .map(|w| (w.user.as_str(), w.workspace_name.as_str()))
             .collect::<Vec<_>>(),
-        vec![("alice", "a"), ("alice", "b")]
+        vec![("sa-runner-01", "a"), ("agent-42", "b")]
     );
     let (p2, has_more2) = meta
-        .list_workspaces_page("ws-repo", Some(("alice", "b")), 2, None)
+        .list_workspaces_page("ws-repo", Some("b"), 2, None)
         .await
         .unwrap();
     assert!(!has_more2);
@@ -506,14 +523,106 @@ async fn test_sqlite_list_workspaces_page_and_negative_commit_sync_token_rejecti
         p2.iter()
             .map(|w| (w.user.as_str(), w.workspace_name.as_str()))
             .collect::<Vec<_>>(),
-        vec![("bob", "a"), ("carol", "z")]
+        vec![("", "c"), ("carol", "z")]
     );
     assert_eq!(
-        meta.list_workspaces_page("ws-repo", Some(("carol", "z")), 2, None)
+        meta.list_workspaces_page("ws-repo", Some("z"), 2, None)
             .await
             .unwrap(),
         (Vec::new(), false)
     );
+}
+
+#[test]
+fn test_sqlite_rejects_legacy_user_email_workspaces_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let cases = [
+        (
+            "legacy_ws_user_email.db",
+            "CREATE TABLE workspaces (
+                repo_id TEXT NOT NULL,
+                user_email TEXT NOT NULL,
+                workspace_name TEXT NOT NULL,
+                commit_id BLOB NOT NULL,
+                operation_id BLOB NOT NULL,
+                tree_id BLOB NOT NULL,
+                sparse_patterns_json TEXT NOT NULL,
+                PRIMARY KEY (repo_id, user_email, workspace_name)
+            );",
+        ),
+        (
+            "legacy_ws_3col_user_pk.db",
+            "CREATE TABLE workspaces (
+                repo_id TEXT NOT NULL,
+                user TEXT NOT NULL,
+                workspace_name TEXT NOT NULL,
+                commit_id BLOB NOT NULL,
+                operation_id BLOB NOT NULL,
+                tree_id BLOB NOT NULL,
+                sparse_patterns_json TEXT NOT NULL,
+                PRIMARY KEY (repo_id, user, workspace_name)
+            );",
+        ),
+        (
+            "legacy_ws_missing_user.db",
+            "CREATE TABLE workspaces (
+                repo_id TEXT NOT NULL,
+                workspace_name TEXT NOT NULL,
+                commit_id BLOB NOT NULL,
+                operation_id BLOB NOT NULL,
+                tree_id BLOB NOT NULL,
+                sparse_patterns_json TEXT NOT NULL,
+                PRIMARY KEY (repo_id, workspace_name)
+            );",
+        ),
+        (
+            "legacy_ws_mixed_case_user_email.db",
+            "CREATE TABLE Workspaces (
+                repo_id TEXT NOT NULL,
+                user_email TEXT NOT NULL,
+                workspace_name TEXT NOT NULL,
+                commit_id BLOB NOT NULL,
+                operation_id BLOB NOT NULL,
+                tree_id BLOB NOT NULL,
+                sparse_patterns_json TEXT NOT NULL,
+                PRIMARY KEY (repo_id, user_email, workspace_name)
+            );",
+        ),
+        (
+            "legacy_ws_upper_case_3col_pk.db",
+            "CREATE TABLE WORKSPACES (
+                repo_id TEXT NOT NULL,
+                user TEXT NOT NULL,
+                workspace_name TEXT NOT NULL,
+                commit_id BLOB NOT NULL,
+                operation_id BLOB NOT NULL,
+                tree_id BLOB NOT NULL,
+                sparse_patterns_json TEXT NOT NULL,
+                PRIMARY KEY (repo_id, user, workspace_name)
+            );",
+        ),
+    ];
+
+    for (file_name, ddl) in cases {
+        let db_path = dir.path().join(file_name);
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(ddl).unwrap();
+        }
+        let err = match SqliteMetadataStore::open(&db_path) {
+            Ok(_) => panic!("expected InvalidArgument, got Ok"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, StoreError::InvalidArgument(_)),
+            "{file_name}: expected InvalidArgument for incompatible workspaces table, got {err:?}"
+        );
+    }
+
+    // Valid freshly-initialized DB must reopen.
+    let valid_path = dir.path().join("valid_ws.db");
+    drop(SqliteMetadataStore::open(&valid_path).unwrap());
+    drop(SqliteMetadataStore::open(&valid_path).unwrap());
 }
 
 #[tokio::test]
@@ -787,7 +896,7 @@ async fn test_sqlite_corrupt_tree_ids_json_reports_field_and_repo_name_normalize
         // Insert workspaces with malformed JSON and invalid hex in tree_ids_json.
         conn.execute(
             "INSERT INTO workspaces
-             (repo_id, user_email, workspace_name, commit_id, operation_id, tree_id, tree_ids_json, conflict_labels_json, sparse_patterns_json)
+             (repo_id, user, workspace_name, commit_id, operation_id, tree_id, tree_ids_json, conflict_labels_json, sparse_patterns_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '[]', '[]')",
             params![
                 "repo-norm",
@@ -802,7 +911,7 @@ async fn test_sqlite_corrupt_tree_ids_json_reports_field_and_repo_name_normalize
         .unwrap();
         conn.execute(
             "INSERT INTO workspaces
-             (repo_id, user_email, workspace_name, commit_id, operation_id, tree_id, tree_ids_json, conflict_labels_json, sparse_patterns_json)
+             (repo_id, user, workspace_name, commit_id, operation_id, tree_id, tree_ids_json, conflict_labels_json, sparse_patterns_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '[]', '[]')",
             params![
                 "repo-norm",
@@ -818,10 +927,7 @@ async fn test_sqlite_corrupt_tree_ids_json_reports_field_and_repo_name_normalize
     }
 
     for ws_name in ["bad-json", "bad-hex"] {
-        let err = meta
-            .get_workspace("repo-norm", "alice", ws_name)
-            .await
-            .unwrap_err();
+        let err = meta.get_workspace("repo-norm", ws_name).await.unwrap_err();
         match err {
             StoreError::Corruption(msg) => {
                 assert!(

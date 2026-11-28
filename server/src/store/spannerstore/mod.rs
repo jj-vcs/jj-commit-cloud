@@ -769,10 +769,9 @@ impl MetadataStore for SpannerMetadataStore {
     async fn get_workspace(
         &self,
         repo_id: &str,
-        user: &str,
         workspace_name: &str,
     ) -> StoreResult<Option<WorkspaceState>> {
-        self.get_workspace_impl(repo_id, user, workspace_name).await
+        self.get_workspace_impl(repo_id, workspace_name).await
     }
 
     async fn put_workspace_cas(
@@ -807,22 +806,16 @@ impl MetadataStore for SpannerMetadataStore {
     async fn list_workspaces_page(
         &self,
         repo_id: &str,
-        after: Option<(&str, &str)>,
+        after_workspace_name: Option<&str>,
         limit: usize,
         max_bytes: Option<usize>,
     ) -> StoreResult<(Vec<WorkspaceState>, bool)> {
-        self.list_workspaces_page_impl(repo_id, after, limit, max_bytes)
+        self.list_workspaces_page_impl(repo_id, after_workspace_name, limit, max_bytes)
             .await
     }
 
-    async fn delete_workspace(
-        &self,
-        repo_id: &str,
-        user: &str,
-        workspace_name: &str,
-    ) -> StoreResult<bool> {
-        self.delete_workspace_impl(repo_id, user, workspace_name)
-            .await
+    async fn delete_workspace(&self, repo_id: &str, workspace_name: &str) -> StoreResult<bool> {
+        self.delete_workspace_impl(repo_id, workspace_name).await
     }
 }
 

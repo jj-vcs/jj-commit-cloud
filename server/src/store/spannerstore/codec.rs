@@ -183,7 +183,7 @@ pub(super) fn decode_spanner_watermark(token: &[u8]) -> StoreResult<(String, Vec
 }
 
 pub(super) fn decode_workspace_row(repo_id: &str, row: &Row) -> StoreResult<WorkspaceState> {
-    let user: String = row.get("UserEmail").map_err(map_spanner_err)?;
+    let user: String = row.get("User").map_err(map_spanner_err)?;
     let workspace_name: String = row.get("WorkspaceName").map_err(map_spanner_err)?;
     let commit_id: Vec<u8> = row.get("CommitId").map_err(map_spanner_err)?;
     let operation_id: Vec<u8> = row.get("OperationId").map_err(map_spanner_err)?;
@@ -415,11 +415,11 @@ pub(super) fn build_project_blob_upsert_mutation(project_id: &str, blob_id: &[u8
 
 pub(super) fn build_workspace_delete_mutation(
     repo_id: &str,
-    keys: &[(String, String)],
+    workspace_names: &[String],
 ) -> Mutation {
     let mut builder = KeySet::builder();
-    for (user_email, workspace_name) in keys {
-        builder = builder.add_key(key![repo_id, user_email.as_str(), workspace_name.as_str()]);
+    for workspace_name in workspace_names {
+        builder = builder.add_key(key![repo_id, workspace_name.as_str()]);
     }
     Mutation::delete("Workspaces", builder.build())
 }

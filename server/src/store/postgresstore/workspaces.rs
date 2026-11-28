@@ -96,10 +96,11 @@ impl PostgresMetadataStore {
                     match tx
                         .execute(
                             "INSERT INTO workspaces
-                             (repo_id, user_email, workspace_name, operation_id, commit_id,
+                             (repo_id, workspace_name, \"user\", operation_id, commit_id,
                               tree_ids, conflict_labels, sparse_patterns, sparse_patterns_set, updated_at)
                              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                             ON CONFLICT (repo_id, user_email, workspace_name) DO UPDATE SET
+                             ON CONFLICT (repo_id, workspace_name) DO UPDATE SET
+                               \"user\" = EXCLUDED.\"user\",
                                operation_id = EXCLUDED.operation_id,
                                commit_id = EXCLUDED.commit_id,
                                tree_ids = EXCLUDED.tree_ids,
@@ -109,8 +110,8 @@ impl PostgresMetadataStore {
                                updated_at = EXCLUDED.updated_at",
                             &[
                                 &ws.repo_id,
-                                &ws.user,
                                 &ws.workspace_name,
+                                &ws.user,
                                 &ws.operation_id,
                                 &ws.commit_id,
                                 &ws.tree_ids,
@@ -135,21 +136,21 @@ impl PostgresMetadataStore {
 
                 let row = tx
                     .query_opt(
-                        "SELECT operation_id, commit_id, tree_ids, conflict_labels, sparse_patterns, sparse_patterns_set
+                        "SELECT \"user\", operation_id, commit_id, tree_ids, conflict_labels, sparse_patterns, sparse_patterns_set
                          FROM workspaces
-                         WHERE repo_id = $1 AND user_email = $2 AND workspace_name = $3
+                         WHERE repo_id = $1 AND workspace_name = $2
                          FOR UPDATE",
-                        &[&ws.repo_id, &ws.user, &ws.workspace_name],
+                        &[&ws.repo_id, &ws.workspace_name],
                     )
                     .await?;
 
                 let existing = row.map(|r| {
                     decode_workspace_row(
                         ws.repo_id.clone(),
-                        ws.user.clone(),
+                        r.get(0),
                         ws.workspace_name.clone(),
                         &r,
-                        0,
+                        1,
                     )
                 });
 
@@ -181,14 +182,14 @@ impl PostgresMetadataStore {
                 if existing.is_some() {
                     tx.execute(
                         "UPDATE workspaces
-                         SET operation_id = $4, commit_id = $5, tree_ids = $6,
+                         SET \"user\" = $3, operation_id = $4, commit_id = $5, tree_ids = $6,
                              conflict_labels = $7, sparse_patterns = $8,
                              sparse_patterns_set = $9, updated_at = $10
-                         WHERE repo_id = $1 AND user_email = $2 AND workspace_name = $3",
+                         WHERE repo_id = $1 AND workspace_name = $2",
                         &[
                             &ws.repo_id,
-                            &ws.user,
                             &ws.workspace_name,
+                            &ws.user,
                             &ws.operation_id,
                             &ws.commit_id,
                             &ws.tree_ids,
@@ -207,14 +208,14 @@ impl PostgresMetadataStore {
                 let inserted = match tx
                     .execute(
                         "INSERT INTO workspaces
-                         (repo_id, user_email, workspace_name, operation_id, commit_id,
+                         (repo_id, workspace_name, \"user\", operation_id, commit_id,
                           tree_ids, conflict_labels, sparse_patterns, sparse_patterns_set, updated_at)
                          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                         ON CONFLICT (repo_id, user_email, workspace_name) DO NOTHING",
+                         ON CONFLICT (repo_id, workspace_name) DO NOTHING",
                         &[
                             &ws.repo_id,
-                            &ws.user,
                             &ws.workspace_name,
+                            &ws.user,
                             &ws.operation_id,
                             &ws.commit_id,
                             &ws.tree_ids,
@@ -239,20 +240,20 @@ impl PostgresMetadataStore {
                 if inserted == 0 {
                     let raced_row = tx
                         .query_opt(
-                            "SELECT operation_id, commit_id, tree_ids, conflict_labels, sparse_patterns, sparse_patterns_set
+                            "SELECT \"user\", operation_id, commit_id, tree_ids, conflict_labels, sparse_patterns, sparse_patterns_set
                              FROM workspaces
-                             WHERE repo_id = $1 AND user_email = $2 AND workspace_name = $3
+                             WHERE repo_id = $1 AND workspace_name = $2
                              FOR UPDATE",
-                            &[&ws.repo_id, &ws.user, &ws.workspace_name],
+                            &[&ws.repo_id, &ws.workspace_name],
                         )
                         .await?;
                     let raced = raced_row.map(|r| {
                         decode_workspace_row(
                             ws.repo_id.clone(),
-                            ws.user.clone(),
+                            r.get(0),
                             ws.workspace_name.clone(),
                             &r,
-                            0,
+                            1,
                         )
                     });
                     match crate::store::check_workspace_cas_precondition(
@@ -279,26 +280,25 @@ impl PostgresMetadataStore {
     pub(super) async fn get_workspace_impl(
         &self,
         repo_id: &str,
-        user: &str,
         workspace_name: &str,
     ) -> StoreResult<Option<WorkspaceState>> {
         let client = self.get_client().await?;
         let row = client
             .query_opt(
-                "SELECT operation_id, commit_id, tree_ids, conflict_labels, sparse_patterns, sparse_patterns_set
+                "SELECT \"user\", operation_id, commit_id, tree_ids, conflict_labels, sparse_patterns, sparse_patterns_set
                  FROM workspaces
-                 WHERE repo_id = $1 AND user_email = $2 AND workspace_name = $3",
-                &[&repo_id, &user, &workspace_name],
+                 WHERE repo_id = $1 AND workspace_name = $2",
+                &[&repo_id, &workspace_name],
             )
             .await
             .map_err(map_pg_err)?;
         Ok(row.map(|r| {
             decode_workspace_row(
                 repo_id.to_string(),
-                user.to_string(),
+                r.get(0),
                 workspace_name.to_string(),
                 &r,
-                0,
+                1,
             )
         }))
     }
@@ -310,11 +310,11 @@ impl PostgresMetadataStore {
         let client = self.get_client().await?;
         let rows = client
             .query(
-                "SELECT user_email, workspace_name, operation_id, commit_id, tree_ids,
+                "SELECT \"user\", workspace_name, operation_id, commit_id, tree_ids,
                         conflict_labels, sparse_patterns, sparse_patterns_set
                  FROM workspaces
                  WHERE repo_id = $1
-                 ORDER BY user_email COLLATE \"C\" ASC, workspace_name COLLATE \"C\" ASC",
+                 ORDER BY workspace_name COLLATE \"C\" ASC",
                 &[&repo_id],
             )
             .await
@@ -328,7 +328,7 @@ impl PostgresMetadataStore {
     pub(super) async fn list_workspaces_page_impl(
         &self,
         repo_id: &str,
-        after: Option<(&str, &str)>,
+        after_workspace_name: Option<&str>,
         limit: usize,
         max_bytes: Option<usize>,
     ) -> StoreResult<(Vec<WorkspaceState>, bool)> {
@@ -337,28 +337,27 @@ impl PostgresMetadataStore {
         }
         let fetch_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
         let client = self.get_client().await?;
-        let rows = match after {
-            Some((after_user, after_ws)) => client
+        let rows = match after_workspace_name {
+            Some(after_ws) => client
                 .query(
-                    "SELECT user_email, workspace_name, operation_id, commit_id, tree_ids,
+                    "SELECT \"user\", workspace_name, operation_id, commit_id, tree_ids,
                             conflict_labels, sparse_patterns, sparse_patterns_set
                      FROM workspaces
                      WHERE repo_id = $1
-                       AND (user_email COLLATE \"C\", workspace_name COLLATE \"C\")
-                           > ($2::TEXT COLLATE \"C\", $3::TEXT COLLATE \"C\")
-                     ORDER BY user_email COLLATE \"C\" ASC, workspace_name COLLATE \"C\" ASC
-                     LIMIT $4",
-                    &[&repo_id, &after_user, &after_ws, &fetch_limit],
+                       AND workspace_name COLLATE \"C\" > $2::TEXT COLLATE \"C\"
+                     ORDER BY workspace_name COLLATE \"C\" ASC
+                     LIMIT $3",
+                    &[&repo_id, &after_ws, &fetch_limit],
                 )
                 .await
                 .map_err(map_pg_err)?,
             None => client
                 .query(
-                    "SELECT user_email, workspace_name, operation_id, commit_id, tree_ids,
+                    "SELECT \"user\", workspace_name, operation_id, commit_id, tree_ids,
                             conflict_labels, sparse_patterns, sparse_patterns_set
                      FROM workspaces
                      WHERE repo_id = $1
-                     ORDER BY user_email COLLATE \"C\" ASC, workspace_name COLLATE \"C\" ASC
+                     ORDER BY workspace_name COLLATE \"C\" ASC
                      LIMIT $2",
                     &[&repo_id, &fetch_limit],
                 )
@@ -388,15 +387,14 @@ impl PostgresMetadataStore {
     pub(super) async fn delete_workspace_impl(
         &self,
         repo_id: &str,
-        user: &str,
         workspace_name: &str,
     ) -> StoreResult<bool> {
         let client = self.get_client().await?;
         let removed = client
             .execute(
                 "DELETE FROM workspaces
-                 WHERE repo_id = $1 AND user_email = $2 AND workspace_name = $3",
-                &[&repo_id, &user, &workspace_name],
+                 WHERE repo_id = $1 AND workspace_name = $2",
+                &[&repo_id, &workspace_name],
             )
             .await
             .map_err(map_pg_err)?;

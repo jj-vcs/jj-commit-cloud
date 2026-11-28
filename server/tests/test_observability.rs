@@ -312,7 +312,6 @@ async fn test_observability_endpoints_live_metrics_and_prometheus_format() {
     workspace
         .delete_workspace(Request::new(DeleteWorkspaceRequest {
             repo_id: "obs-repo".to_string(),
-            user: "alice@example.com".to_string(),
             workspace_name: "ws-1".to_string(),
         }))
         .await
