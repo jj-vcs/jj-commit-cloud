@@ -12,20 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Entrypoint for `jj-cc-server`, wiring gRPC `BackendService`, `OpStoreService`,
-//! `WorkspaceService`, and `tonic_health` with optional constant-time Bearer token
-//! authentication.
+//! Entrypoint and CLI wiring for the `jj-cc-server` gRPC server.
 //!
-//! # Cross-Process and RPC Boundaries
-//! Wraps `BackendService`, `OpStoreService`, and `WorkspaceService` in
-//! [`BearerAuthInterceptor`] while leaving `tonic_health` open for unauthenticated
-//! liveness/readiness probes, and refuses to bind non-loopback `--host` interfaces without
-//! authentication unless `--allow-unauthenticated` is explicitly enabled.
+//! # Authority and Crash-Safety Ordering
+//! Pairs a durable [`MetadataStore`] (`memory`, `sqlite`, or `spanner`) with a
+//! content-addressed [`BlobStore`] (`memory` or `local`) inside [`CompositeStore`]
+//! with `validate_dependencies` enabled before serving gRPC traffic. Refuses to start
+//! `--store-type=spanner` without an explicit blob store so metadata never outlives
+//! throwaway in-memory blobs.
+//!
+//! # Security and Network Boundaries
+//! Loads optional Bearer tokens from `--auth-token` / `--auth-token-file`, scrubs raw
+//! secret buffers after building [`BearerAuthInterceptor`], fails closed on empty token
+//! specs or unauthenticated non-loopback binds (unless `--allow-unauthenticated`), and
+//! exposes gRPC health probes unauthenticated for readiness checks.
 
-#![allow(clippy::result_large_err)]
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::{Parser, ValueEnum};
-use std::sync::Arc;
 use tonic::transport::Server;
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -33,56 +38,134 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use cc_common::backend::backend_service_server::BackendServiceServer;
 use cc_common::op_store::op_store_service_server::OpStoreServiceServer;
 use cc_common::workspace::workspace_service_server::WorkspaceServiceServer;
+use jj_commit_cloud_server::auth::{
+    BearerAuthInterceptor, load_tokens_from_file, resolve_listen_addrs, scrub_tokens,
+};
+use jj_commit_cloud_server::backend::{
+    CommitCloudBackendService, DEFAULT_WRITE_STREAM_SPILL_THRESHOLD_BYTES,
+};
+use jj_commit_cloud_server::op_store::CommitCloudOpStoreService;
+use jj_commit_cloud_server::store::{
+    BlobStore, CompositeStore, CompositeStoreConfig, LocalFsBlobStore, MemoryBlobStore,
+    MemoryMetadataStore, MetadataStore, SpannerConnectConfig, SpannerMetadataStore,
+    SqliteMetadataStore,
+};
+use jj_commit_cloud_server::workspace::CommitCloudWorkspaceService;
 
-pub mod auth;
-mod backend;
-pub mod error_util;
-mod hash_utils;
-pub mod jj_lib_adapters;
-mod op_store;
-pub mod reconcile_op_heads;
-pub mod store;
-mod workspace;
-
-use auth::{BearerAuthInterceptor, load_tokens_from_file, resolve_listen_addrs, scrub_tokens};
-use backend::CommitCloudBackendService;
-use op_store::CommitCloudOpStoreService;
-use store::{MemoryStore, Store};
-use workspace::CommitCloudWorkspaceService;
-
-// Storage backend to run the server against.
-#[derive(Copy, Clone, Debug, ValueEnum)]
+/// Metadata storage backend to run the server against.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 enum StoreType {
     Memory,
     Sqlite,
     Spanner,
 }
 
+/// Content-addressed blob storage backend.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum BlobStoreType {
+    Memory,
+    Local,
+}
+
+/// Upper bound for `--inline-blob-threshold-bytes` (4 MiB), matching the streaming upload
+/// spill threshold and staying well under Cloud Spanner's 10 MiB column limit.
+const MAX_INLINE_BLOB_THRESHOLD_BYTES: usize = DEFAULT_WRITE_STREAM_SPILL_THRESHOLD_BYTES;
+
+fn parse_inline_blob_threshold_bytes(raw: &str) -> Result<usize, String> {
+    let value: usize = raw
+        .parse()
+        .map_err(|e| format!("invalid --inline-blob-threshold-bytes value '{raw}': {e}"))?;
+    if value > MAX_INLINE_BLOB_THRESHOLD_BYTES {
+        return Err(format!(
+            "--inline-blob-threshold-bytes ({value}) exceeds maximum allowed value of \
+             {MAX_INLINE_BLOB_THRESHOLD_BYTES} bytes (4 MiB)"
+        ));
+    }
+    Ok(value)
+}
+
+// No Debug derive: `auth_tokens` holds secrets.
 #[derive(Parser)]
-#[command(name = "jj-cc-server", about = "Jujutsu Commit Cloud Server")]
+#[command(name = "jj-cc-server", about = "jj Commit Cloud Server")]
 struct Args {
     /// Host interface to bind to
-    #[arg(long, default_value = "127.0.0.1")]
+    #[arg(long, env = "HOST", default_value = "127.0.0.1")]
     host: String,
 
     /// Port to listen on (use 0 for ephemeral port assignment)
-    #[arg(short, long, default_value_t = 8080)]
+    #[arg(short, long, env = "PORT", default_value_t = 8080)]
     port: u16,
 
-    /// Storage backend type
-    #[arg(long, value_enum, default_value_t = StoreType::Memory)]
+    /// Metadata storage backend type
+    #[arg(long, env = "STORE_TYPE", value_enum, default_value_t = StoreType::Memory)]
     store_type: StoreType,
 
+    /// Blob storage backend type (auto-detected from store-type and --blob-path if omitted;
+    /// required with --store-type=spanner unless --blob-path is set)
+    #[arg(long, env = "BLOB_STORE", value_enum)]
+    blob_store: Option<BlobStoreType>,
+
+    /// Maximum blob size in bytes stored inline inside MetadataStore (0 disables inlining;
+    /// max 4 MiB)
+    #[arg(
+        long,
+        env = "INLINE_BLOB_THRESHOLD_BYTES",
+        default_value_t = 0,
+        value_parser = parse_inline_blob_threshold_bytes
+    )]
+    inline_blob_threshold_bytes: usize,
+
     /// Path to SQLite database file (defaults to ~/.jj-cc-server/commit_cloud.db)
+    #[arg(long, env = "SQLITE_PATH")]
+    sqlite_path: Option<PathBuf>,
+
+    /// Root directory for local content-addressed blob storage
+    #[arg(long, env = "BLOB_PATH")]
+    blob_path: Option<PathBuf>,
+
+    /// Optional logical location URI override for local blob store (e.g. gs://region-a)
+    #[arg(long, env = "BLOB_LOCATION_ID")]
+    blob_location_id: Option<String>,
+
+    /// Cloud Spanner database resource path (projects/<p>/instances/<i>/databases/<d>)
+    #[arg(long, visible_alias = "spanner-db", env = "SPANNER_DATABASE")]
+    spanner_database: Option<String>,
+
+    /// Optional Spanner gRPC endpoint override (e.g. Spanner Omni or custom emulator URL)
+    #[arg(long, env = "SPANNER_ENDPOINT")]
+    spanner_endpoint: Option<String>,
+
+    /// Optional Spanner HTTP/REST admin endpoint override for DDL auto-migration
+    #[arg(long, env = "SPANNER_EMULATOR_REST_HOST")]
+    spanner_admin_endpoint: Option<String>,
+
+    /// Automatically create missing Spanner database and apply spanner_schema.sql on startup
+    #[arg(long, env = "SPANNER_AUTO_MIGRATE")]
+    spanner_auto_migrate: bool,
+
+    /// Target a local Cloud Spanner Emulator (allows plaintext endpoints and HTTP/1.0 REST DDL
+    /// administration without setting SPANNER_EMULATOR_HOST)
+    #[arg(long, env = "SPANNER_EMULATOR", default_value_t = false)]
+    spanner_emulator: bool,
+
+    /// Connect to a containerized Spanner Omni endpoint instead of managed Cloud Spanner
     #[arg(long)]
-    sqlite_path: Option<std::path::PathBuf>,
+    spanner_omni: bool,
 
-    /// Spanner database resource path (e.g. projects/<project>/instances/<instance>/databases/<db>)
-    #[arg(long, env = "SPANNER_DATABASE")]
-    spanner_db: Option<String>,
+    /// Path to custom Root CA PEM file for Spanner Omni TLS verification
+    #[arg(long)]
+    spanner_omni_ca_cert: Option<PathBuf>,
 
-    /// Comma-separated graphic-ASCII Bearer token(s) required on gRPC requests (prefer
-    /// `--auth-token-file` on shared hosts where CLI arguments appear in process listings)
+    /// Path to client certificate PEM file for Spanner Omni mTLS authentication
+    #[arg(long)]
+    spanner_omni_client_cert: Option<PathBuf>,
+
+    /// Path to client private key PEM file for Spanner Omni mTLS authentication
+    #[arg(long)]
+    spanner_omni_client_key: Option<PathBuf>,
+
+    /// Optional Bearer token(s) required on gRPC requests (comma-separated; health checks stay
+    /// open)
     #[arg(
         long = "auth-token",
         env = "JJ_CC_SERVER_AUTH_TOKEN",
@@ -91,8 +174,7 @@ struct Args {
     )]
     auth_tokens: Vec<String>,
 
-    /// Path to a UTF-8 file containing newline- or comma-separated graphic-ASCII Bearer
-    /// token(s) (whitespace-delimited `#` comments and blank lines are ignored)
+    /// Path to a file containing Bearer token(s) (newline- or comma-separated)
     #[arg(long = "auth-token-file", env = "JJ_CC_SERVER_AUTH_TOKEN_FILE")]
     auth_token_file: Option<std::path::PathBuf>,
 
@@ -102,67 +184,10 @@ struct Args {
     allow_unauthenticated: bool,
 }
 
-pub struct CommitCloudServerImpl {
-    pub store: Arc<dyn Store>,
-}
-
-impl Default for CommitCloudServerImpl {
-    fn default() -> Self {
-        Self {
-            store: Arc::new(MemoryStore::default()),
-        }
-    }
-}
-
-pub fn get_default_sqlite_path_from_home(
-    home: Option<&std::path::Path>,
-) -> Result<std::path::PathBuf, std::io::Error> {
-    if let Some(home_dir) = home {
-        let dir = home_dir.join(".jj-cc-server");
-        std::fs::create_dir_all(&dir).map_err(|e| {
-            std::io::Error::new(
-                e.kind(),
-                format!(
-                    "Failed to create default SQLite directory '{}': {}",
-                    dir.display(),
-                    e
-                ),
-            )
-        })?;
-        Ok(dir.join("commit_cloud.db"))
-    } else {
-        warn!("HOME environment variable is not set; using local directory for SQLite database");
-        Ok(std::path::PathBuf::from("commit_cloud.db"))
-    }
-}
-
-pub fn get_default_sqlite_path() -> Result<std::path::PathBuf, std::io::Error> {
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    get_default_sqlite_path_from_home(home.as_deref())
-}
-
-pub fn resolve_sqlite_path(
-    custom_path: Option<std::path::PathBuf>,
-) -> Result<std::path::PathBuf, std::io::Error> {
-    if let Some(path) = custom_path {
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                std::io::Error::new(
-                    e.kind(),
-                    format!(
-                        "Failed to create parent directory '{}' for SQLite database: {}",
-                        parent.display(),
-                        e
-                    ),
-                )
-            })?;
-        }
-        Ok(path)
-    } else {
-        get_default_sqlite_path()
-    }
+fn default_server_data_dir() -> PathBuf {
+    std::env::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".jj-cc-server")
 }
 
 #[tokio::main]
@@ -178,12 +203,26 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .with(tracing_subscriber::fmt::layer())
         .with(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("jj_cc_server=info".parse()?),
+                .add_directive("jj_cc_server=info".parse()?)
+                .add_directive("jj_commit_cloud_server=info".parse()?),
         )
         .init();
 
     let mut args = Args::parse();
-
+    args.sqlite_path = args
+        .sqlite_path
+        .filter(|p| !p.as_os_str().is_empty() && p.to_str().is_none_or(|s| !s.trim().is_empty()));
+    args.blob_path = args
+        .blob_path
+        .filter(|p| !p.as_os_str().is_empty() && p.to_str().is_none_or(|s| !s.trim().is_empty()));
+    args.blob_location_id = args
+        .blob_location_id
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    args.spanner_database = args
+        .spanner_database
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     let mut combined_tokens = std::mem::take(&mut args.auth_tokens);
     if let Some(token_file) = &args.auth_token_file {
         match load_tokens_from_file(token_file) {
@@ -200,6 +239,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     drop(combined_tokens);
     let auth = auth_res?;
 
+    // A secret that renders as "" or " , " must not leave the server open without a trace.
     let cli_auth_flag = std::env::args_os().any(|a| {
         let s = a.to_string_lossy();
         s == "--auth-token" || s.starts_with("--auth-token=")
@@ -210,7 +250,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         || std::env::var_os("JJ_CC_SERVER_AUTH_TOKEN").is_some();
     if auth_requested && !auth.is_enabled() {
         return Err(
-            "--auth-token (or JJ_CC_SERVER_AUTH_TOKEN) is set but contains no non-empty token; unset it to run without authentication"
+            "--auth-token (or JJ_CC_SERVER_AUTH_TOKEN) is set but contains no non-empty \
+                    token; unset it to run without authentication"
                 .into(),
         );
     }
@@ -227,27 +268,94 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         warn!("Bearer token authentication disabled: gRPC services accept any caller");
     }
 
-    let store: Arc<dyn Store> = match args.store_type {
-        StoreType::Memory => Arc::new(MemoryStore::default()),
+    let resolved_sqlite_path = args
+        .sqlite_path
+        .clone()
+        .unwrap_or_else(|| default_server_data_dir().join("commit_cloud.db"));
+    let has_blob_path = args.blob_path.is_some();
+    let metadata_store: Arc<dyn MetadataStore> = match args.store_type {
+        StoreType::Memory => Arc::new(MemoryMetadataStore::new()),
         StoreType::Sqlite => {
-            let path = resolve_sqlite_path(args.sqlite_path)?;
-            info!("Opening SQLite Database Store at '{}'", path.display());
-            Arc::new(store::SqliteStore::open(&path).map_err(|e| {
-                format!(
-                    "Failed to open SQLite database at '{}': {}",
-                    path.display(),
-                    e
-                )
-            })?)
+            info!(
+                "Opening SQLite metadata store at {}",
+                resolved_sqlite_path.display()
+            );
+            Arc::new(SqliteMetadataStore::open(&resolved_sqlite_path)?)
         }
         StoreType::Spanner => {
-            let spanner_db = args.spanner_db.ok_or_else(|| {
-                "--spanner-db (or SPANNER_DATABASE environment variable) must be specified when using the spanner store type"
-            })?;
-            info!("Connecting to Cloud Spanner at '{spanner_db}'");
-            Arc::new(store::SpannerStore::connect(&spanner_db).await?)
+            let database = args.spanner_database.clone().ok_or(
+                "--spanner-database (or SPANNER_DATABASE) is required when --store-type=spanner",
+            )?;
+            // Durable metadata over a silent in-memory blob default would lose file contents
+            // on restart while commits and trees still reference them.
+            if args.blob_store.is_none() && !has_blob_path {
+                return Err("--store-type=spanner requires an explicit blob store: set \
+                            --blob-path (BLOB_PATH), or pass \
+                            --blob-store=memory (BLOB_STORE=memory) for throwaway tests"
+                    .into());
+            }
+            info!("Connecting to Cloud Spanner database '{database}'");
+            let cfg = SpannerConnectConfig {
+                database,
+                endpoint: args.spanner_endpoint.clone(),
+                admin_endpoint: args.spanner_admin_endpoint.clone(),
+                omni: args.spanner_omni,
+                omni_ca_cert: args.spanner_omni_ca_cert.clone(),
+                omni_client_cert: args.spanner_omni_client_cert.clone(),
+                omni_client_key: args.spanner_omni_client_key.clone(),
+                auto_migrate: args.spanner_auto_migrate,
+                emulator: args.spanner_emulator,
+            };
+            Arc::new(SpannerMetadataStore::connect(&cfg).await?)
         }
     };
+    let effective_blob_store = args.blob_store.unwrap_or(if has_blob_path {
+        BlobStoreType::Local
+    } else {
+        match args.store_type {
+            StoreType::Memory => BlobStoreType::Memory,
+            // Spanner startup rejects a missing --blob-store and --blob-path above.
+            StoreType::Sqlite | StoreType::Spanner => BlobStoreType::Local,
+        }
+    });
+    if effective_blob_store == BlobStoreType::Memory && args.store_type != StoreType::Memory {
+        warn!("Blob payloads are kept in memory and are lost on restart");
+    }
+
+    let blob_store: Arc<dyn BlobStore> = match effective_blob_store {
+        BlobStoreType::Memory => match &args.blob_location_id {
+            Some(loc) => Arc::new(MemoryBlobStore::with_location(loc.clone())),
+            None => Arc::new(MemoryBlobStore::new()),
+        },
+        BlobStoreType::Local => {
+            let blob_root = args.blob_path.clone().unwrap_or_else(|| {
+                if args.store_type == StoreType::Sqlite {
+                    let mut p = resolved_sqlite_path.as_os_str().to_os_string();
+                    p.push(".blobs");
+                    PathBuf::from(p)
+                } else {
+                    default_server_data_dir().join("blobs")
+                }
+            });
+            info!(
+                "Opening local filesystem blob store at {}",
+                blob_root.display()
+            );
+            match &args.blob_location_id {
+                Some(loc) => Arc::new(LocalFsBlobStore::open_with_location_id(&blob_root, loc)?),
+                None => Arc::new(LocalFsBlobStore::open(&blob_root)?),
+            }
+        }
+    };
+
+    let store = Arc::new(CompositeStore::with_config(
+        metadata_store,
+        blob_store,
+        CompositeStoreConfig {
+            inline_blob_threshold: args.inline_blob_threshold_bytes,
+            validate_dependencies: true,
+        },
+    ));
 
     let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
     health_reporter
@@ -276,97 +384,95 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .http2_max_header_list_size(64 * 1024)
         .add_service(health_service)
         .add_service(tonic::service::interceptor::InterceptedService::new(
-            BackendServiceServer::new(backend_service),
+            BackendServiceServer::new(backend_service)
+                .max_decoding_message_size(cc_common::MAX_GRPC_MESSAGE_BYTES)
+                .max_encoding_message_size(cc_common::MAX_GRPC_MESSAGE_BYTES),
             auth.clone(),
         ))
         .add_service(tonic::service::interceptor::InterceptedService::new(
-            OpStoreServiceServer::new(op_store_service),
+            OpStoreServiceServer::new(op_store_service)
+                .max_decoding_message_size(cc_common::MAX_GRPC_MESSAGE_BYTES)
+                .max_encoding_message_size(cc_common::MAX_GRPC_MESSAGE_BYTES),
             auth.clone(),
         ))
         .add_service(tonic::service::interceptor::InterceptedService::new(
-            WorkspaceServiceServer::new(workspace_service),
+            WorkspaceServiceServer::new(workspace_service)
+                .max_decoding_message_size(cc_common::MAX_GRPC_MESSAGE_BYTES)
+                .max_encoding_message_size(cc_common::MAX_GRPC_MESSAGE_BYTES),
             auth,
         ))
-        .serve_with_incoming_shutdown(incoming, async {
-            match tokio::signal::ctrl_c().await {
-                Ok(()) => {
-                    info!("Shutdown signal received, shutting down gracefully...");
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to listen for shutdown signal: {}, shutting down...",
-                        e
-                    );
-                }
-            }
-        })
+        .serve_with_incoming_shutdown(incoming, shutdown_signal())
         .await?;
 
     Ok(())
 }
 
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("installing SIGTERM handler should succeed");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!("SIGINT received, shutting down...");
+            }
+            _ = sigterm.recv() => {
+                info!("SIGTERM received, shutting down...");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => info!("Shutdown signal received, shutting down..."),
+            Err(e) => tracing::warn!("Failed to listen for shutdown signal: {e}, shutting down..."),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
 
     #[test]
-    fn test_default_sqlite_path_happy_path() {
-        let temp_dir = tempdir().unwrap();
-        let path = get_default_sqlite_path_from_home(Some(temp_dir.path())).unwrap();
-        assert!(path.ends_with("commit_cloud.db"));
-        assert!(temp_dir.path().join(".jj-cc-server").is_dir());
+    fn test_cli_spanner_emulator_flag_defaults_false_and_parses_true() {
+        let default_args = Args::try_parse_from(["jj-cc-server"]).unwrap();
+        assert!(!default_args.spanner_emulator);
+
+        let emu_args = Args::try_parse_from([
+            "jj-cc-server",
+            "--store-type=spanner",
+            "--spanner-database=projects/p/instances/i/databases/d",
+            "--spanner-endpoint=127.0.0.1:9010",
+            "--spanner-emulator",
+            "--spanner-auto-migrate",
+            "--blob-store=memory",
+        ])
+        .unwrap();
+        assert!(emu_args.spanner_emulator);
+        assert!(emu_args.spanner_auto_migrate);
+        assert_eq!(emu_args.spanner_endpoint.as_deref(), Some("127.0.0.1:9010"));
     }
 
     #[test]
-    fn test_default_sqlite_path_without_home() {
-        let path = get_default_sqlite_path_from_home(None).unwrap();
-        assert_eq!(path, std::path::PathBuf::from("commit_cloud.db"));
-    }
-
-    #[test]
-    fn test_default_sqlite_path_failure_when_dir_creation_fails() {
-        let temp_dir = tempdir().unwrap();
-        let blocker_file = temp_dir.path().join(".jj-cc-server");
-        std::fs::write(&blocker_file, "blocking file").unwrap();
-
-        let result = get_default_sqlite_path_from_home(Some(temp_dir.path()));
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        let expected_io_err = std::fs::create_dir_all(&blocker_file).unwrap_err();
-        let expected_msg = format!(
-            "Failed to create default SQLite directory '{}': {}",
-            blocker_file.display(),
-            expected_io_err
+    fn test_cli_inline_blob_threshold_bytes_enforces_4mib_upper_bound() {
+        let max_arg = format!("--inline-blob-threshold-bytes={MAX_INLINE_BLOB_THRESHOLD_BYTES}");
+        let at_max = Args::try_parse_from(["jj-cc-server", &max_arg]).unwrap();
+        assert_eq!(
+            at_max.inline_blob_threshold_bytes,
+            MAX_INLINE_BLOB_THRESHOLD_BYTES
         );
-        assert_eq!(err.to_string(), expected_msg);
-    }
 
-    #[test]
-    fn test_resolve_sqlite_path_custom_happy_path() {
-        let temp_dir = tempdir().unwrap();
-        let db_path = temp_dir.path().join("nested").join("custom.db");
-        let resolved = resolve_sqlite_path(Some(db_path.clone())).unwrap();
-        assert_eq!(resolved, db_path);
-        assert!(temp_dir.path().join("nested").is_dir());
-    }
-
-    #[test]
-    fn test_resolve_sqlite_path_custom_failure() {
-        let temp_dir = tempdir().unwrap();
-        let blocker_file = temp_dir.path().join("nested");
-        std::fs::write(&blocker_file, "blocking file").unwrap();
-
-        let db_path = blocker_file.join("custom.db");
-        let result = resolve_sqlite_path(Some(db_path));
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        let expected_io_err = std::fs::create_dir_all(&blocker_file).unwrap_err();
-        let expected_msg = format!(
-            "Failed to create parent directory '{}' for SQLite database: {}",
-            blocker_file.display(),
-            expected_io_err
+        let over_arg = format!(
+            "--inline-blob-threshold-bytes={}",
+            MAX_INLINE_BLOB_THRESHOLD_BYTES + 1
         );
-        assert_eq!(err.to_string(), expected_msg);
+        let err = Args::try_parse_from(["jj-cc-server", &over_arg])
+            .err()
+            .expect("value above 4 MiB must be rejected");
+        assert!(
+            err.to_string().contains("exceeds maximum allowed value"),
+            "unexpected error: {err}"
+        );
     }
 }

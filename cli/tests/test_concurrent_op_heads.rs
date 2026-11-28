@@ -43,9 +43,10 @@ async fn register_test_repo(server_url: &str) -> String {
     response.into_inner().repo_id
 }
 
-/// Verifies that write races on stale op heads fail with Status::Aborted on SQLite backend.
+/// Verifies that concurrent UpdateOpHeads calls using stale old_op_head_ids preserve sibling
+/// heads additively without ABORTED on SQLite (matching lock-free op_store.proto semantics).
 #[tokio::test]
-async fn test_sqlite_concurrent_write_race_fails_on_stale_old_heads() {
+async fn test_sqlite_concurrent_write_race_preserves_sibling_heads_additively() {
     let db_file = NamedTempFile::new().unwrap();
     let server = spawn_sqlite_server(db_file.path()).await;
     let repo_id = register_test_repo(server.url()).await;
@@ -113,7 +114,7 @@ async fn test_sqlite_concurrent_write_race_fails_on_stale_old_heads() {
         .await
         .unwrap();
 
-    // Client 2 persists op_2 and tries to update using stale base_head
+    // Client 2 persists op_2 and updates using stale base_head: op_1 is preserved alongside op_2.
     let op_2 = op_client_2
         .write_operation(cc_common::op_store::WriteOperationRequest {
             repo_id: repo_id.clone(),
@@ -123,21 +124,29 @@ async fn test_sqlite_concurrent_write_race_fails_on_stale_old_heads() {
         .unwrap()
         .into_inner()
         .operation_id;
-    let result = op_client_2
+    let resp = op_client_2
         .update_op_heads(UpdateOpHeadsRequest {
             repo_id: repo_id.clone(),
-            old_op_head_ids: vec![base_head.clone()],
+            old_op_head_ids: vec![base_head],
             new_op_head_id: op_2.clone(),
         })
-        .await;
+        .await
+        .expect("additive lock-free UpdateOpHeads must preserve concurrent sibling heads")
+        .into_inner();
 
-    assert!(
-        result.is_err(),
-        "Expected SQLite stale op_heads update to fail with CAS conflict"
-    );
-    let status = result.unwrap_err();
-    assert_eq!(status.code(), tonic::Code::Aborted);
-    assert!(status.message().contains("CAS conflict"));
+    let expected_heads = HashSet::from([op_1, op_2]);
+    let returned_heads: HashSet<Vec<u8>> = resp.current_op_head_ids.into_iter().collect();
+    assert_eq!(returned_heads, expected_heads);
+
+    let persisted_heads: HashSet<Vec<u8>> = op_client_1
+        .get_op_heads(GetOpHeadsRequest { repo_id })
+        .await
+        .unwrap()
+        .into_inner()
+        .op_head_ids
+        .into_iter()
+        .collect();
+    assert_eq!(persisted_heads, expected_heads);
 }
 
 /// Stress test: 20 concurrent tasks firing simultaneous UpdateOpHeads RPCs against SQLite backend.

@@ -13,13 +13,16 @@ RUN cargo build --release --bin jj-cc-server
 
 # Runtime stage uses a minimal Debian image
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/* && mkdir -p /data/blobs
 
 # Copy compiled binary from builder
 COPY --from=builder /app/target/release/jj-cc-server /usr/local/bin/jj-cc-server
 
 ENV PORT=8080
 ENV SPANNER_DATABASE=projects/your-project-id/instances/your-spanner-instance/databases/commit_cloud
+# Mount persistent storage at /data/blobs or override BLOB_PATH / BLOB_STORE
+# (e.g. BLOB_STORE=memory for throwaway emulator deployments).
+ENV BLOB_PATH=/data/blobs
 EXPOSE 8080
 
 # Bind to 0.0.0.0 and listen on Cloud Run's injected PORT using the Spanner database backend.

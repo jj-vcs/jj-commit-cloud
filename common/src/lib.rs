@@ -39,6 +39,8 @@ pub const VIEW_ID_LENGTH: usize = 16;
 
 /// Maximum gRPC message size (64 MiB) reserved for large-payload and streaming channels.
 pub const MAX_GRPC_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+/// Chunk size (64 KiB) used by `ReadFile` and `WriteFileStream` gRPC streams.
+pub const FILE_STREAM_CHUNK_SIZE: usize = 64 * 1024;
 
 pub const ROOT_COMMIT_ID_BYTES: [u8; COMMIT_ID_LENGTH] = [0u8; COMMIT_ID_LENGTH];
 pub const ROOT_CHANGE_ID_BYTES: [u8; CHANGE_ID_LENGTH] = [0u8; CHANGE_ID_LENGTH];

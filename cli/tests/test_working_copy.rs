@@ -659,7 +659,7 @@ async fn test_working_copy_shared_project_sqlite_integration() {
 
     let repo_count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM repos WHERE project_id = 'shared-proj'",
+            "SELECT COUNT(*) FROM repositories WHERE project_id = 'shared-proj'",
             [],
             |row| row.get(0),
         )

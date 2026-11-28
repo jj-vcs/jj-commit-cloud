@@ -2,13 +2,18 @@
 name = "jj-commit-cloud-server"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
+
+[lib]
+name = "jj_commit_cloud_server"
+path = "src/lib.rs"
 
 [[bin]]
 name = "jj-cc-server"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1.39", features = ["rt-multi-thread", "macros", "net", "signal", "process", "time"] }
+tokio = { version = "1.39", features = ["rt-multi-thread", "macros", "net", "signal", "process", "sync", "time", "fs", "io-util"] }
 clap = { version = "4", features = ["derive", "env"] }
 tonic = "0.12"
 tonic-health = "0.12"
@@ -16,22 +21,27 @@ tokio-stream = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 cc-common = { path = "../common" }
+cc-lib = { path = "../lib" }
+jj-lib = "0.47.1"
+futures = "0.3"
+pollster = "0.4"
+rand = "0.8"
 async-trait = "0.1"
+bytes = "1"
+prost = "0.13"
+thiserror = "2"
 gix = "0.85.0"
 hex = "0.4"
 uuid = { version = "1", features = ["v4"] }
-prost = "0.13"
-rusqlite = { version = "0.31", features = ["bundled"] }
-google-cloud-spanner = "0.34.4-preview"
-jj-lib = "0.47.1"
-futures = "0.3"
-rand = "0.8"
-pollster = "0.3"
 sha2 = "0.10"
 subtle = "2.6"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json = "1"
+tempfile = "3"
+google-cloud-spanner = "0.35.0"
+google-cloud-gax = "1.15.0"
 
 [dev-dependencies]
 assert_cmd = "2.0"
 predicates = "3.1"
-tempfile = "3"
 testutils = { path = "../testutils" }

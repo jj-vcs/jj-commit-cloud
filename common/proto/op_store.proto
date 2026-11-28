@@ -25,11 +25,11 @@ package commit_cloud.op_store;
 //   `WriteOperation` before publishing `new_op_head_id` via `UpdateOpHeads`.
 // - `WriteView` and `WriteOperation` are deterministic, idempotent
 //   content-addressed writes.
-// - `UpdateOpHeads` executes under serializable isolation, removing
-//   `old_op_head_ids` and adding `new_op_head_id` while retaining concurrent
-//   sibling operation heads. A `ROOT_OPERATION_ID` entry in `old_op_head_ids`
-//   is exempt from active-head presence checks so a new workspace joining an
-//   existing repository can fork from root and leave merging to
+// - `UpdateOpHeads` and `PublishOperation` execute under serializable
+//   isolation, removing `old_op_head_ids` and adding the new operation head
+//   while retaining concurrent sibling heads. Both are additive and lock-free:
+//   stale or `ROOT_OPERATION_ID` entries in `old_op_head_ids` do not fail with
+//   `ABORTED`, so newly initialized or concurrent workspaces converge via
 //   `ReconcileOpHeads`.
 //
 // Status Codes:
@@ -48,11 +48,9 @@ package commit_cloud.op_store;
 //   duplicate/mixed root parents, or inconsistent/duplicate
 //   `commit_predecessors`; mismatched `operation.view_id`; `ROOT_OPERATION_ID`
 //   supplied as `UpdateOpHeads.new_op_head_id`; or missing message payload.
-// - `ABORTED`: `UpdateOpHeads` or `PublishOperation` failed optimistic
-//   concurrency validation against active operation heads (for example, when a
-//   non-root `old_op_head_ids` entry is no longer active).
-// - `UNIMPLEMENTED`: Requested RPC (`ResolveOperationPrefix`,
-//   `PublishOperation`) is not yet enabled on this server.
+// - `ABORTED`: `ReconcileOpHeads` exhausted internal compare-and-swap retries
+//   against concurrent operation-head updates (`UpdateOpHeads` and
+//   `PublishOperation` are additive and lock-free and do not return `ABORTED`).
 service OpStoreService {
   // Reads an operation node by 16-byte `operation_id`. Synthesizes the all-zero
   // root operation.
@@ -82,9 +80,9 @@ service OpStoreService {
   // Atomically advances operation heads from `old_op_head_ids` to
   // `new_op_head_id`, preserving concurrent sibling heads for 3-way
   // reconciliation. Rejects virtual `ROOT_OPERATION_ID` as `new_op_head_id`
-  // (`INVALID_ARGUMENT`). A `ROOT_OPERATION_ID` entry in `old_op_head_ids` is
-  // exempt from stale-head `ABORTED` validation so newly initialized workspaces
-  // can fork from root and converge via `ReconcileOpHeads`.
+  // (`INVALID_ARGUMENT`). Additive and lock-free: stale or `ROOT_OPERATION_ID`
+  // entries in `old_op_head_ids` do not fail with `ABORTED`, so newly
+  // initialized or concurrent workspaces converge via `ReconcileOpHeads`.
   rpc UpdateOpHeads(UpdateOpHeadsRequest) returns (UpdateOpHeadsResponse);
 
   // Reconciles divergent operation heads on the server using `jj_lib`'s 3-way

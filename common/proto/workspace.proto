@@ -43,6 +43,8 @@ package commit_cloud.workspace;
 //   absent.
 //
 // Status Codes:
+// - `UNAUTHENTICATED`: Server requires Bearer authentication and request
+//   metadata lacks a valid `authorization: Bearer <token>` header.
 // - `NOT_FOUND`: `repo_id` is unregistered on `GetWorkspace`, `UpdateWorkspace`,
 //   `ListWorkspaces`, or `CheckWorkingCopyChanges`, or `CheckWorkingCopyChanges`
 //   targets an unknown workspace or commit. `GetWorkspace` returns `OK` with
