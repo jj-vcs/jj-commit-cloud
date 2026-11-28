@@ -303,7 +303,7 @@ fn test_server_spanner_refuses_to_start_without_explicit_blob_store() {
 
     // Empty env var placeholders must not bypass the durable blob store requirement.
     let out_empty_env = run_server_cli(
-        &[("BLOB_PATH", "")],
+        &[("GCS_BUCKET", ""), ("BLOB_PATH", "")],
         &["--port=0", "--store-type=spanner", db_arg],
     );
     assert!(!out_empty_env.status.success());
@@ -379,6 +379,180 @@ async fn test_server_rejects_oversized_inline_blob_threshold_bytes() {
     assert_eq!(
         res.into_inner().status(),
         tonic_health::pb::health_check_response::ServingStatus::Serving
+    );
+}
+
+#[test]
+fn test_server_gcs_and_peer_flags_fail_fast_before_opening_metadata_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let sqlite_path = dir.path().join("must_not_be_created.db");
+    let sqlite_arg = format!("--sqlite-path={}", sqlite_path.display());
+
+    // --blob-store=gcs without --gcs-bucket (or with empty/whitespace GCS_BUCKET) fails fast
+    // before touching SQLite or Spanner.
+    for env_vars in [
+        &[][..],
+        &[("GCS_BUCKET", "")][..],
+        &[("GCS_BUCKET", "   ")][..],
+    ] {
+        let out = run_server_cli(
+            env_vars,
+            &[
+                "--port=0",
+                "--store-type=sqlite",
+                &sqlite_arg,
+                "--blob-store=gcs",
+            ],
+        );
+        assert!(
+            !out.status.success(),
+            "missing/empty --gcs-bucket with --blob-store=gcs must fail (env={env_vars:?})"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("--gcs-bucket (or GCS_BUCKET) is required"),
+            "unexpected stderr: {stderr}"
+        );
+        assert!(
+            !sqlite_path.exists(),
+            "SQLite DB should not be created when --gcs-bucket validation fails"
+        );
+    }
+
+    // Spanner + --blob-store=gcs without --gcs-bucket also fails fast before connecting.
+    let spanner_out = run_server_cli(
+        &[],
+        &[
+            "--port=0",
+            "--store-type=spanner",
+            "--spanner-database=projects/p/instances/i/databases/d",
+            "--blob-store=gcs",
+        ],
+    );
+    assert!(!spanner_out.status.success());
+    let spanner_stderr = String::from_utf8_lossy(&spanner_out.stderr);
+    assert!(
+        spanner_stderr.contains("--gcs-bucket (or GCS_BUCKET) is required"),
+        "unexpected stderr: {spanner_stderr}"
+    );
+
+    // Malformed --gcs-peer-buckets entries (empty LHS or RHS around '=') are rejected.
+    for bad_peer in [
+        "=",
+        "=http://127.0.0.1:4443",
+        " =http://127.0.0.1:4443",
+        "gs://peer=",
+        "gs://peer=   ",
+    ] {
+        let arg = format!("--gcs-peer-buckets={bad_peer}");
+        let out = run_server_cli(&[], &["--port=0", "--store-type=sqlite", &sqlite_arg, &arg]);
+        assert!(
+            !out.status.success(),
+            "malformed --gcs-peer-buckets={bad_peer:?} must be rejected"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("invalid --gcs-peer-buckets entry"),
+            "unexpected stderr for {bad_peer:?}: {stderr}"
+        );
+        assert!(!sqlite_path.exists());
+    }
+
+    // Malformed --local-peer-blob-dirs entries (missing '=', empty LHS, or empty RHS) are rejected.
+    for bad_peer in [
+        "no-equals",
+        "=",
+        "=/tmp/dir",
+        "  =/tmp/dir",
+        "gs://peer=",
+        "gs://peer=  ",
+    ] {
+        let arg = format!("--local-peer-blob-dirs={bad_peer}");
+        let out = run_server_cli(&[], &["--port=0", "--store-type=sqlite", &sqlite_arg, &arg]);
+        assert!(
+            !out.status.success(),
+            "malformed --local-peer-blob-dirs={bad_peer:?} must be rejected"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("invalid --local-peer-blob-dirs entry"),
+            "unexpected stderr for {bad_peer:?}: {stderr}"
+        );
+        assert!(!sqlite_path.exists());
+    }
+
+    // Invalid GCS bucket identifiers and endpoints fail fast before opening SQLite/Spanner.
+    for bad_args in [
+        vec!["--gcs-bucket=INVALID_UPPER"],
+        vec!["--gcs-bucket=ab"],
+        vec![
+            "--gcs-bucket=valid-bucket",
+            "--gcs-endpoint=http://remote.example:4443",
+        ],
+        vec![
+            "--gcs-bucket=valid-bucket",
+            "--gcs-endpoint=http://127.0.0.1:4443/prefix",
+        ],
+        vec!["--gcs-peer-buckets=INVALID_PEER"],
+        vec!["--gcs-peer-buckets=gs://valid-peer=http://remote.example:4443"],
+        vec!["--gcs-endpoint=http://remote.example:4443"],
+        vec!["--gcs-bucket=valid-bucket\n"],
+        vec!["--gcs-bucket=valid-bucket\r\n"],
+        vec!["--gcs-bucket=\tvalid-bucket"],
+        vec!["--gcs-peer-buckets=gs://valid-peer\r\n"],
+        vec!["--gcs-peer-buckets=gs://valid-peer\n=http://127.0.0.1:4443"],
+        vec!["--gcs-peer-buckets=\tgs://valid-peer=http://127.0.0.1:4443"],
+    ] {
+        let mut cli_args = vec!["--port=0", "--store-type=sqlite", &sqlite_arg];
+        cli_args.extend(bad_args.iter().copied());
+        let out = run_server_cli(&[], &cli_args);
+        assert!(
+            !out.status.success(),
+            "invalid GCS flags {bad_args:?} must fail fast at startup"
+        );
+        assert!(
+            !sqlite_path.exists(),
+            "SQLite DB should not be created when GCS validation fails for {bad_args:?}"
+        );
+    }
+
+    // Control-character-only or control-padded GCS_BUCKET / GCS_PEER_BUCKETS env vars must fail fast
+    // rather than being silently trimmed as unset or accepted.
+    for env_vars in [
+        &[("GCS_BUCKET", "\r\n")][..],
+        &[("GCS_BUCKET", "valid-bucket\n")][..],
+        &[("GCS_BUCKET", "\tvalid-bucket")][..],
+        &[("GCS_PEER_BUCKETS", "gs://valid-peer\r\n")][..],
+        &[(
+            "GCS_PEER_BUCKETS",
+            "gs://valid-peer\n=http://127.0.0.1:4443",
+        )][..],
+    ] {
+        let out = run_server_cli(env_vars, &["--port=0", "--store-type=sqlite", &sqlite_arg]);
+        assert!(
+            !out.status.success(),
+            "control-char GCS env {env_vars:?} must fail fast at startup"
+        );
+        assert!(
+            !sqlite_path.exists(),
+            "SQLite DB should not be created when GCS env validation fails for {env_vars:?}"
+        );
+    }
+
+    // --blob-store help text documents --gcs-bucket auto-detection and Spanner eligibility.
+    let help = run_server_cli(&[], &["--help"]);
+    assert!(help.status.success());
+    let help_stdout = String::from_utf8_lossy(&help.stdout);
+    let blob_store_section = help_stdout
+        .split("--blob-store")
+        .nth(1)
+        .expect("--help should document --blob-store")
+        .split("--inline-blob-threshold-bytes")
+        .next()
+        .unwrap_or("");
+    assert!(
+        blob_store_section.contains("--gcs-bucket"),
+        "--blob-store help text should mention --gcs-bucket: {blob_store_section}"
     );
 }
 
