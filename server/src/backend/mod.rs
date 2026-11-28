@@ -43,6 +43,9 @@ use tracing::info;
 use cc_common::backend::backend_service_server::BackendService;
 use cc_common::backend::*;
 
+use crate::auth::{
+    CallerIdentity, CallerKind, apply_commit_actor_attribution, enforce_actor_repo_suffix,
+};
 use crate::hash_utils::{
     compute_git_tree_hash, try_compute_git_blob_hash, verify_or_compute_git_commit_hash,
 };
@@ -111,6 +114,7 @@ pub struct CommitCloudBackendService {
     store: Arc<CompositeStore>,
     write_stream_spill_threshold: usize,
     metrics: ServerMetrics,
+    enforce_actor_repo_suffix: bool,
 }
 
 impl CommitCloudBackendService {
@@ -123,11 +127,17 @@ impl CommitCloudBackendService {
             store,
             write_stream_spill_threshold: DEFAULT_WRITE_STREAM_SPILL_THRESHOLD_BYTES,
             metrics,
+            enforce_actor_repo_suffix: false,
         }
     }
 
     pub fn with_write_stream_spill_threshold(mut self, bytes: usize) -> Self {
         self.write_stream_spill_threshold = bytes;
+        self
+    }
+
+    pub fn with_actor_repo_suffix_enforcement(mut self, enforce: bool) -> Self {
+        self.enforce_actor_repo_suffix = enforce;
         self
     }
 }
@@ -223,6 +233,7 @@ impl BackendService for CommitCloudBackendService {
         &self,
         request: tonic::Request<RegisterRepositoryRequest>,
     ) -> Result<tonic::Response<RegisterRepositoryResponse>, tonic::Status> {
+        let caller_identity = request.extensions().get::<CallerIdentity>().cloned();
         let req = request.into_inner();
         match HashAlgorithm::try_from(req.hash_algorithm) {
             Ok(HashAlgorithm::Unspecified | HashAlgorithm::Sha1) => {}
@@ -243,8 +254,25 @@ impl BackendService for CommitCloudBackendService {
                 validate_identifier(&raw, "repo_id")?;
                 raw
             }
-            None => uuid::Uuid::new_v4().to_string(),
+            None => {
+                if self.enforce_actor_repo_suffix
+                    && caller_identity
+                        .as_ref()
+                        .is_some_and(|caller| caller.kind == CallerKind::OidcActor)
+                {
+                    return Err(tonic::Status::invalid_argument(
+                        "explicit repo_id matching <alnum>_<atespace>_<actorName> is required \
+                         when actor repository suffix enforcement is enabled",
+                    ));
+                }
+                uuid::Uuid::new_v4().to_string()
+            }
         };
+        enforce_actor_repo_suffix(
+            caller_identity.as_ref(),
+            self.enforce_actor_repo_suffix,
+            &repo_id,
+        )?;
         let requested_project = if req.project_id.is_empty() {
             None
         } else {
@@ -270,8 +298,14 @@ impl BackendService for CommitCloudBackendService {
         &self,
         request: tonic::Request<DeleteRepositoryRequest>,
     ) -> Result<tonic::Response<DeleteRepositoryResponse>, tonic::Status> {
+        let caller_identity = request.extensions().get::<CallerIdentity>().cloned();
         let req = request.into_inner();
         validate_identifier(&req.repo_id, "repo_id")?;
+        enforce_actor_repo_suffix(
+            caller_identity.as_ref(),
+            self.enforce_actor_repo_suffix,
+            &req.repo_id,
+        )?;
         let expected_project_id = match req.project_id.as_deref() {
             Some(raw) => {
                 validate_identifier(raw, "project_id")?;
@@ -343,6 +377,7 @@ impl BackendService for CommitCloudBackendService {
         &self,
         request: tonic::Request<WriteCommitRequest>,
     ) -> Result<tonic::Response<WriteCommitResponse>, tonic::Status> {
+        let caller_identity = request.extensions().get::<CallerIdentity>().cloned();
         let req = request.into_inner();
         validate_identifier(&req.project_id, "project_id")?;
         let mut commit = req.commit.ok_or_else(|| {
@@ -359,6 +394,7 @@ impl BackendService for CommitCloudBackendService {
             ));
         }
 
+        apply_commit_actor_attribution(caller_identity.as_ref(), &mut commit);
         let commit_id = verify_or_compute_git_commit_hash(&mut commit)
             .map_err(tonic::Status::invalid_argument)?;
         commit.commit_id = commit_id.clone();

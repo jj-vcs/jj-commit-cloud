@@ -44,6 +44,7 @@ use cc_common::workspace::*;
 use tonic::{Request, Response, Status};
 use tracing::info;
 
+use crate::auth::{CallerIdentity, enforce_actor_repo_suffix};
 use crate::metrics::ServerMetrics;
 use crate::store::CompositeStore;
 
@@ -149,6 +150,7 @@ fn decode_workspace_cursor(token: &str) -> Result<(String, String), Status> {
 pub struct CommitCloudWorkspaceService {
     store: Arc<CompositeStore>,
     metrics: ServerMetrics,
+    enforce_actor_repo_suffix: bool,
 }
 
 impl CommitCloudWorkspaceService {
@@ -157,7 +159,16 @@ impl CommitCloudWorkspaceService {
     }
 
     pub fn with_metrics(store: Arc<CompositeStore>, metrics: ServerMetrics) -> Self {
-        Self { store, metrics }
+        Self {
+            store,
+            metrics,
+            enforce_actor_repo_suffix: false,
+        }
+    }
+
+    pub fn with_actor_repo_suffix_enforcement(mut self, enforce: bool) -> Self {
+        self.enforce_actor_repo_suffix = enforce;
+        self
     }
 }
 
@@ -182,6 +193,7 @@ impl WorkspaceService for CommitCloudWorkspaceService {
         &self,
         request: Request<UpdateWorkspaceRequest>,
     ) -> Result<Response<UpdateWorkspaceResponse>, Status> {
+        let caller_identity = request.extensions().get::<CallerIdentity>().cloned();
         let req = request.into_inner();
         let expected_operation_id = req.expected_operation_id;
         if let Some(ref exp) = expected_operation_id
@@ -198,6 +210,11 @@ impl WorkspaceService for CommitCloudWorkspaceService {
             .workspace
             .ok_or_else(|| Status::invalid_argument("WorkspaceState payload is required"))?;
         validate_repo_id(&ws.repo_id)?;
+        enforce_actor_repo_suffix(
+            caller_identity.as_ref(),
+            self.enforce_actor_repo_suffix,
+            &ws.repo_id,
+        )?;
         validate_key_segment(&ws.user, "user", true)?;
         validate_key_segment(&ws.workspace_name, "workspace_name", false)?;
 
@@ -559,8 +576,14 @@ impl WorkspaceService for CommitCloudWorkspaceService {
         &self,
         request: Request<DeleteWorkspaceRequest>,
     ) -> Result<Response<DeleteWorkspaceResponse>, Status> {
+        let caller_identity = request.extensions().get::<CallerIdentity>().cloned();
         let req = request.into_inner();
         validate_repo_id(&req.repo_id)?;
+        enforce_actor_repo_suffix(
+            caller_identity.as_ref(),
+            self.enforce_actor_repo_suffix,
+            &req.repo_id,
+        )?;
         validate_key_segment(&req.user, "user", true)?;
         validate_key_segment(&req.workspace_name, "workspace_name", false)?;
         info!(

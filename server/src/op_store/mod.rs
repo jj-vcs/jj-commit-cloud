@@ -37,6 +37,7 @@ use tracing::info;
 use cc_common::op_store::op_store_service_server::OpStoreService;
 use cc_common::op_store::*;
 
+use crate::auth::{CallerIdentity, enforce_actor_repo_suffix};
 use crate::backend::{validate_digest_len, validate_identifier};
 use crate::hash_utils::{hash_operation, hash_view};
 use crate::metrics::ServerMetrics;
@@ -169,6 +170,7 @@ fn validate_operation(op: &Operation) -> Result<(), tonic::Status> {
 pub struct CommitCloudOpStoreService {
     store: Arc<CompositeStore>,
     metrics: ServerMetrics,
+    enforce_actor_repo_suffix: bool,
 }
 
 impl CommitCloudOpStoreService {
@@ -177,7 +179,16 @@ impl CommitCloudOpStoreService {
     }
 
     pub fn with_metrics(store: Arc<CompositeStore>, metrics: ServerMetrics) -> Self {
-        Self { store, metrics }
+        Self {
+            store,
+            metrics,
+            enforce_actor_repo_suffix: false,
+        }
+    }
+
+    pub fn with_actor_repo_suffix_enforcement(mut self, enforce: bool) -> Self {
+        self.enforce_actor_repo_suffix = enforce;
+        self
     }
 }
 
@@ -243,8 +254,14 @@ impl OpStoreService for CommitCloudOpStoreService {
         &self,
         request: tonic::Request<WriteOperationRequest>,
     ) -> Result<tonic::Response<WriteOperationResponse>, tonic::Status> {
+        let caller_identity = request.extensions().get::<CallerIdentity>().cloned();
         let req = request.into_inner();
         validate_identifier(&req.repo_id, "repo_id")?;
+        enforce_actor_repo_suffix(
+            caller_identity.as_ref(),
+            self.enforce_actor_repo_suffix,
+            &req.repo_id,
+        )?;
         let op = req.operation.ok_or_else(|| {
             tonic::Status::invalid_argument("request should have contained an operation object")
         })?;
@@ -333,8 +350,14 @@ impl OpStoreService for CommitCloudOpStoreService {
         &self,
         request: tonic::Request<WriteViewRequest>,
     ) -> Result<tonic::Response<WriteViewResponse>, tonic::Status> {
+        let caller_identity = request.extensions().get::<CallerIdentity>().cloned();
         let req = request.into_inner();
         validate_identifier(&req.repo_id, "repo_id")?;
+        enforce_actor_repo_suffix(
+            caller_identity.as_ref(),
+            self.enforce_actor_repo_suffix,
+            &req.repo_id,
+        )?;
         let view = req.view.ok_or_else(|| {
             tonic::Status::invalid_argument("request should have contained a view object")
         })?;
@@ -364,8 +387,14 @@ impl OpStoreService for CommitCloudOpStoreService {
         &self,
         request: tonic::Request<UpdateOpHeadsRequest>,
     ) -> Result<tonic::Response<UpdateOpHeadsResponse>, tonic::Status> {
+        let caller_identity = request.extensions().get::<CallerIdentity>().cloned();
         let req = request.into_inner();
         validate_identifier(&req.repo_id, "repo_id")?;
+        enforce_actor_repo_suffix(
+            caller_identity.as_ref(),
+            self.enforce_actor_repo_suffix,
+            &req.repo_id,
+        )?;
         validate_digest_len(
             &req.new_op_head_id,
             cc_common::OPERATION_ID_LENGTH,
@@ -394,8 +423,14 @@ impl OpStoreService for CommitCloudOpStoreService {
         &self,
         request: tonic::Request<ReconcileOpHeadsRequest>,
     ) -> Result<tonic::Response<ReconcileOpHeadsResponse>, tonic::Status> {
+        let caller_identity = request.extensions().get::<CallerIdentity>().cloned();
         let req = request.into_inner();
         validate_identifier(&req.repo_id, "repo_id")?;
+        enforce_actor_repo_suffix(
+            caller_identity.as_ref(),
+            self.enforce_actor_repo_suffix,
+            &req.repo_id,
+        )?;
         info!("Reconcile op heads for repo: {}", req.repo_id);
         let response = reconcile_repo_op_heads_proto_with_metrics(
             self.store.clone(),
@@ -410,8 +445,14 @@ impl OpStoreService for CommitCloudOpStoreService {
         &self,
         request: tonic::Request<PublishOperationRequest>,
     ) -> Result<tonic::Response<PublishOperationResponse>, tonic::Status> {
+        let caller_identity = request.extensions().get::<CallerIdentity>().cloned();
         let req = request.into_inner();
         validate_identifier(&req.repo_id, "repo_id")?;
+        enforce_actor_repo_suffix(
+            caller_identity.as_ref(),
+            self.enforce_actor_repo_suffix,
+            &req.repo_id,
+        )?;
         for old_id in &req.old_op_head_ids {
             validate_digest_len(old_id, cc_common::OPERATION_ID_LENGTH, "old_op_head_ids")?;
         }

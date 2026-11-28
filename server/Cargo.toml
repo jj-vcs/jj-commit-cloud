@@ -30,18 +30,24 @@ async-trait = "0.1"
 bytes = "1"
 prost = "0.13"
 thiserror = "2"
+axum = "0.7"
+base64 = "0.22"
 gix = "0.85.0"
 hex = "0.4"
+http = "1"
+jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
+lru = "0.16.4"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tower = "0.4.13"
+url = "2"
 uuid = { version = "1", features = ["v4"] }
 sha2 = "0.10"
 subtle = "2.6"
 rusqlite = { version = "0.32", features = ["bundled"] }
-axum = "0.7"
-http = "1"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 tempfile = "3"
-tower = "0.4"
 google-cloud-spanner = "0.35.0"
 google-cloud-storage = "1.22.0"
 google-cloud-auth = "1.19.0"
@@ -49,5 +55,6 @@ google-cloud-gax = "1.15.0"
 
 [dev-dependencies]
 assert_cmd = "2.0"
+aws-lc-rs = "1"
 predicates = "3.1"
 testutils = { path = "../testutils" }

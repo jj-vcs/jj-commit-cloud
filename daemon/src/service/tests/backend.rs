@@ -1159,3 +1159,164 @@ async fn grpc_timeout_forwarded_on_uncached_rpcs_and_omitted_on_coalesced_fetche
         .unwrap();
     assert_eq!(mock.state.lock().unwrap().last_read_commit_timeout, None);
 }
+
+#[tokio::test]
+async fn write_commit_skips_auth_write_through_and_strips_spoofed_actor_keys() {
+    let mock = MockUpstream::default();
+    mock.state.lock().unwrap().stamp_actor_sub = Some("system:actor:oss-demo:coder-1".to_string());
+    let url = spawn_mock_upstream(mock.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let cache = Arc::new(TwoTierCache::new(dir.path().to_path_buf(), 4 * 1024 * 1024).unwrap());
+    let proxy = DaemonProxy::new(Arc::clone(&cache), Arc::new(UpstreamPool::new(None)), None);
+
+    // Authenticated WriteCommit skips commit write-through so ReadCommit observes
+    // server-stamped `actor-sub` and `actor-uid` instead of stale client-supplied bytes.
+    let mut auth_commit = Commit {
+        commit_id: Vec::new(),
+        change_id: vec![0x71; 16],
+        parent_commit_ids: vec![ROOT_COMMIT_ID_BYTES.to_vec()],
+        root_tree_id: vec![EMPTY_TREE_ID_BYTES.to_vec()],
+        description: "authenticated actor commit".to_string(),
+        ..Default::default()
+    };
+    auth_commit
+        .external_ids
+        .insert("actor-sub".to_string(), b"spoofed-sub".to_vec());
+    auth_commit
+        .external_ids
+        .insert("actor-uid".to_string(), b"spoofed-uid".to_vec());
+
+    let auth_id = BackendService::write_commit(
+        &proxy,
+        req_with_upstream(
+            WriteCommitRequest {
+                project_id: "proj".to_string(),
+                commit: Some(auth_commit),
+            },
+            &url,
+            Some("Bearer actor-jwt"),
+        ),
+    )
+    .await
+    .unwrap()
+    .into_inner()
+    .commit_id;
+
+    let read_auth = BackendService::read_commit(
+        &proxy,
+        req_with_upstream(
+            ReadCommitRequest {
+                project_id: "proj".to_string(),
+                commit_id: auth_id,
+            },
+            &url,
+            Some("Bearer actor-jwt"),
+        ),
+    )
+    .await
+    .unwrap()
+    .into_inner()
+    .commit
+    .unwrap();
+    assert_eq!(
+        mock.state.lock().unwrap().read_commit_calls,
+        1,
+        "authenticated WriteCommit must not serve pre-attribution commit bytes from cache"
+    );
+    assert_eq!(
+        read_auth.external_ids.get("actor-sub"),
+        Some(&b"system:actor:oss-demo:coder-1".to_vec())
+    );
+    assert_eq!(
+        read_auth.external_ids.get("actor-uid"),
+        Some(&b"uid-server-verified".to_vec())
+    );
+
+    // Unauthenticated WriteCommit also avoids non-authoritative write-through, so the first
+    // ReadCommit fetches the server-sanitized commit (spoofed actor keys stripped) and
+    // caches that authoritative copy for subsequent reads.
+    let mut unauth_commit = Commit {
+        commit_id: Vec::new(),
+        change_id: vec![0x72; 16],
+        parent_commit_ids: vec![ROOT_COMMIT_ID_BYTES.to_vec()],
+        root_tree_id: vec![EMPTY_TREE_ID_BYTES.to_vec()],
+        description: "unauthenticated spoofed commit".to_string(),
+        ..Default::default()
+    };
+    unauth_commit
+        .external_ids
+        .insert("actor-sub".to_string(), b"spoofed-sub".to_vec());
+    unauth_commit
+        .external_ids
+        .insert("actor-uid".to_string(), b"spoofed-uid".to_vec());
+    unauth_commit
+        .external_ids
+        .insert("perforce-cl".to_string(), b"42".to_vec());
+
+    let unauth_id = BackendService::write_commit(
+        &proxy,
+        req_with_upstream(
+            WriteCommitRequest {
+                project_id: "proj".to_string(),
+                commit: Some(unauth_commit),
+            },
+            &url,
+            None,
+        ),
+    )
+    .await
+    .unwrap()
+    .into_inner()
+    .commit_id;
+
+    let read_unauth = BackendService::read_commit(
+        &proxy,
+        req_with_upstream(
+            ReadCommitRequest {
+                project_id: "proj".to_string(),
+                commit_id: unauth_id.clone(),
+            },
+            &url,
+            None,
+        ),
+    )
+    .await
+    .unwrap()
+    .into_inner()
+    .commit
+    .unwrap();
+    assert_eq!(
+        mock.state.lock().unwrap().read_commit_calls,
+        2,
+        "unauthenticated WriteCommit must fetch authoritative server-sanitized commit on first read"
+    );
+    assert!(!read_unauth.external_ids.contains_key("actor-sub"));
+    assert!(!read_unauth.external_ids.contains_key("actor-uid"));
+    assert_eq!(
+        read_unauth.external_ids.get("perforce-cl"),
+        Some(&b"42".to_vec())
+    );
+
+    let cached_unauth = BackendService::read_commit(
+        &proxy,
+        req_with_upstream(
+            ReadCommitRequest {
+                project_id: "proj".to_string(),
+                commit_id: unauth_id,
+            },
+            &url,
+            None,
+        ),
+    )
+    .await
+    .unwrap()
+    .into_inner()
+    .commit
+    .unwrap();
+    assert_eq!(
+        mock.state.lock().unwrap().read_commit_calls,
+        2,
+        "second ReadCommit should serve the cached authoritative server-sanitized commit"
+    );
+    assert_eq!(cached_unauth, read_unauth);
+}

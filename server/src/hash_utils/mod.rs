@@ -370,11 +370,15 @@ fn validate_external_ids(
 ) -> Result<(), String> {
     const MAX_EXTERNAL_IDS: usize = 16;
     const MAX_EXTERNAL_ID_KEY_LEN: usize = 64;
+    const MAX_ACTOR_EXTERNAL_ID_LEN: usize = 256;
 
-    if external_ids.len() > MAX_EXTERNAL_IDS {
+    let non_actor_count = external_ids
+        .keys()
+        .filter(|k| !matches!(k.as_str(), "actor-sub" | "actor-uid"))
+        .count();
+    if non_actor_count > MAX_EXTERNAL_IDS {
         return Err(format!(
-            "external_ids count ({}) exceeds maximum ({MAX_EXTERNAL_IDS})",
-            external_ids.len()
+            "external_ids count ({non_actor_count}) exceeds maximum ({MAX_EXTERNAL_IDS})"
         ));
     }
     for (key, value) in external_ids {
@@ -390,26 +394,46 @@ fn validate_external_ids(
                 "invalid external_ids key {key:?} (must be 1..={MAX_EXTERNAL_ID_KEY_LEN} ASCII [a-z0-9._-] characters)"
             ));
         }
-        if value.is_empty() || value.len() > 64 {
-            return Err(format!(
-                "external_ids[{key:?}] must be 1..=64 bytes (got {} bytes)",
-                value.len()
-            ));
-        }
         match key.as_str() {
-            "git-sha1" if value.len() != SHA1_ID_LENGTH => {
-                return Err(format!(
-                    "external_ids['git-sha1'] must be {SHA1_ID_LENGTH} bytes (got {} bytes)",
-                    value.len()
-                ));
+            "git-sha1" => {
+                if value.len() != SHA1_ID_LENGTH {
+                    return Err(format!(
+                        "external_ids['git-sha1'] must be {SHA1_ID_LENGTH} bytes (got {} bytes)",
+                        value.len()
+                    ));
+                }
             }
-            "git-sha256" if value.len() != 32 => {
-                return Err(format!(
-                    "external_ids['git-sha256'] must be 32 bytes (got {} bytes)",
-                    value.len()
-                ));
+            "git-sha256" => {
+                if value.len() != 32 {
+                    return Err(format!(
+                        "external_ids['git-sha256'] must be 32 bytes (got {} bytes)",
+                        value.len()
+                    ));
+                }
             }
-            _ => {}
+            "actor-sub" | "actor-uid" => {
+                if value.is_empty() || value.len() > MAX_ACTOR_EXTERNAL_ID_LEN {
+                    return Err(format!(
+                        "external_ids[{key:?}] must be 1..={MAX_ACTOR_EXTERNAL_ID_LEN} bytes (got {} bytes)",
+                        value.len()
+                    ));
+                }
+                let text = std::str::from_utf8(value)
+                    .map_err(|_| format!("external_ids[{key:?}] must be valid UTF-8"))?;
+                if text.trim().is_empty() || text.bytes().any(|b| b.is_ascii_control()) {
+                    return Err(format!(
+                        "external_ids[{key:?}] must not be blank or contain ASCII control characters"
+                    ));
+                }
+            }
+            _ => {
+                if value.is_empty() || value.len() > 64 {
+                    return Err(format!(
+                        "external_ids[{key:?}] must be 1..=64 bytes (got {} bytes)",
+                        value.len()
+                    ));
+                }
+            }
         }
     }
     Ok(())

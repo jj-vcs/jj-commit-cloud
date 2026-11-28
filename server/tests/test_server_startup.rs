@@ -833,3 +833,110 @@ async fn test_server_env_token_file_and_allow_unauthenticated_non_loopback() {
         .await
         .expect("unauthenticated RPC should succeed when JJ_CC_ALLOW_UNAUTHENTICATED=true");
 }
+
+#[tokio::test]
+async fn test_server_oidc_and_k8s_auth_flags_validation_and_non_loopback_bind() {
+    // OIDC issuer without audience fails closed.
+    let no_aud = run_server_cli(
+        &[],
+        &["--port=0", "--auth-oidc-issuer=https://accounts.google.com"],
+    );
+    assert!(!no_aud.status.success());
+    assert!(
+        String::from_utf8_lossy(&no_aud.stderr).contains("--auth-oidc-audience"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&no_aud.stderr)
+    );
+
+    // OIDC sub-flags without issuer fail closed.
+    let no_issuer = run_server_cli(&[], &["--port=0", "--auth-enforce-actor-repo-suffix"]);
+    assert!(!no_issuer.status.success());
+    assert!(
+        String::from_utf8_lossy(&no_issuer.stderr).contains("--auth-oidc-issuer"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&no_issuer.stderr)
+    );
+
+    // K8s sub-flags without TokenReview URL fail closed.
+    let no_k8s_url = run_server_cli(&[], &["--port=0", "--auth-k8s-tokenreview-aud=cloud-jj"]);
+    assert!(!no_k8s_url.status.success());
+    assert!(
+        String::from_utf8_lossy(&no_k8s_url.stderr).contains("--auth-k8s-tokenreview-url"),
+        "unexpected stderr: {}",
+        String::from_utf8_lossy(&no_k8s_url.stderr)
+    );
+
+    // Empty or whitespace values for any OIDC or K8s auth flag/env must fail closed rather than
+    // silently disabling auth or dropping security constraints.
+    for (env_var, flag) in [
+        ("JJ_CC_AUTH_OIDC_ISSUER", "--auth-oidc-issuer"),
+        ("JJ_CC_AUTH_OIDC_AUDIENCE", "--auth-oidc-audience"),
+        ("JJ_CC_AUTH_OIDC_JWKS_URI", "--auth-oidc-jwks-uri"),
+        ("JJ_CC_AUTH_OIDC_CA_CERT", "--auth-oidc-ca-cert"),
+        (
+            "JJ_CC_AUTH_K8S_TOKENREVIEW_URL",
+            "--auth-k8s-tokenreview-url",
+        ),
+        (
+            "JJ_CC_AUTH_K8S_TOKENREVIEW_AUD",
+            "--auth-k8s-tokenreview-aud",
+        ),
+        ("JJ_CC_AUTH_K8S_CA_CERT", "--auth-k8s-ca-cert"),
+        ("JJ_CC_AUTH_K8S_SA_TOKEN_FILE", "--auth-k8s-sa-token-file"),
+    ] {
+        for blank in ["", "   "] {
+            let env_out = run_server_cli(&[(env_var, blank)], &["--port=0"]);
+            assert!(
+                !env_out.status.success(),
+                "blank env {env_var}={blank:?} must fail closed"
+            );
+            let cli_arg = format!("{flag}={blank}");
+            let cli_out = run_server_cli(&[], &["--port=0", &cli_arg]);
+            assert!(
+                !cli_out.status.success(),
+                "blank CLI {cli_arg:?} must fail closed"
+            );
+        }
+    }
+
+    // OIDC auth satisfies non-loopback `--host=0.0.0.0` bind check without --allow-unauthenticated.
+    let server = testutils::spawn_server_with_env(
+        &[
+            ("JJ_CC_AUTH_OIDC_ISSUER", "https://accounts.google.com"),
+            ("JJ_CC_AUTH_OIDC_AUDIENCE", "cloud-jj"),
+        ],
+        &["--host=0.0.0.0"],
+    )
+    .await;
+    let connect_url = server
+        .url()
+        .replacen("http://0.0.0.0:", "http://127.0.0.1:", 1);
+    let channel = tonic::transport::Endpoint::from_shared(connect_url)
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut health = HealthClient::new(channel.clone());
+    assert_eq!(
+        health
+            .check(HealthCheckRequest {
+                service: String::new()
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .status(),
+        tonic_health::pb::health_check_response::ServingStatus::Serving
+    );
+    let mut backend = BackendServiceClient::new(channel);
+    let err = backend
+        .register_repository(Request::new(RegisterRepositoryRequest {
+            project_id: "oidc-proj".to_string(),
+            repo_id: None,
+            name: None,
+            hash_algorithm: 0,
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::Unauthenticated);
+}

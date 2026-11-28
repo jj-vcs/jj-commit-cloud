@@ -669,6 +669,49 @@ fn test_validate_commit_external_ids_format() {
 }
 
 #[test]
+fn test_validate_commit_external_ids_actor_attribution_preserves_git_hash() {
+    let mut baseline = test_commit();
+    let baseline_hash = verify_or_compute_git_commit_hash(&mut baseline).unwrap();
+
+    let long_sub = format!("system:actor:atespace-prod:{}", "a".repeat(120));
+    assert!(long_sub.len() > 64 && long_sub.len() <= 256);
+    let max_len_uid = "u".repeat(256);
+
+    let mut attributed = test_commit();
+    attributed
+        .external_ids
+        .insert("actor-sub".to_string(), long_sub.as_bytes().to_vec());
+    attributed
+        .external_ids
+        .insert("actor-uid".to_string(), max_len_uid.as_bytes().to_vec());
+    let attributed_hash = verify_or_compute_git_commit_hash(&mut attributed).unwrap();
+    assert_eq!(
+        attributed_hash, baseline_hash,
+        "actor-sub and actor-uid must be excluded from canonical Git SHA-1 hashing"
+    );
+
+    let overlong = vec![b'x'; 257];
+    for key in ["actor-sub", "actor-uid"] {
+        for bad_val in [
+            vec![],
+            overlong.clone(),
+            vec![0xff, 0xfe],
+            b"line1\nline2".to_vec(),
+            b"null\0byte".to_vec(),
+            b"tab\there".to_vec(),
+            b"del\x7fchar".to_vec(),
+        ] {
+            let mut bad = test_commit();
+            bad.external_ids.insert(key.to_string(), bad_val);
+            assert!(
+                verify_or_compute_git_commit_hash(&mut bad).is_err(),
+                "expected invalid {key} external_id to be rejected"
+            );
+        }
+    }
+}
+
+#[test]
 fn test_try_blob_view_and_operation_hashes_return_deterministic_digests() {
     let empty_blob = try_compute_git_blob_hash(b"").unwrap();
     assert_eq!(

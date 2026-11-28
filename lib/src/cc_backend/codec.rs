@@ -442,6 +442,8 @@ pub fn apply_commit_signing(
 fn validate_external_ids(
     external_ids: &std::collections::HashMap<String, Vec<u8>>,
 ) -> BackendResult<()> {
+    const MAX_ACTOR_EXTERNAL_ID_LEN: usize = 256;
+
     for (key, value) in external_ids {
         if key.is_empty()
             || key.len() > 128
@@ -455,35 +457,64 @@ fn validate_external_ids(
                 format!("ReadCommit invalid external_ids key {key:?}").into(),
             ));
         }
-        if value.is_empty() || value.len() > 64 {
-            return Err(BackendError::Other(
-                format!(
-                    "ReadCommit external_ids[{key:?}] must be 1..=64 bytes (got {} bytes)",
-                    value.len()
-                )
-                .into(),
-            ));
-        }
         match key.as_str() {
-            "git-sha1" if value.len() != 20 => {
-                return Err(BackendError::Other(
-                    format!(
-                        "ReadCommit external_ids['git-sha1'] must be 20 bytes (got {} bytes)",
-                        value.len()
-                    )
-                    .into(),
-                ));
+            "git-sha1" => {
+                if value.len() != 20 {
+                    return Err(BackendError::Other(
+                        format!(
+                            "ReadCommit external_ids['git-sha1'] must be 20 bytes (got {} bytes)",
+                            value.len()
+                        )
+                        .into(),
+                    ));
+                }
             }
-            "git-sha256" if value.len() != 32 => {
-                return Err(BackendError::Other(
-                    format!(
-                        "ReadCommit external_ids['git-sha256'] must be 32 bytes (got {} bytes)",
-                        value.len()
-                    )
-                    .into(),
-                ));
+            "git-sha256" => {
+                if value.len() != 32 {
+                    return Err(BackendError::Other(
+                        format!(
+                            "ReadCommit external_ids['git-sha256'] must be 32 bytes (got {} bytes)",
+                            value.len()
+                        )
+                        .into(),
+                    ));
+                }
             }
-            _ => {}
+            "actor-sub" | "actor-uid" => {
+                if value.is_empty() || value.len() > MAX_ACTOR_EXTERNAL_ID_LEN {
+                    return Err(BackendError::Other(
+                        format!(
+                            "ReadCommit external_ids[{key:?}] must be 1..={MAX_ACTOR_EXTERNAL_ID_LEN} bytes (got {} bytes)",
+                            value.len()
+                        )
+                        .into(),
+                    ));
+                }
+                let text = std::str::from_utf8(value).map_err(|_| {
+                    BackendError::Other(
+                        format!("ReadCommit external_ids[{key:?}] must be valid UTF-8").into(),
+                    )
+                })?;
+                if text.trim().is_empty() || text.bytes().any(|b| b.is_ascii_control()) {
+                    return Err(BackendError::Other(
+                        format!(
+                            "ReadCommit external_ids[{key:?}] must not be blank or contain ASCII control characters"
+                        )
+                        .into(),
+                    ));
+                }
+            }
+            _ => {
+                if value.is_empty() || value.len() > 64 {
+                    return Err(BackendError::Other(
+                        format!(
+                            "ReadCommit external_ids[{key:?}] must be 1..=64 bytes (got {} bytes)",
+                            value.len()
+                        )
+                        .into(),
+                    ));
+                }
+            }
         }
     }
     Ok(())

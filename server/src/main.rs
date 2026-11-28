@@ -22,11 +22,13 @@
 //! throwaway in-memory blobs.
 //!
 //! # Security and Network Boundaries
-//! Loads optional Bearer tokens from `--auth-token` / `--auth-token-file`, scrubs raw
-//! secret buffers after building [`BearerAuthInterceptor`], fails closed on empty token
-//! specs or unauthenticated non-loopback binds (unless `--allow-unauthenticated`), and
-//! exposes gRPC health probes and optional HTTP `--metrics-listen` (`/healthz`, `/statz`,
-//! `/metrics`) endpoints unauthenticated for readiness checks and telemetry scraping.
+//! Wires [`ServerAuthLayer`] from optional static Bearer tokens (`--auth-token` /
+//! `--auth-token-file`, scrubbed after building [`BearerAuthInterceptor`]), OIDC JWT
+//! verification (`--auth-oidc-*`, with optional `--auth-enforce-actor-repo-suffix`), and
+//! Kubernetes `TokenReview` (`--auth-k8s-*`). Fails closed on empty or partial auth specs
+//! and unauthenticated non-loopback binds (unless `--allow-unauthenticated`), while keeping
+//! gRPC health probes and optional HTTP `--metrics-listen` (`/healthz`, `/statz`, `/metrics`)
+//! open for readiness checks and telemetry scraping.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -42,7 +44,8 @@ use cc_common::backend::backend_service_server::BackendServiceServer;
 use cc_common::op_store::op_store_service_server::OpStoreServiceServer;
 use cc_common::workspace::workspace_service_server::WorkspaceServiceServer;
 use jj_commit_cloud_server::auth::{
-    BearerAuthInterceptor, load_tokens_from_file, resolve_listen_addrs, scrub_tokens,
+    BearerAuthInterceptor, K8sTokenReviewConfig, OidcAuthConfig, ServerAuthConfig, ServerAuthLayer,
+    load_tokens_from_file, resolve_listen_addrs, scrub_tokens,
 };
 use jj_commit_cloud_server::backend::{
     CommitCloudBackendService, DEFAULT_WRITE_STREAM_SPILL_THRESHOLD_BYTES,
@@ -217,10 +220,59 @@ struct Args {
     #[arg(long = "auth-token-file", env = "JJ_CC_SERVER_AUTH_TOKEN_FILE")]
     auth_token_file: Option<std::path::PathBuf>,
 
-    /// Allow binding to a non-loopback `--host` without Bearer authentication (for example
+    /// Allow binding to a non-loopback `--host` without authentication (for example
     /// behind Cloud Run IAM, Identity-Aware Proxy, or an isolated container network)
     #[arg(long, env = "JJ_CC_ALLOW_UNAUTHENTICATED")]
     allow_unauthenticated: bool,
+
+    /// Optional OIDC issuer URL for JWT authentication (e.g. `https://accounts.google.com` or
+    /// `https://idp.ate-system.svc`)
+    #[arg(long = "auth-oidc-issuer", env = "JJ_CC_AUTH_OIDC_ISSUER")]
+    auth_oidc_issuer: Option<String>,
+
+    /// Required audience (`aud` claim) when `--auth-oidc-issuer` is set (e.g. `cloud-jj`)
+    #[arg(long = "auth-oidc-audience", env = "JJ_CC_AUTH_OIDC_AUDIENCE")]
+    auth_oidc_audience: Option<String>,
+
+    /// Optional explicit JWKS URI override (otherwise discovered via
+    /// `<issuer>/.well-known/openid-configuration`)
+    #[arg(long = "auth-oidc-jwks-uri", env = "JJ_CC_AUTH_OIDC_JWKS_URI")]
+    auth_oidc_jwks_uri: Option<String>,
+
+    /// Optional PEM CA certificate bundle for TLS verification against the OIDC issuer/JWKS
+    #[arg(long = "auth-oidc-ca-cert", env = "JJ_CC_AUTH_OIDC_CA_CERT")]
+    auth_oidc_ca_cert: Option<PathBuf>,
+
+    /// Restrict OIDC actor JWT writes carrying a `repo_id` to `<alnum>_<atespace>_<actorName>`
+    /// repositories matching the actor's required `atespace` and `actorName` claims
+    #[arg(
+        long = "auth-enforce-actor-repo-suffix",
+        env = "JJ_CC_AUTH_ENFORCE_ACTOR_REPO_SUFFIX"
+    )]
+    auth_enforce_actor_repo_suffix: bool,
+
+    /// Optional Kubernetes API server URL (or full `tokenreviews` URL) for ServiceAccount
+    /// `TokenReview` authentication
+    #[arg(
+        long = "auth-k8s-tokenreview-url",
+        env = "JJ_CC_AUTH_K8S_TOKENREVIEW_URL"
+    )]
+    auth_k8s_tokenreview_url: Option<String>,
+
+    /// Optional expected audience passed to Kubernetes `TokenReview`
+    #[arg(
+        long = "auth-k8s-tokenreview-aud",
+        env = "JJ_CC_AUTH_K8S_TOKENREVIEW_AUD"
+    )]
+    auth_k8s_tokenreview_aud: Option<String>,
+
+    /// Optional PEM CA certificate bundle for TLS verification against the Kubernetes API server
+    #[arg(long = "auth-k8s-ca-cert", env = "JJ_CC_AUTH_K8S_CA_CERT")]
+    auth_k8s_ca_cert: Option<PathBuf>,
+
+    /// Optional path to projected ServiceAccount token used to authenticate `TokenReview` requests
+    #[arg(long = "auth-k8s-sa-token-file", env = "JJ_CC_AUTH_K8S_SA_TOKEN_FILE")]
+    auth_k8s_sa_token_file: Option<PathBuf>,
 
     /// Optional HTTP listen address for unauthenticated observability endpoints
     /// (`/healthz`, `/statz`, `/metrics`), e.g. `127.0.0.1:9090` (disabled when unset or blank)
@@ -315,17 +367,168 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .into(),
         );
     }
+
+    let require_non_blank_str = |opt: Option<String>,
+                                 flag: &str,
+                                 env_var: &str|
+     -> Result<Option<String>, String> {
+        match opt {
+            None => Ok(None),
+            Some(raw) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    Err(format!(
+                        "{flag} (or {env_var}) must not be empty or whitespace; unset it to disable"
+                    ))
+                } else {
+                    Ok(Some(trimmed.to_string()))
+                }
+            }
+        }
+    };
+    let require_non_blank_path = |opt: Option<PathBuf>,
+                                  flag: &str,
+                                  env_var: &str|
+     -> Result<Option<PathBuf>, String> {
+        match opt {
+            None => Ok(None),
+            Some(path) => {
+                if path.as_os_str().is_empty() || path.to_str().is_some_and(|s| s.trim().is_empty())
+                {
+                    Err(format!(
+                        "{flag} (or {env_var}) must not be empty or whitespace; unset it to disable"
+                    ))
+                } else {
+                    Ok(Some(path))
+                }
+            }
+        }
+    };
+
+    let oidc_issuer = require_non_blank_str(
+        args.auth_oidc_issuer.take(),
+        "--auth-oidc-issuer",
+        "JJ_CC_AUTH_OIDC_ISSUER",
+    )?;
+    let oidc_audience = require_non_blank_str(
+        args.auth_oidc_audience.take(),
+        "--auth-oidc-audience",
+        "JJ_CC_AUTH_OIDC_AUDIENCE",
+    )?;
+    let oidc_jwks_uri = require_non_blank_str(
+        args.auth_oidc_jwks_uri.take(),
+        "--auth-oidc-jwks-uri",
+        "JJ_CC_AUTH_OIDC_JWKS_URI",
+    )?;
+    let oidc_ca_cert = require_non_blank_path(
+        args.auth_oidc_ca_cert.take(),
+        "--auth-oidc-ca-cert",
+        "JJ_CC_AUTH_OIDC_CA_CERT",
+    )?;
+    let oidc_config = match oidc_issuer {
+        Some(issuer) => {
+            let audience = oidc_audience.ok_or(
+                "--auth-oidc-audience (or JJ_CC_AUTH_OIDC_AUDIENCE) is required when \
+                 --auth-oidc-issuer is set",
+            )?;
+            Some(OidcAuthConfig {
+                issuer,
+                audience,
+                jwks_uri: oidc_jwks_uri,
+                ca_cert: oidc_ca_cert,
+                enforce_actor_repo_suffix: args.auth_enforce_actor_repo_suffix,
+            })
+        }
+        None => {
+            if oidc_audience.is_some()
+                || oidc_jwks_uri.is_some()
+                || oidc_ca_cert.is_some()
+                || args.auth_enforce_actor_repo_suffix
+            {
+                return Err(
+                    "--auth-oidc-issuer (or JJ_CC_AUTH_OIDC_ISSUER) is required when OIDC auth \
+                     options are configured"
+                        .into(),
+                );
+            }
+            None
+        }
+    };
+
+    let k8s_url = require_non_blank_str(
+        args.auth_k8s_tokenreview_url.take(),
+        "--auth-k8s-tokenreview-url",
+        "JJ_CC_AUTH_K8S_TOKENREVIEW_URL",
+    )?;
+    let k8s_aud = require_non_blank_str(
+        args.auth_k8s_tokenreview_aud.take(),
+        "--auth-k8s-tokenreview-aud",
+        "JJ_CC_AUTH_K8S_TOKENREVIEW_AUD",
+    )?;
+    let k8s_ca_cert = require_non_blank_path(
+        args.auth_k8s_ca_cert.take(),
+        "--auth-k8s-ca-cert",
+        "JJ_CC_AUTH_K8S_CA_CERT",
+    )?;
+    let k8s_sa_token_file = require_non_blank_path(
+        args.auth_k8s_sa_token_file.take(),
+        "--auth-k8s-sa-token-file",
+        "JJ_CC_AUTH_K8S_SA_TOKEN_FILE",
+    )?;
+    let k8s_config = match k8s_url {
+        Some(url) => Some(K8sTokenReviewConfig {
+            url,
+            audience: k8s_aud,
+            ca_cert: k8s_ca_cert,
+            sa_token_file: k8s_sa_token_file,
+        }),
+        None => {
+            if k8s_aud.is_some() || k8s_ca_cert.is_some() || k8s_sa_token_file.is_some() {
+                return Err(
+                    "--auth-k8s-tokenreview-url (or JJ_CC_AUTH_K8S_TOKENREVIEW_URL) is required \
+                     when Kubernetes TokenReview options are configured"
+                        .into(),
+                );
+            }
+            None
+        }
+    };
+
+    let static_auth_enabled = auth.is_enabled();
+    let oidc_enabled = oidc_config.is_some();
+    let k8s_enabled = k8s_config.is_some();
+    let auth_layer = ServerAuthLayer::new(ServerAuthConfig {
+        static_tokens: auth,
+        oidc: oidc_config,
+        k8s_tokenreview: k8s_config,
+    })?;
+    let enforce_actor_repo_suffix = auth_layer.enforce_actor_repo_suffix();
+
     let listen_addrs = resolve_listen_addrs(
         &args.host,
         args.port,
-        auth.is_enabled(),
+        auth_layer.is_enabled(),
         args.allow_unauthenticated,
     )
     .await?;
-    if auth.is_enabled() {
-        info!("Bearer token authentication enabled for gRPC services");
+    if auth_layer.is_enabled() {
+        let mut modes = Vec::new();
+        if static_auth_enabled {
+            modes.push("static-bearer");
+        }
+        if oidc_enabled {
+            modes.push("oidc-jwt");
+        }
+        if k8s_enabled {
+            modes.push("k8s-tokenreview");
+        }
+        info!(
+            "gRPC authentication enabled (modes: {}, enforce_actor_repo_suffix={})",
+            modes.join(", "),
+            enforce_actor_repo_suffix
+        );
     } else {
-        warn!("Bearer token authentication disabled: gRPC services accept any caller");
+        warn!("gRPC authentication disabled: gRPC services accept any caller");
     }
 
     let resolved_sqlite_path = args
@@ -634,32 +837,33 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     info!("jj-cc-server listening on {}", local_addr);
 
     let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-    let backend_service = CommitCloudBackendService::with_metrics(store.clone(), metrics.clone());
-    let op_store_service = CommitCloudOpStoreService::with_metrics(store.clone(), metrics.clone());
-    let workspace_service = CommitCloudWorkspaceService::with_metrics(store, metrics.clone());
+    let backend_service = CommitCloudBackendService::with_metrics(store.clone(), metrics.clone())
+        .with_actor_repo_suffix_enforcement(enforce_actor_repo_suffix);
+    let op_store_service = CommitCloudOpStoreService::with_metrics(store.clone(), metrics.clone())
+        .with_actor_repo_suffix_enforcement(enforce_actor_repo_suffix);
+    let workspace_service = CommitCloudWorkspaceService::with_metrics(store, metrics.clone())
+        .with_actor_repo_suffix_enforcement(enforce_actor_repo_suffix);
 
     Server::builder()
         .http2_max_header_list_size(64 * 1024)
         .layer(MetricsLayer::new(metrics))
+        .layer(auth_layer)
         .add_service(health_service)
-        .add_service(tonic::service::interceptor::InterceptedService::new(
+        .add_service(
             BackendServiceServer::new(backend_service)
                 .max_decoding_message_size(cc_common::MAX_GRPC_MESSAGE_BYTES)
                 .max_encoding_message_size(cc_common::MAX_GRPC_MESSAGE_BYTES),
-            auth.clone(),
-        ))
-        .add_service(tonic::service::interceptor::InterceptedService::new(
+        )
+        .add_service(
             OpStoreServiceServer::new(op_store_service)
                 .max_decoding_message_size(cc_common::MAX_GRPC_MESSAGE_BYTES)
                 .max_encoding_message_size(cc_common::MAX_GRPC_MESSAGE_BYTES),
-            auth.clone(),
-        ))
-        .add_service(tonic::service::interceptor::InterceptedService::new(
+        )
+        .add_service(
             WorkspaceServiceServer::new(workspace_service)
                 .max_decoding_message_size(cc_common::MAX_GRPC_MESSAGE_BYTES)
                 .max_encoding_message_size(cc_common::MAX_GRPC_MESSAGE_BYTES),
-            auth,
-        ))
+        )
         .serve_with_incoming_shutdown(incoming, async move {
             let _ = grpc_shutdown_rx.wait_for(|&stopped| stopped).await;
         })
