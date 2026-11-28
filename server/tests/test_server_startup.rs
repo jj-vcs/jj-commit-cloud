@@ -108,6 +108,8 @@ async fn test_server_bearer_auth_enforces_tokens_while_keeping_health_open() {
     let ws_unauth_err = workspace
         .list_workspaces(Request::new(ListWorkspacesRequest {
             repo_id: "any".to_string(),
+            page_size: 0,
+            page_token: String::new(),
         }))
         .await
         .expect_err("unauthenticated ListWorkspaces must fail");
@@ -197,7 +199,11 @@ async fn test_server_bearer_auth_enforces_tokens_while_keeping_health_open() {
         .op_head_ids;
     assert_eq!(heads.len(), 1);
 
-    let mut req3 = Request::new(ListWorkspacesRequest { repo_id });
+    let mut req3 = Request::new(ListWorkspacesRequest {
+        repo_id,
+        page_size: 0,
+        page_token: String::new(),
+    });
     req3.metadata_mut()
         .insert("authorization", "Bearer active-token-1".parse().unwrap());
     let ws_list = workspace

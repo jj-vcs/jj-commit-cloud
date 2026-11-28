@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(deprecated)]
+
 use cc_common::workspace::GetWorkspaceRequest;
 use cc_common::workspace::workspace_service_client::WorkspaceServiceClient;
 use std::fs;
@@ -332,7 +334,7 @@ async fn test_delete_workspace_succeeds() {
         .await
         .expect("Failed to delete workspace")
         .into_inner();
-    assert!(del_resp.success);
+    assert!(del_resp.existed);
 
     // Verify workspace is gone from database
     let response = client
@@ -349,6 +351,8 @@ async fn test_delete_workspace_succeeds() {
     let list_resp = client
         .list_workspaces(ListWorkspacesRequest {
             repo_id: repo_id.clone(),
+            page_size: 0,
+            page_token: String::new(),
         })
         .await
         .expect("Failed to list workspaces")
@@ -382,8 +386,8 @@ async fn test_delete_workspace_nonexistent_returns_false() {
         .expect("Failed to call delete_workspace")
         .into_inner();
     assert!(
-        !del_resp.success,
-        "Deleting a nonexistent workspace should return success = false"
+        !del_resp.existed,
+        "Deleting a nonexistent workspace should return existed = false"
     );
 
     // Attempt to delete from a nonexistent repository
@@ -397,8 +401,8 @@ async fn test_delete_workspace_nonexistent_returns_false() {
         .expect("Failed to call delete_workspace")
         .into_inner();
     assert!(
-        !del_resp2.success,
-        "Deleting from a nonexistent repository should return success = false"
+        !del_resp2.existed,
+        "Deleting from a nonexistent repository should return existed = false"
     );
 }
 
@@ -670,4 +674,480 @@ async fn test_working_copy_shared_project_sqlite_integration() {
         )
         .unwrap();
     assert_eq!(ws_count, 2);
+}
+
+#[tokio::test]
+async fn test_workspace_cas_conflicts_sparse_pagination_and_preconditions() {
+    use cc_common::workspace::{
+        CheckWorkingCopyChangesRequest, ListWorkspacesRequest, UpdateWorkspaceRequest,
+        WorkspaceState,
+    };
+
+    let ws = TestWorkspace::init_sqlite().await;
+    let config_path = ws.repo_path().join(".jj/repo/store/config.toml");
+    let config_str = fs::read_to_string(&config_path).unwrap();
+    let config: toml::Value = toml::from_str(&config_str).unwrap();
+    let repo_id = config.get("repo_id").unwrap().as_str().unwrap().to_string();
+
+    let mut client = WorkspaceServiceClient::connect(ws.server_url().to_string())
+        .await
+        .expect("Failed to connect to WorkspaceService");
+
+    // Create-only CAS (`expected_operation_id = Some(vec![])`) succeeds on a new workspace
+    // and is idempotent on exact retry, but returns ABORTED when attempting to overwrite.
+    let agent_ws = WorkspaceState {
+        repo_id: repo_id.clone(),
+        user: "agent@example.com".to_string(),
+        workspace_name: "agent-1".to_string(),
+        commit_id: cc_common::ROOT_COMMIT_ID_BYTES.to_vec(),
+        operation_id: cc_common::ROOT_OPERATION_ID_BYTES.to_vec(),
+        tree_id: cc_common::EMPTY_TREE_ID_BYTES.to_vec(),
+        sparse_patterns: Vec::new(),
+        tree_ids: vec![cc_common::EMPTY_TREE_ID_BYTES.to_vec()],
+        conflict_labels: Vec::new(),
+        sparse_patterns_set: true,
+    };
+    client
+        .update_workspace(UpdateWorkspaceRequest {
+            workspace: Some(agent_ws.clone()),
+            expected_operation_id: Some(Vec::new()),
+        })
+        .await
+        .expect("create-only CAS should succeed");
+    // Exact retry is idempotent.
+    client
+        .update_workspace(UpdateWorkspaceRequest {
+            workspace: Some(agent_ws.clone()),
+            expected_operation_id: Some(Vec::new()),
+        })
+        .await
+        .expect("idempotent create-only CAS retry should succeed");
+
+    // Empty sparse patterns (`sparse_patterns_set = true`) are preserved rather than reset to `[""]`.
+    let fetched_empty_sparse = client
+        .get_workspace(GetWorkspaceRequest {
+            repo_id: repo_id.clone(),
+            user: "agent@example.com".to_string(),
+            workspace_name: "agent-1".to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .workspace
+        .unwrap();
+    assert!(fetched_empty_sparse.sparse_patterns.is_empty());
+    assert!(fetched_empty_sparse.sparse_patterns_set);
+
+    // Different state with create-only precondition fails with ABORTED.
+    let mut modified_ws = agent_ws.clone();
+    modified_ws.sparse_patterns = vec!["src".to_string()];
+    let create_conflict = client
+        .update_workspace(UpdateWorkspaceRequest {
+            workspace: Some(modified_ws.clone()),
+            expected_operation_id: Some(Vec::new()),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(create_conflict.code(), tonic::Code::Aborted);
+
+    // Wrong `expected_operation_id` fails with ABORTED, while matching `ROOT_OPERATION_ID` succeeds.
+    let wrong_op = vec![0xab; cc_common::OPERATION_ID_LENGTH];
+    let op_conflict = client
+        .update_workspace(UpdateWorkspaceRequest {
+            workspace: Some(modified_ws.clone()),
+            expected_operation_id: Some(wrong_op),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(op_conflict.code(), tonic::Code::Aborted);
+
+    client
+        .update_workspace(UpdateWorkspaceRequest {
+            workspace: Some(modified_ws),
+            expected_operation_id: Some(cc_common::ROOT_OPERATION_ID_BYTES.to_vec()),
+        })
+        .await
+        .expect("matching expected_operation_id CAS should succeed");
+
+    // FAILED_PRECONDITION when referencing an unpersisted operation, commit, or tree.
+    let missing_op_err = client
+        .update_workspace(UpdateWorkspaceRequest {
+            workspace: Some(WorkspaceState {
+                operation_id: vec![0x11; cc_common::OPERATION_ID_LENGTH],
+                ..agent_ws.clone()
+            }),
+            expected_operation_id: None,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(missing_op_err.code(), tonic::Code::FailedPrecondition);
+
+    let missing_tree_err = client
+        .update_workspace(UpdateWorkspaceRequest {
+            workspace: Some(WorkspaceState {
+                tree_id: vec![0x22; cc_common::EMPTY_TREE_ID_BYTES.len()],
+                tree_ids: vec![vec![0x22; cc_common::EMPTY_TREE_ID_BYTES.len()]],
+                ..agent_ws.clone()
+            }),
+            expected_operation_id: None,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(missing_tree_err.code(), tonic::Code::FailedPrecondition);
+
+    // Conflicted 3-term `Merge<TreeId>` (`[EMPTY, EMPTY, EMPTY]` with labels) round-trips
+    // on SQLite and reports `has_changes = true` against the resolved single-tree root commit.
+    let conflicted_ws = WorkspaceState {
+        tree_id: cc_common::EMPTY_TREE_ID_BYTES.to_vec(),
+        tree_ids: vec![
+            cc_common::EMPTY_TREE_ID_BYTES.to_vec(),
+            cc_common::EMPTY_TREE_ID_BYTES.to_vec(),
+            cc_common::EMPTY_TREE_ID_BYTES.to_vec(),
+        ],
+        conflict_labels: vec![
+            "side-1".to_string(),
+            "base".to_string(),
+            "side-2".to_string(),
+        ],
+        ..agent_ws
+    };
+    client
+        .update_workspace(UpdateWorkspaceRequest {
+            workspace: Some(conflicted_ws),
+            expected_operation_id: None,
+        })
+        .await
+        .expect("conflicted 3-term WorkspaceState should persist");
+    let check_resp = client
+        .check_working_copy_changes(CheckWorkingCopyChangesRequest {
+            repo_id: repo_id.clone(),
+            user: "agent@example.com".to_string(),
+            workspace_name: "agent-1".to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(check_resp.has_changes);
+    assert_eq!(check_resp.current_tree_ids.len(), 3);
+    assert_eq!(check_resp.commit_tree_ids.len(), 1);
+
+    // Cursor pagination on ListWorkspaces (`agent-1` + `default` = 2 workspaces).
+    let page1 = client
+        .list_workspaces(ListWorkspacesRequest {
+            repo_id: repo_id.clone(),
+            page_size: 1,
+            page_token: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(page1.workspaces.len(), 1);
+    assert!(!page1.next_page_token.is_empty());
+
+    let page2 = client
+        .list_workspaces(ListWorkspacesRequest {
+            repo_id: repo_id.clone(),
+            page_size: 1,
+            page_token: page1.next_page_token,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(page2.workspaces.len(), 1);
+    assert!(page2.next_page_token.is_empty());
+    assert_ne!(
+        (
+            &page1.workspaces[0].user,
+            &page1.workspaces[0].workspace_name
+        ),
+        (
+            &page2.workspaces[0].user,
+            &page2.workspaces[0].workspace_name
+        )
+    );
+
+    let bad_cursor = client
+        .list_workspaces(ListWorkspacesRequest {
+            repo_id,
+            page_size: 10,
+            page_token: "not-hex!".to_string(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(bad_cursor.code(), tonic::Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn test_working_copy_sparse_after_snapshot_rename_and_unregistered_repo_not_found() {
+    use cc_common::workspace::{
+        CheckWorkingCopyChangesRequest, ListWorkspacesRequest, UpdateWorkspaceRequest,
+        WorkspaceState,
+    };
+
+    let ws = TestWorkspace::init().await;
+    let config_path = ws.repo_path().join(".jj/repo/store/config.toml");
+    let config_str = fs::read_to_string(&config_path).unwrap();
+    let config: toml::Value = toml::from_str(&config_str).unwrap();
+    let repo_id = config.get("repo_id").unwrap().as_str().unwrap().to_string();
+
+    let mut client = WorkspaceServiceClient::connect(ws.server_url().to_string())
+        .await
+        .expect("Failed to connect to WorkspaceService");
+
+    // Unregistered repo_id returns NOT_FOUND on GetWorkspace, ListWorkspaces,
+    // and CheckWorkingCopyChanges.
+    assert_eq!(
+        client
+            .get_workspace(GetWorkspaceRequest {
+                repo_id: "missing-repo".to_string(),
+                user: "test.user@example.com".to_string(),
+                workspace_name: "default".to_string(),
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::NotFound
+    );
+    assert_eq!(
+        client
+            .list_workspaces(ListWorkspacesRequest {
+                repo_id: "missing-repo".to_string(),
+                page_size: 10,
+                page_token: String::new(),
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::NotFound
+    );
+    assert_eq!(
+        client
+            .check_working_copy_changes(CheckWorkingCopyChangesRequest {
+                repo_id: "missing-repo".to_string(),
+                user: "test.user@example.com".to_string(),
+                workspace_name: "default".to_string(),
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::NotFound
+    );
+
+    // Snapshot a file change, then run same-operation `jj status` and `jj sparse set --clear`.
+    // Regression test ensuring `WorkspaceState.commit_id` never reverts to a stale commit ID
+    // and `CheckWorkingCopyChanges` stays clean (`has_changes = false`).
+    fs::write(ws.repo_path().join("notes.txt"), "hello world\n").unwrap();
+    ws.jj_cmd()
+        .args(["describe", "-m", "add notes"])
+        .assert()
+        .success();
+    let commit_hex = String::from_utf8_lossy(
+        &ws.jj_cmd()
+            .args(["log", "-r", "@", "-T", "commit_id", "--no-graph"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    ws.jj_cmd().args(["status"]).assert().success();
+    ws.jj_cmd()
+        .args(["sparse", "set", "--clear"])
+        .assert()
+        .success();
+
+    let after_sparse = client
+        .get_workspace(GetWorkspaceRequest {
+            repo_id: repo_id.clone(),
+            user: "test.user@example.com".to_string(),
+            workspace_name: "default".to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .workspace
+        .expect("workspace should exist");
+    assert_eq!(
+        jj_lib::hex_util::encode_hex(&after_sparse.commit_id),
+        commit_hex,
+        "same-op jj status / sparse set must not revert commit_id"
+    );
+    assert!(after_sparse.sparse_patterns.is_empty());
+    assert!(after_sparse.sparse_patterns_set);
+    let clean_check = client
+        .check_working_copy_changes(CheckWorkingCopyChangesRequest {
+            repo_id: repo_id.clone(),
+            user: "test.user@example.com".to_string(),
+            workspace_name: "default".to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!clean_check.has_changes);
+
+    // `jj workspace rename` publishes the new record and removes the old name.
+    ws.jj_cmd()
+        .args(["workspace", "rename", "renamed-ws"])
+        .assert()
+        .success();
+    let old_ws = client
+        .get_workspace(GetWorkspaceRequest {
+            repo_id: repo_id.clone(),
+            user: "test.user@example.com".to_string(),
+            workspace_name: "default".to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .workspace;
+    assert!(old_ws.is_none(), "old workspace name should be removed");
+    let new_ws = client
+        .get_workspace(GetWorkspaceRequest {
+            repo_id: repo_id.clone(),
+            user: "test.user@example.com".to_string(),
+            workspace_name: "renamed-ws".to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .workspace;
+    assert!(new_ws.is_some(), "renamed workspace should be persisted");
+
+    // Tree count ceiling (`> 1025`) is rejected with INVALID_ARGUMENT.
+    let huge_trees = vec![cc_common::EMPTY_TREE_ID_BYTES.to_vec(); 1027];
+    let err = client
+        .update_workspace(UpdateWorkspaceRequest {
+            workspace: Some(WorkspaceState {
+                repo_id,
+                user: "test.user@example.com".to_string(),
+                workspace_name: "renamed-ws".to_string(),
+                commit_id: cc_common::ROOT_COMMIT_ID_BYTES.to_vec(),
+                operation_id: cc_common::ROOT_OPERATION_ID_BYTES.to_vec(),
+                tree_id: cc_common::EMPTY_TREE_ID_BYTES.to_vec(),
+                sparse_patterns: vec![String::new()],
+                tree_ids: huge_trees,
+                conflict_labels: Vec::new(),
+                sparse_patterns_set: true,
+            }),
+            expected_operation_id: None,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+}
+
+#[tokio::test]
+#[allow(deprecated)]
+async fn test_working_copy_real_conflicted_checkout_and_slash_workspace_name() {
+    use cc_common::workspace::CheckWorkingCopyChangesRequest;
+
+    let ws = TestWorkspace::init_sqlite().await;
+    let config_path = ws.repo_path().join(".jj/repo/store/config.toml");
+    let config_str = fs::read_to_string(&config_path).unwrap();
+    let config: toml::Value = toml::from_str(&config_str).unwrap();
+    let repo_id = config.get("repo_id").unwrap().as_str().unwrap().to_string();
+
+    let conflict_file = ws.repo_path().join("conflict.txt");
+    fs::write(&conflict_file, "base\n").unwrap();
+    ws.jj_cmd()
+        .args(["describe", "-m", "base"])
+        .assert()
+        .success();
+    ws.jj_cmd()
+        .args(["bookmark", "create", "base", "-r", "@"])
+        .assert()
+        .success();
+
+    ws.jj_cmd()
+        .args(["new", "base", "-m", "side-a"])
+        .assert()
+        .success();
+    fs::write(&conflict_file, "from side a\n").unwrap();
+    ws.jj_cmd()
+        .args(["bookmark", "create", "side-a", "-r", "@"])
+        .assert()
+        .success();
+
+    ws.jj_cmd()
+        .args(["new", "base", "-m", "side-b"])
+        .assert()
+        .success();
+    fs::write(&conflict_file, "from side b\n").unwrap();
+    ws.jj_cmd()
+        .args(["bookmark", "create", "side-b", "-r", "@"])
+        .assert()
+        .success();
+
+    ws.jj_cmd()
+        .args(["new", "side-a", "side-b", "-m", "conflicted merge"])
+        .assert()
+        .success();
+
+    let mut client = WorkspaceServiceClient::connect(ws.server_url().to_string())
+        .await
+        .expect("Failed to connect to WorkspaceService");
+
+    let ws_state = client
+        .get_workspace(GetWorkspaceRequest {
+            repo_id: repo_id.clone(),
+            user: "test.user@example.com".to_string(),
+            workspace_name: "default".to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .workspace
+        .expect("conflicted workspace should be persisted");
+    assert_eq!(ws_state.tree_ids.len(), 3);
+    assert_eq!(ws_state.tree_id, ws_state.tree_ids[0]);
+    assert_eq!(ws_state.conflict_labels.len(), 3);
+    assert!(ws_state.conflict_labels[0].contains("side-a"));
+    assert!(ws_state.conflict_labels[1].contains("base"));
+    assert!(ws_state.conflict_labels[2].contains("side-b"));
+
+    let check_resp = client
+        .check_working_copy_changes(CheckWorkingCopyChangesRequest {
+            repo_id: repo_id.clone(),
+            user: "test.user@example.com".to_string(),
+            workspace_name: "default".to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!check_resp.has_changes);
+    assert_eq!(check_resp.current_tree_ids, ws_state.tree_ids);
+    assert_eq!(check_resp.commit_tree_ids, ws_state.tree_ids);
+    assert_eq!(check_resp.current_tree_id, ws_state.tree_id);
+    assert_eq!(check_resp.commit_tree_id, ws_state.tree_id);
+
+    // Renaming to a slash-containing upstream jj workspace name syncs and removes the old name.
+    ws.jj_cmd()
+        .args(["workspace", "rename", "feature/conflict-test"])
+        .assert()
+        .success();
+    let old_ws = client
+        .get_workspace(GetWorkspaceRequest {
+            repo_id: repo_id.clone(),
+            user: "test.user@example.com".to_string(),
+            workspace_name: "default".to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .workspace;
+    assert!(old_ws.is_none());
+    let renamed_ws = client
+        .get_workspace(GetWorkspaceRequest {
+            repo_id,
+            user: "test.user@example.com".to_string(),
+            workspace_name: "feature/conflict-test".to_string(),
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .workspace
+        .expect("slash-named workspace should persist");
+    assert_eq!(renamed_ws.tree_ids, ws_state.tree_ids);
+    assert_eq!(renamed_ws.conflict_labels, ws_state.conflict_labels);
 }

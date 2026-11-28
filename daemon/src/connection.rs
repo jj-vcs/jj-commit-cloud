@@ -114,7 +114,7 @@ impl RemoteConnectionManager {
     pub fn is_connection_error(status: &Status) -> bool {
         matches!(
             status.code(),
-            Code::Unavailable | Code::Unknown | Code::ResourceExhausted | Code::Aborted
+            Code::Unavailable | Code::Unknown | Code::ResourceExhausted
         )
     }
 
@@ -181,5 +181,20 @@ impl RemoteConnectionManager {
                 Err(status)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cas_aborted_is_not_treated_as_connection_error() {
+        assert!(!RemoteConnectionManager::is_connection_error(
+            &Status::aborted("cas")
+        ));
+        assert!(RemoteConnectionManager::is_connection_error(
+            &Status::unavailable("transport down")
+        ));
     }
 }

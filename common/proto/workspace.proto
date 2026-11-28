@@ -16,31 +16,141 @@ syntax = "proto3";
 
 package commit_cloud.workspace;
 
-// Service for managing workspaces and working copy state in Commit Cloud
+// Cloud-tracked workspace and working-copy state service backing
+// `CommitCloudWorkingCopy` and virtual filesystem workspace mounts.
+//
+// Ordering, Idempotency & Isolation Contract:
+// - Clients MUST persist any non-root `Operation` (and its `View`), non-root
+//   `Commit`, and non-empty `Tree` records before calling `UpdateWorkspace`.
+// - When `UpdateWorkspaceRequest.expected_operation_id` is omitted,
+//   `UpdateWorkspace` executes as an idempotent last-writer-wins upsert keyed
+//   by `(repo_id, user, workspace_name)` (suitable when writers serialize
+//   locally via `.jj/working_copy/working_copy.lock`). When
+//   `expected_operation_id` is set, `UpdateWorkspace` executes an atomic
+//   compare-and-swap under serializable isolation (`b""` requires the record to
+//   be absent; a 16-byte `OperationId` requires an existing record with that
+//   normalized `operation_id`), succeeding idempotently when the persisted
+//   record already matches the normalized target state and returning `ABORTED`
+//   on concurrent conflict. Because the precondition compares `operation_id`,
+//   it guards transitions that advance `operation_id`; concurrent updates that
+//   retain the same `operation_id` (such as same-operation sparse-pattern
+//   changes) both satisfy the precondition and follow last-writer-wins.
+// - `CheckWorkingCopyChanges` reads committed workspace and commit records, and
+//   `ListWorkspaces` uses keyset cursor resumption strictly after `(user,
+//   workspace_name)`.
+// - `DeleteWorkspace` is advisory and idempotent, returning `OK` with
+//   `existed = false` when `(repo_id, user, workspace_name)` or `repo_id` is
+//   absent.
+//
+// Status Codes:
+// - `NOT_FOUND`: `repo_id` is unregistered on `GetWorkspace`, `UpdateWorkspace`,
+//   `ListWorkspaces`, or `CheckWorkingCopyChanges`, or `CheckWorkingCopyChanges`
+//   targets an unknown workspace or commit. `GetWorkspace` returns `OK` with
+//   `workspace = None` when `repo_id` is registered but `(user, workspace_name)`
+//   does not exist.
+// - `INVALID_ARGUMENT`: Missing `workspace` payload; empty or invalid `repo_id`
+//   (`1..=128` ASCII `[A-Za-z0-9._-]`, excluding `"."` and `".."`); empty
+//   `workspace_name`, or a non-empty `user` or `workspace_name` that is
+//   whitespace-only, exceeds 256 bytes, or contains control characters
+//   (including `'\0'`; `'/'` is permitted to match upstream `jj` workspace
+//   names such as `feature/foo`, and `user == ""` is valid for single-user or
+//   unauthenticated checkouts and is matched literally as part of the key); invalid digest byte lengths on
+//   `commit_id`, `operation_id`, `expected_operation_id`, `tree_id`, or
+//   `tree_ids`; empty resolved
+//   `commit_id`; requests where both `tree_id` and `tree_ids` are empty, where
+//   both are non-empty and `tree_id != tree_ids[0]`, or where `tree_ids` has an
+//   even length or exceeds 1,025 terms; `conflict_labels` containing `'\n'`,
+//   having a mismatched count, or exceeding 64 KiB of combined UTF-8 bytes;
+//   malformed `RepoPath` internal strings in
+//   `sparse_patterns` (leading or trailing `'/'`, `"//"`, `'\0'`, any
+//   `'/'`-delimited component equal to `"."` or `".."`, more than 4,096
+//   entries, or more than 256 KiB of combined UTF-8 bytes); or malformed
+//   `ListWorkspacesRequest.page_token`.
+// - `FAILED_PRECONDITION`: `UpdateWorkspace` specifies a non-empty, non-root
+//   `operation_id` whose `Operation` or non-root `View` has not been persisted
+//   yet, a non-`ROOT_COMMIT_ID` resolved `commit_id` absent from the
+//   repository's project store, or any non-`EMPTY_TREE_ID` entry in `tree_ids`
+//   absent from the repository's project store.
+// - `ABORTED`: `UpdateWorkspace` specified `expected_operation_id`, and the
+//   persisted workspace record neither matched `expected_operation_id` nor
+//   equaled the normalized target `WorkspaceState`.
 service WorkspaceService {
-  // Read workspace state for a given repository and workspace name
-  rpc GetWorkspace (GetWorkspaceRequest) returns (GetWorkspaceResponse);
+  // Reads persisted workspace checkout metadata for `(repo_id, user,
+  // workspace_name)`. Returns `OK` with `workspace = None` when absent.
+  rpc GetWorkspace(GetWorkspaceRequest) returns (GetWorkspaceResponse);
 
-  // Register or update workspace state (commit, operation, working tree)
-  rpc UpdateWorkspace (UpdateWorkspaceRequest) returns (UpdateWorkspaceResponse);
+  // Upserts workspace checkout metadata (`commit_id`, `operation_id`, `tree_id`
+  // / `tree_ids`, `conflict_labels`, and `sparse_patterns`) after a local or
+  // VFS working-copy transaction finishes.
+  rpc UpdateWorkspace(UpdateWorkspaceRequest) returns (UpdateWorkspaceResponse);
 
-  // List all active workspaces in a repository
-  rpc ListWorkspaces (ListWorkspacesRequest) returns (ListWorkspacesResponse);
+  // Lists registered workspaces in `repo_id` ordered lexicographically by
+  // `(user, workspace_name)`, with cursor pagination via `page_size` (`0` uses
+  // the server default, clamped to a server-configured ceiling and a 2 MiB
+  // serialized page byte budget, always returning at least one record) and
+  // `page_token`.
+  rpc ListWorkspaces(ListWorkspacesRequest) returns (ListWorkspacesResponse);
 
-  // Detect whether a workspace has un-snapshotted changes (tree_id != commit.root_tree_id)
-  rpc CheckWorkingCopyChanges (CheckWorkingCopyChangesRequest) returns (CheckWorkingCopyChangesResponse);
+  // Compares the workspace's recorded `Merge<TreeId>` terms against
+  // `WorkspaceState.commit_id`'s root tree (synthesizing `[EMPTY_TREE_ID]` when
+  // `commit_id == ROOT_COMMIT_ID`, and preserving conflicted checkout sides).
+  // The server only sees recorded snapshots, so edits that no jj command has
+  // snapshotted yet are not detected.
+  rpc CheckWorkingCopyChanges(CheckWorkingCopyChangesRequest)
+      returns (CheckWorkingCopyChangesResponse);
 
-  // Delete a workspace from Commit Cloud
-  rpc DeleteWorkspace (DeleteWorkspaceRequest) returns (DeleteWorkspaceResponse);
+  // Removes a workspace record from `repo_id`.
+  rpc DeleteWorkspace(DeleteWorkspaceRequest) returns (DeleteWorkspaceResponse);
 }
 
 message WorkspaceState {
   string repo_id = 1;
   string user = 2;
   string workspace_name = 3;
+  // The workspace's `@` commit. Missing non-root `Operation` or non-root `View`
+  // dependencies always fail first with `FAILED_PRECONDITION`. When `commit_id`
+  // is non-empty, that explicit client value is authoritative (preserving
+  // multi-user `(user, workspace_name)` checkouts and two-phase VFS snapshots).
+  // When `commit_id` is empty: if `operation_id` is empty or
+  // `ROOT_OPERATION_ID`, `UpdateWorkspace` defaults `commit_id` to
+  // `ROOT_COMMIT_ID`; otherwise `UpdateWorkspace` derives `commit_id` from the
+  // persisted operation's `View.wc_commit_ids[workspace_name]` (returning
+  // `INVALID_ARGUMENT` if that `View` has no entry for `workspace_name`).
   bytes commit_id = 4;
+  // Last reconciled 16-byte `OperationId` (`b""` normalizes to
+  // `ROOT_OPERATION_ID` in persisted and returned records).
   bytes operation_id = 5;
-  bytes tree_id = 6;
+  // Legacy single-tree form retained for backwards compatibility with initial
+  // PoC clients and schemas. New clients should use `tree_ids`; at least one of
+  // `tree_id` or `tree_ids` MUST be populated, and if both are non-empty
+  // `tree_id` MUST equal `tree_ids[0]` (`INVALID_ARGUMENT` otherwise). Servers
+  // normalize `tree_id = tree_ids[0]` when `tree_id` is empty and
+  // `tree_ids = [tree_id]` when `tree_ids` is empty.
+  bytes tree_id = 6 [deprecated = true];
+  // Checked-out `RepoPath` internal strings (`""` denotes the repository root
+  // checking out all files; `[]` with `sparse_patterns_set = true` denotes an
+  // empty `jj sparse set --clear` checkout, while `[]` with
+  // `sparse_patterns_set = false` defaults to `[""]`).
+  repeated string sparse_patterns = 7;
+  // Full `Merge<TreeId>` term list (1 element when resolved, odd >= 3 when
+  // conflicted). Normalized symmetrically with `tree_id` so persisted and
+  // returned records always carry an odd-length list (`>= 1`).
+  repeated bytes tree_ids = 8;
+  // Optional conflict marker labels corresponding to `tree_ids`. Must be empty
+  // or have length equal to `tree_ids.len()` (`INVALID_ARGUMENT` otherwise,
+  // preventing client-side panics in `jj_lib`'s `Merge::from_vec` /
+  // `MergedTree::new`). Labels must not contain `'\n'`. All-empty lists are
+  // canonicalized and stored as `[]`; partially empty lists on conflicted trees
+  // are preserved as-is, and non-empty labels on a resolved 1-tree workspace
+  // return `INVALID_ARGUMENT`.
+  repeated string conflict_labels = 9;
+  // Distinguishes an explicit empty `sparse_patterns` checkout (`jj sparse set
+  // --clear`, `sparse_patterns = []` with `sparse_patterns_set = true`) from an
+  // omitted proto3 field (`sparse_patterns = []` with `sparse_patterns_set =
+  // false`, normalized to `[""]`). Non-empty `sparse_patterns` lists are always
+  // preserved, and persisted/returned records always set `sparse_patterns_set =
+  // true`.
+  bool sparse_patterns_set = 10;
 }
 
 message GetWorkspaceRequest {
@@ -50,33 +160,48 @@ message GetWorkspaceRequest {
 }
 
 message GetWorkspaceResponse {
-  optional WorkspaceState workspace = 1;
+  WorkspaceState workspace = 1;
 }
 
 message UpdateWorkspaceRequest {
   WorkspaceState workspace = 1;
+  // Optional optimistic concurrency precondition for lockless VFS or remote
+  // sandbox writers. Omit (`None`) for unconditional last-writer-wins upsert;
+  // set to `b""` (0 bytes) for create-only (must not exist yet); or set to a
+  // 16-byte `OperationId` (including `ROOT_OPERATION_ID`) to require that the
+  // existing record's normalized `operation_id` matches (`ABORTED` on mismatch,
+  // idempotent `OK` if the persisted record already equals the normalized
+  // `workspace`). Guards transitions that advance `operation_id`; concurrent
+  // updates that keep the same `operation_id` both satisfy the precondition and
+  // follow last-writer-wins.
+  optional bytes expected_operation_id = 2;
 }
 
 message UpdateWorkspaceResponse {
+  // Always `true` when the RPC succeeds (`OK`); failures return gRPC status
+  // codes. Retained for backwards compatibility with initial PoC clients.
   bool success = 1;
-}
-
-message DeleteWorkspaceRequest {
-  string repo_id = 1;
-  string user = 2;
-  string workspace_name = 3;
-}
-
-message DeleteWorkspaceResponse {
-  bool success = 1;
+  // The normalized `WorkspaceState` persisted by the server (including any
+  // server-derived `commit_id`, normalized `operation_id`, `tree_ids`,
+  // canonicalized `conflict_labels`, and `sparse_patterns`), avoiding a
+  // follow-up `GetWorkspace` round-trip.
+  WorkspaceState workspace = 2;
 }
 
 message ListWorkspacesRequest {
   string repo_id = 1;
+  // Maximum number of workspace records to return (`0` uses the server default,
+  // clamped to a server-configured maximum).
+  uint32 page_size = 2;
+  // Opaque cursor from a prior `ListWorkspacesResponse.next_page_token`
+  // resuming strictly after the last `(user, workspace_name)` entry.
+  string page_token = 3;
 }
 
 message ListWorkspacesResponse {
   repeated WorkspaceState workspaces = 1;
+  // Non-empty when additional workspaces remain in `repo_id` after this page.
+  string next_page_token = 2;
 }
 
 message CheckWorkingCopyChangesRequest {
@@ -86,7 +211,28 @@ message CheckWorkingCopyChangesRequest {
 }
 
 message CheckWorkingCopyChangesResponse {
+  // True when `current_tree_ids != commit_tree_ids` across all `Merge<TreeId>`
+  // terms.
   bool has_changes = 1;
-  bytes current_tree_id = 2;
-  bytes commit_tree_id = 3;
+  // Legacy single-tree mirror of `current_tree_ids[0]` for initial PoC readers.
+  bytes current_tree_id = 2 [deprecated = true];
+  // Legacy single-tree mirror of `commit_tree_ids[0]` for initial PoC readers.
+  bytes commit_tree_id = 3 [deprecated = true];
+  // Full `Merge<TreeId>` term list recorded on the workspace.
+  repeated bytes current_tree_ids = 4;
+  // Full `Merge<TreeId>` term list on `WorkspaceState.commit_id` (`[EMPTY_TREE_ID]`
+  // when `commit_id == ROOT_COMMIT_ID`).
+  repeated bytes commit_tree_ids = 5;
+}
+
+message DeleteWorkspaceRequest {
+  string repo_id = 1;
+  string user = 2;
+  string workspace_name = 3;
+}
+
+message DeleteWorkspaceResponse {
+  // `true` when an existing workspace record was deleted; `false` when the
+  // workspace or repository did not exist.
+  bool existed = 1;
 }
