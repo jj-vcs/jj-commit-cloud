@@ -1937,3 +1937,315 @@ async fn test_spanner_delete_repository_atomic_fast_path_unconditional_replaceme
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn test_spanner_sharded_commits_by_inserted_at_orders_and_paginates_across_shards() {
+    use jj_commit_cloud_server::store::spannerstore::{
+        COMMIT_INSERTED_AT_SHARDS, commit_inserted_at_shard,
+    };
+
+    fn make_other_commit(counter_val: &mut u32, label: &str) -> (Vec<u8>, Commit) {
+        let id_num = *counter_val;
+        *counter_val += 1;
+        let mut cid = vec![0u8; cc_common::COMMIT_ID_LENGTH];
+        cid[0] = 0xee;
+        cid[16..20].copy_from_slice(&id_num.to_be_bytes());
+        let mut change_id = vec![0u8; cc_common::CHANGE_ID_LENGTH];
+        change_id[0] = 0xee;
+        change_id[12..16].copy_from_slice(&id_num.to_be_bytes());
+        let commit = Commit {
+            commit_id: cid.clone(),
+            change_id,
+            parent_commit_ids: vec![cc_common::ROOT_COMMIT_ID_BYTES.to_vec()],
+            root_tree_id: vec![cc_common::EMPTY_TREE_ID_BYTES.to_vec()],
+            description: format!("other project commit {label}\n"),
+            ..Default::default()
+        };
+        (cid, commit)
+    }
+
+    let Some(emulator) = testutils::SpannerEmulatorGuard::start_or_skip(
+        "test_spanner_sharded_commits_by_inserted_at_orders_and_paginates_across_shards",
+        false,
+    )
+    .await
+    else {
+        return;
+    };
+
+    let cfg = SpannerConnectConfig {
+        database: emulator.database_uri(&unique_db_id("cc_shard_idx")),
+        endpoint: Some(emulator.grpc_endpoint()),
+        admin_endpoint: Some(emulator.rest_endpoint().to_string()),
+        auto_migrate: true,
+        emulator: true,
+        ..Default::default()
+    };
+    let meta = Arc::new(SpannerMetadataStore::connect(&cfg).await.unwrap());
+    let store = CompositeStore::new(meta.clone(), Arc::new(MemoryBlobStore::new()));
+
+    store
+        .register_project("sharded-proj", Some("Sharded Index Proj"))
+        .await
+        .unwrap();
+    store
+        .register_repo_in_project("sharded-repo", Some("sharded-proj"), None)
+        .await
+        .unwrap();
+    store
+        .register_project("other-proj", Some("Other Sharded Proj"))
+        .await
+        .unwrap();
+    store
+        .register_repo_in_project("other-repo", Some("other-proj"), None)
+        .await
+        .unwrap();
+
+    let other_empty_watermark = meta.current_commit_watermark("other-proj").await.unwrap();
+    let mut other_ids: Vec<Vec<u8>> = Vec::new();
+    let mut other_counter = 10_000u32;
+    let (other_initial_cid, other_initial_commit) =
+        make_other_commit(&mut other_counter, "initial");
+    store
+        .put_commit("other-repo", &other_initial_cid, &other_initial_commit)
+        .await
+        .unwrap();
+    other_ids.push(other_initial_cid);
+
+    // Empty project returns epoch watermark and empty results for both limit == 0 and limit > 0,
+    // even when another project already has commits in CommitsByInsertedAt.
+    let empty_watermark = meta.current_commit_watermark("sharded-proj").await.unwrap();
+    assert_eq!(empty_watermark, other_empty_watermark);
+    assert_eq!(
+        meta.list_commit_ids_since("sharded-proj", &empty_watermark, 0)
+            .await
+            .unwrap(),
+        (Vec::new(), empty_watermark.clone(), false)
+    );
+    assert_eq!(
+        meta.list_commit_ids_since("sharded-proj", &empty_watermark, 10)
+            .await
+            .unwrap(),
+        (Vec::new(), empty_watermark.clone(), false)
+    );
+
+    // Pick 20 commit IDs guaranteed to cover every shard in 0..COMMIT_INSERTED_AT_SHARDS
+    // (1 commit per shard, plus 4 extra commits across distinct shards).
+    let mut selected_ids: Vec<Vec<u8>> = Vec::with_capacity(20);
+    let mut covered_shards: HashSet<i64> = HashSet::new();
+    let mut counter = 1u32;
+    while covered_shards.len() < COMMIT_INSERTED_AT_SHARDS as usize {
+        let mut cid = vec![0u8; cc_common::COMMIT_ID_LENGTH];
+        cid[16..20].copy_from_slice(&counter.to_be_bytes());
+        counter += 1;
+        let shard = commit_inserted_at_shard(&cid);
+        if covered_shards.insert(shard) {
+            selected_ids.push(cid);
+        }
+    }
+    let mut extra_shards: HashSet<i64> = HashSet::new();
+    while extra_shards.len() < 4 {
+        let mut cid = vec![0u8; cc_common::COMMIT_ID_LENGTH];
+        cid[16..20].copy_from_slice(&counter.to_be_bytes());
+        counter += 1;
+        let shard = commit_inserted_at_shard(&cid);
+        if extra_shards.insert(shard) {
+            selected_ids.push(cid);
+        }
+    }
+    assert_eq!(covered_shards.len(), COMMIT_INSERTED_AT_SHARDS as usize);
+    assert_eq!(extra_shards.len(), 4);
+    assert_eq!(selected_ids.len(), COMMIT_INSERTED_AT_SHARDS as usize + 4);
+
+    for (idx, cid) in selected_ids.iter().enumerate() {
+        let mut change_id = vec![0u8; cc_common::CHANGE_ID_LENGTH];
+        change_id[12..16].copy_from_slice(&(idx as u32 + 1).to_be_bytes());
+        let commit = Commit {
+            commit_id: cid.clone(),
+            change_id,
+            parent_commit_ids: vec![cc_common::ROOT_COMMIT_ID_BYTES.to_vec()],
+            root_tree_id: vec![cc_common::EMPTY_TREE_ID_BYTES.to_vec()],
+            description: format!("sharded commit {idx}\n"),
+            ..Default::default()
+        };
+        store
+            .put_commit("sharded-repo", cid, &commit)
+            .await
+            .unwrap();
+    }
+
+    // Seed newer commits in another project landing on overlapping shards to verify cross-project
+    // isolation in current_commit_watermark and list_commit_ids_since.
+    let mut other_overlap_shards: HashSet<i64> = HashSet::new();
+    while other_overlap_shards.len() < extra_shards.len() {
+        let (cid, commit) = make_other_commit(&mut other_counter, "overlap");
+        let shard = commit_inserted_at_shard(&cid);
+        if extra_shards.contains(&shard) && other_overlap_shards.insert(shard) {
+            store.put_commit("other-repo", &cid, &commit).await.unwrap();
+            other_ids.push(cid);
+        }
+    }
+
+    // limit == 0 on a non-empty delta still short-circuits with the original token and has_more == false.
+    assert_eq!(
+        meta.list_commit_ids_since("sharded-proj", &empty_watermark, 0)
+            .await
+            .unwrap(),
+        (Vec::new(), empty_watermark.clone(), false)
+    );
+
+    // Single unbounded scan across all 16 shards returns all 20 commits in (InsertedAt, CommitId) order.
+    let (full_order, full_watermark, full_has_more) = meta
+        .list_commit_ids_since("sharded-proj", &empty_watermark, 100)
+        .await
+        .unwrap();
+    assert!(!full_has_more);
+    assert_eq!(full_order.len(), 20);
+    let expected_set: HashSet<Vec<u8>> = selected_ids.iter().cloned().collect();
+    let observed_set: HashSet<Vec<u8>> = full_order.iter().cloned().collect();
+    assert_eq!(observed_set, expected_set);
+
+    let current_wm = meta.current_commit_watermark("sharded-proj").await.unwrap();
+    assert_eq!(full_watermark, current_wm);
+
+    // Paginating with non-dividing page size (3) reproduces exact global order and final watermark.
+    let mut paginated = Vec::with_capacity(20);
+    let mut cursor = empty_watermark.clone();
+    let mut page_count = 0usize;
+    loop {
+        let (page, next_cursor, has_more) = meta
+            .list_commit_ids_since("sharded-proj", &cursor, 3)
+            .await
+            .unwrap();
+        page_count += 1;
+        if page_count <= 6 {
+            assert_eq!(page.len(), 3);
+            assert!(has_more);
+        } else {
+            assert_eq!(page.len(), 2);
+            assert!(!has_more);
+        }
+        paginated.extend(page);
+        cursor = next_cursor;
+        if !has_more {
+            break;
+        }
+    }
+    assert_eq!(page_count, 7);
+    assert_eq!(paginated, full_order);
+    assert_eq!(cursor, current_wm);
+
+    // Paginating with exact-boundary page size (5) reports has_more == false on page 4.
+    let mut boundary_paginated = Vec::with_capacity(20);
+    let mut boundary_cursor = empty_watermark;
+    for page_idx in 0..4 {
+        let (page, next_cursor, has_more) = meta
+            .list_commit_ids_since("sharded-proj", &boundary_cursor, 5)
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 5);
+        assert_eq!(has_more, page_idx < 3);
+        boundary_paginated.extend(page);
+        boundary_cursor = next_cursor;
+    }
+    assert_eq!(boundary_paginated, full_order);
+    assert_eq!(boundary_cursor, current_wm);
+
+    // Incremental sync after current_wm returns empty, then streams newly inserted commits across shards.
+    let (empty_delta, same_tok, empty_more) = meta
+        .list_commit_ids_since("sharded-proj", &current_wm, 10)
+        .await
+        .unwrap();
+    assert!(empty_delta.is_empty());
+    assert_eq!(same_tok, current_wm);
+    assert!(!empty_more);
+
+    let mut delta_ids = Vec::with_capacity(3);
+    let mut delta_shards = HashSet::new();
+    while delta_ids.len() < 3 {
+        let mut cid = vec![0u8; cc_common::COMMIT_ID_LENGTH];
+        cid[16..20].copy_from_slice(&counter.to_be_bytes());
+        counter += 1;
+        let shard = commit_inserted_at_shard(&cid);
+        if delta_shards.insert(shard) {
+            let mut change_id = vec![0u8; cc_common::CHANGE_ID_LENGTH];
+            change_id[12..16].copy_from_slice(&counter.to_be_bytes());
+            store
+                .put_commit(
+                    "sharded-repo",
+                    &cid,
+                    &Commit {
+                        commit_id: cid.clone(),
+                        change_id,
+                        parent_commit_ids: vec![cc_common::ROOT_COMMIT_ID_BYTES.to_vec()],
+                        root_tree_id: vec![cc_common::EMPTY_TREE_ID_BYTES.to_vec()],
+                        description: format!("delta commit {}\n", delta_ids.len()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            delta_ids.push(cid);
+        }
+    }
+
+    // Seed another newer commit in other-proj on an overlapping delta shard to verify incremental
+    // sync and watermark queries ignore sibling projects.
+    loop {
+        let (cid, commit) = make_other_commit(&mut other_counter, "delta-overlap");
+        if delta_shards.contains(&commit_inserted_at_shard(&cid)) {
+            store.put_commit("other-repo", &cid, &commit).await.unwrap();
+            other_ids.push(cid);
+            break;
+        }
+    }
+
+    let (delta_page1, delta_next1, delta_sync1) = store
+        .list_commits_with_sync("sharded-repo", &[], 2, &current_wm)
+        .await
+        .unwrap();
+    assert_eq!(delta_page1.len(), 2);
+    assert!(!delta_next1.is_empty());
+    assert_eq!(delta_next1, delta_sync1);
+
+    let (delta_page2, delta_next2, delta_sync2) = store
+        .list_commits_with_sync("sharded-repo", &delta_next1, 2, &current_wm)
+        .await
+        .unwrap();
+    assert_eq!(delta_page2.len(), 1);
+    assert!(delta_next2.is_empty());
+
+    let mut combined_delta = delta_page1;
+    combined_delta.extend(delta_page2);
+    let (single_shot_delta, single_shot_wm, single_shot_more) = meta
+        .list_commit_ids_since("sharded-proj", &current_wm, 10)
+        .await
+        .unwrap();
+    assert!(!single_shot_more);
+    assert_eq!(combined_delta, single_shot_delta);
+    assert_eq!(
+        combined_delta.iter().cloned().collect::<HashSet<_>>(),
+        delta_ids.into_iter().collect::<HashSet<_>>()
+    );
+    assert_eq!(delta_sync2, single_shot_wm);
+    assert_eq!(
+        meta.current_commit_watermark("sharded-proj").await.unwrap(),
+        single_shot_wm
+    );
+
+    let (other_order, other_wm, other_has_more) = meta
+        .list_commit_ids_since("other-proj", &other_empty_watermark, 100)
+        .await
+        .unwrap();
+    assert!(!other_has_more);
+    assert_eq!(other_order.len(), other_ids.len());
+    assert_eq!(
+        other_order.into_iter().collect::<HashSet<_>>(),
+        other_ids.into_iter().collect::<HashSet<_>>()
+    );
+    assert_eq!(
+        meta.current_commit_watermark("other-proj").await.unwrap(),
+        other_wm
+    );
+    assert_ne!(other_wm, single_shot_wm);
+}

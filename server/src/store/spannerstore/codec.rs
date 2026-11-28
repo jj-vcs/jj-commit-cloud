@@ -28,8 +28,10 @@ use google_cloud_spanner::key::KeySet;
 use google_cloud_spanner::mutation::Mutation;
 use google_cloud_spanner::result::{ResultSet, Row};
 use google_cloud_spanner::statement::{Statement, StatementBuilder};
+use google_cloud_spanner::types as spanner_types;
 use prost::Message;
 
+use super::schema::commit_inserted_at_shards;
 use crate::store::{BlobRecord, StoreError, StoreResult};
 
 pub(super) const EPOCH_RFC3339_NANOS: &str = "1970-01-01T00:00:00.000000000Z";
@@ -267,6 +269,7 @@ pub(super) fn build_commit_mutation(
     commit_id: &[u8],
     commit: &Commit,
     generation: i64,
+    inserted_at_shard: i64,
 ) -> Mutation {
     let proto_bytes = commit.encode_to_vec();
     Mutation::new_insert_builder("Commits")
@@ -280,20 +283,41 @@ pub(super) fn build_commit_mutation(
         .to(generation)
         .set("ProtoBytes")
         .to(&proto_bytes)
+        .set("InsertedAtShard")
+        .to(inserted_at_shard)
         .set("InsertedAt")
         .to("spanner.commit_timestamp()")
         .build()
 }
 
 pub(super) fn build_current_commit_watermark_stmt(project_id: &str) -> StatementBuilder {
+    // Fan out 1-row reverse index-only seeks across all 16 shards so watermark capture
+    // stays O(COMMIT_INSERTED_AT_SHARDS) instead of scanning all commits in the project.
     Statement::builder(
-        "SELECT FORMAT_TIMESTAMP('%Y-%m-%dT%H:%M:%E9SZ', InsertedAt) AS TsRfc3339, CommitId
-         FROM Commits@{FORCE_INDEX=CommitsByInsertedAt}
-         WHERE ProjectId = @project_id AND InsertedAt IS NOT NULL
-         ORDER BY InsertedAt DESC, CommitId DESC
+        "SELECT
+           FORMAT_TIMESTAMP('%Y-%m-%dT%H:%M:%E9SZ', latest.InsertedAt) AS TsRfc3339,
+           latest.CommitId
+         FROM UNNEST(@shards) AS shard
+         CROSS JOIN UNNEST(
+           ARRAY(
+             SELECT AS STRUCT c.InsertedAt, c.CommitId
+             FROM Commits@{FORCE_INDEX=CommitsByInsertedAt} AS c
+             WHERE c.ProjectId = @project_id
+               AND c.InsertedAtShard = shard
+               AND c.InsertedAt IS NOT NULL
+             ORDER BY c.InsertedAt DESC, c.CommitId DESC
+             LIMIT 1
+           )
+         ) AS latest
+         ORDER BY latest.InsertedAt DESC, latest.CommitId DESC
          LIMIT 1",
     )
     .add_param("project_id", project_id)
+    .add_typed_param(
+        "shards",
+        commit_inserted_at_shards(),
+        spanner_types::array(spanner_types::int64()),
+    )
 }
 
 pub(super) fn build_list_commit_ids_since_stmt(
@@ -302,22 +326,41 @@ pub(super) fn build_list_commit_ids_since_stmt(
     after_id: &[u8],
     fetch_limit: i64,
 ) -> StatementBuilder {
+    // Bound each shard's index-only scan to `@limit` rows before merging globally on
+    // `(InsertedAt ASC, CommitId ASC)` so large catch-up deltas never scan unbounded shards.
     Statement::builder(
-        "SELECT FORMAT_TIMESTAMP('%Y-%m-%dT%H:%M:%E9SZ', InsertedAt) AS TsRfc3339, CommitId
-         FROM Commits@{FORCE_INDEX=CommitsByInsertedAt}
-         WHERE ProjectId = @project_id
-           AND InsertedAt IS NOT NULL
-           AND (
-             InsertedAt > PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E9SZ', @ts_rfc3339)
-             OR (
-               InsertedAt = PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E9SZ', @ts_rfc3339)
-               AND CommitId > @after_id
-             )
+        "SELECT
+           FORMAT_TIMESTAMP('%Y-%m-%dT%H:%M:%E9SZ', row_entry.InsertedAt) AS TsRfc3339,
+           row_entry.CommitId
+         FROM UNNEST(@shards) AS shard
+         CROSS JOIN UNNEST(
+           ARRAY(
+             SELECT AS STRUCT c.InsertedAt, c.CommitId
+             FROM Commits@{FORCE_INDEX=CommitsByInsertedAt} AS c
+             WHERE c.ProjectId = @project_id
+               AND c.InsertedAtShard = shard
+               AND c.InsertedAt IS NOT NULL
+               AND c.InsertedAt >= PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E9SZ', @ts_rfc3339)
+               AND (
+                 c.InsertedAt > PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E9SZ', @ts_rfc3339)
+                 OR (
+                   c.InsertedAt = PARSE_TIMESTAMP('%Y-%m-%dT%H:%M:%E9SZ', @ts_rfc3339)
+                   AND c.CommitId > @after_id
+                 )
+               )
+             ORDER BY c.InsertedAt ASC, c.CommitId ASC
+             LIMIT @limit
            )
-         ORDER BY InsertedAt ASC, CommitId ASC
+         ) AS row_entry
+         ORDER BY row_entry.InsertedAt ASC, row_entry.CommitId ASC
          LIMIT @limit",
     )
     .add_param("project_id", project_id)
+    .add_typed_param(
+        "shards",
+        commit_inserted_at_shards(),
+        spanner_types::array(spanner_types::int64()),
+    )
     .add_param("ts_rfc3339", ts_rfc3339)
     .add_param("after_id", after_id)
     .add_param("limit", fetch_limit)

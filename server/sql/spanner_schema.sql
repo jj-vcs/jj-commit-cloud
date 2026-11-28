@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS Commits(
   ChangeId BYTES(64) NOT NULL,
   Generation INT64 NOT NULL,
   ProtoBytes BYTES(MAX) NOT NULL,
+  InsertedAtShard INT64 NOT NULL,
   InsertedAt TIMESTAMP OPTIONS (allow_commit_timestamp = TRUE))
   PRIMARY KEY(ProjectId, CommitId);
 
@@ -43,7 +44,7 @@ ON
 
 CREATE INDEX IF NOT EXISTS CommitsByInsertedAt
 ON
-  Commits(ProjectId, InsertedAt);
+  Commits(ProjectId, InsertedAtShard, InsertedAt, CommitId);
 
 CREATE TABLE IF NOT EXISTS Trees(
   ProjectId STRING(128) NOT NULL,

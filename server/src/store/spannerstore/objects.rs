@@ -38,6 +38,7 @@ use super::codec::{
     decode_spanner_watermark, drain_first_row, encode_spanner_watermark, is_already_exists,
     map_spanner_err,
 };
+use super::schema::commit_inserted_at_shard;
 use super::{SpannerMetadataStore, TxAction, UNNEST_BATCH_SIZE};
 use crate::store::{BlobRecord, CommitId, StoreError, StoreResult};
 
@@ -164,7 +165,13 @@ impl SpannerMetadataStore {
         let gen_i64 = i64::try_from(generation).map_err(|_| {
             StoreError::InvalidArgument(format!("commit generation {generation} exceeds i64::MAX"))
         })?;
-        let mutation = build_commit_mutation(project_id, commit_id, commit, gen_i64);
+        let mutation = build_commit_mutation(
+            project_id,
+            commit_id,
+            commit,
+            gen_i64,
+            commit_inserted_at_shard(commit_id),
+        );
 
         match self
             .db_client
@@ -241,6 +248,9 @@ impl SpannerMetadataStore {
         limit: usize,
     ) -> StoreResult<(Vec<CommitId>, Vec<u8>, bool)> {
         let (ts_rfc3339, after_id) = decode_spanner_watermark(since_token)?;
+        if limit == 0 {
+            return Ok((Vec::new(), since_token.to_vec(), false));
+        }
         let fetch_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
         let stmt =
             build_list_commit_ids_since_stmt(project_id, &ts_rfc3339, &after_id, fetch_limit)

@@ -18,7 +18,8 @@
 //! `SpannerMetadataStore` shares one `Spanner` client and multiplexed `DatabaseClient`.
 //! Content-addressed writes (`Commits`, `Trees` + `TreeEntries`, `Symlinks`, `Views`,
 //! `Operations`, `Blobs` + `ProjectBlobs`) commit atomically after external `BlobStore`
-//! uploads and batched dependency checks. `Commits` rows use insert-only mutations.
+//! uploads and batched dependency checks. `Commits` rows use insert-only mutations with
+//! a 16-way `InsertedAtShard` prefix ahead of `InsertedAt` per project to avoid hotspots.
 //!
 //! # Concurrency and Merge Invariants
 //! Point reads, `UNNEST` dependency checks, and prefix scans use lock-free `single_use()`
@@ -44,6 +45,7 @@ mod workspaces;
 mod tests;
 
 pub use repo::{MAX_DELETE_BATCH_ITERATIONS, SPANNER_DELETE_BATCH_LIMIT};
+pub use schema::{COMMIT_INSERTED_AT_SHARDS, commit_inserted_at_shard};
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;

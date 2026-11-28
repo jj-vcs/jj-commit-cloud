@@ -152,7 +152,7 @@ flowchart TD
 ```
 
 * **Staged Wide-Directory Writes (`Trees.Ready`):** Cloud Spanner caps a single transaction at 80,000 cell mutations. Directories up to 4,000 entries write `Trees` (`Ready = TRUE`) and all `TreeEntries` in one atomic batch; larger directories stage `Ready = FALSE`, stream 4,000-entry batches, and flip `Ready = TRUE` on the final batch so readers never see partial directories.
-* **Prefix Scans, Secondary Indexes, and Publish Tracking:** Short commit and operation hex prefixes convert to binary primary-key bounds $[a, b]$ ($a \le \mathit{Id} \le b$), while `CommitsByChangeId` resolves `z-k` change-ID prefixes and `CommitsByInsertedAt` drives incremental `ListCommits` cursors. `Operations` tracks a `Published` flag so retried `PublishOperation` RPCs stay idempotent without resurrecting superseded heads.
+* **Prefix Scans, Secondary Indexes, and Publish Tracking:** Short commit and operation hex prefixes convert to binary primary-key bounds $[a, b]$ ($a \le \mathit{Id} \le b$), and `CommitsByChangeId` resolves `z-k` change-ID prefixes. The 16-way hash-sharded `CommitsByInsertedAt(ProjectId, InsertedAtShard, InsertedAt, CommitId)` index spreads commit timestamps across Cloud Spanner splits while serving index-only `ListCommits` cursors and watermarks. `Operations` tracks a `Published` flag so retried `PublishOperation` RPCs stay idempotent without resurrecting superseded heads.
 
 ### PostgreSQL, SQLite, and In-Memory Metadata Stores
 

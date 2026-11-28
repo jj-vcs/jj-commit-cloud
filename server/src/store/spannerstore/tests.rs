@@ -22,6 +22,7 @@ use google_cloud_gax::error::rpc::{Code as RpcCode, Status as RpcStatus};
 use google_cloud_spanner::key;
 use google_cloud_spanner::key::KeySet;
 use google_cloud_spanner::mutation::Mutation;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -106,6 +107,20 @@ fn parse_ddl_statements_strips_comments_and_parses_schema() {
 
     let schema_stmts = parse_ddl_statements(SPANNER_SCHEMA);
     assert!(!schema_stmts.is_empty());
+    assert!(
+        schema_stmts
+            .iter()
+            .any(|s| s.contains("CREATE TABLE IF NOT EXISTS Commits")
+                && s.contains("InsertedAtShard INT64 NOT NULL")),
+        "Commits table must declare InsertedAtShard INT64 NOT NULL"
+    );
+    assert!(
+        schema_stmts.iter().any(
+            |s| s.contains("CREATE INDEX IF NOT EXISTS CommitsByInsertedAt")
+                && s.contains("Commits(ProjectId, InsertedAtShard, InsertedAt, CommitId)")
+        ),
+        "CommitsByInsertedAt must place InsertedAtShard ahead of InsertedAt and list CommitId"
+    );
     assert!(
         schema_stmts
             .iter()
@@ -491,92 +506,349 @@ fn spanner_watermark_encode_decode_roundtrip_and_rejects_malformed() {
 }
 
 #[test]
+fn commit_inserted_at_shard_is_deterministic_in_range_and_balanced() {
+    assert_eq!(COMMIT_INSERTED_AT_SHARDS, 16);
+    assert_eq!(
+        commit_inserted_at_shards(),
+        (0..COMMIT_INSERTED_AT_SHARDS).collect::<Vec<i64>>()
+    );
+
+    let empty_shard = commit_inserted_at_shard(&[]);
+    assert!((0..COMMIT_INSERTED_AT_SHARDS).contains(&empty_shard));
+    assert_eq!(empty_shard, commit_inserted_at_shard(&[]));
+
+    let sample = [0xab; cc_common::COMMIT_ID_LENGTH];
+    let sample_shard = commit_inserted_at_shard(&sample);
+    assert!((0..COMMIT_INSERTED_AT_SHARDS).contains(&sample_shard));
+    assert_eq!(sample_shard, commit_inserted_at_shard(&sample));
+
+    // 1,600 synthetic IDs sharing the first 16 bytes (varying only in trailing 4 bytes)
+    // must hit every shard evenly.
+    let mut counts = [0usize; COMMIT_INSERTED_AT_SHARDS as usize];
+    for idx in 0u32..1_600 {
+        let mut id = [0u8; cc_common::COMMIT_ID_LENGTH];
+        id[16..20].copy_from_slice(&idx.to_be_bytes());
+        let shard = commit_inserted_at_shard(&id);
+        assert!((0..COMMIT_INSERTED_AT_SHARDS).contains(&shard));
+        counts[shard as usize] += 1;
+    }
+    for (shard, &count) in counts.iter().enumerate() {
+        assert!(
+            (50..=160).contains(&count),
+            "shard {shard} received imbalanced count {count} out of 1,600: {counts:?}"
+        );
+    }
+
+    // Upper-nibble-only variations also spread across multiple shards.
+    let upper_shards: HashSet<i64> = (0u8..16)
+        .map(|n| commit_inserted_at_shard(&[n << 4; cc_common::COMMIT_ID_LENGTH]))
+        .collect();
+    assert!(
+        upper_shards.len() >= 6,
+        "expected upper-nibble variations to span multiple shards, got {upper_shards:?}"
+    );
+}
+
+#[test]
 fn validate_existing_spanner_ddl_accepts_current_and_rejects_pre_split_poc() {
     // Empty database and current schema pass.
     validate_existing_spanner_ddl(&[]).unwrap();
     let current_stmts = parse_ddl_statements(SPANNER_SCHEMA);
     validate_existing_spanner_ddl(&current_stmts).unwrap();
 
-    // Spanner-normalized DDL (without IF NOT EXISTS and with backticks) also passes.
+    // Spanner-normalized DDL (without IF NOT EXISTS, with backticks and ASC) also passes.
     let normalized = [
         "CREATE TABLE `Projects` (ProjectId STRING(128) NOT NULL, Name STRING(256)) PRIMARY KEY(ProjectId)".to_string(),
-        "CREATE TABLE Commits (ProjectId STRING(128) NOT NULL, CommitId BYTES(64) NOT NULL, ChangeId BYTES(64) NOT NULL, Generation INT64 NOT NULL, ProtoBytes BYTES(MAX) NOT NULL, InsertedAt TIMESTAMP OPTIONS (allow_commit_timestamp=true)) PRIMARY KEY(ProjectId, CommitId)".to_string(),
+        "CREATE TABLE Commits (ProjectId STRING(128) NOT NULL, CommitId BYTES(64) NOT NULL, ChangeId BYTES(64) NOT NULL, Generation INT64 NOT NULL, ProtoBytes BYTES(MAX) NOT NULL, InsertedAtShard INT64 NOT NULL, InsertedAt TIMESTAMP OPTIONS (allow_commit_timestamp=true)) PRIMARY KEY(ProjectId, CommitId)".to_string(),
+        "CREATE INDEX `CommitsByInsertedAt` ON `Commits`(`ProjectId` ASC, `InsertedAtShard` ASC, `InsertedAt` ASC, `CommitId` ASC)".to_string(),
         "CREATE TABLE Trees (ProjectId STRING(128) NOT NULL, TreeId BYTES(64) NOT NULL, Ready BOOL NOT NULL) PRIMARY KEY(ProjectId, TreeId)".to_string(),
         "CREATE TABLE `Workspaces` (`RepoId` STRING(128) NOT NULL, `WorkspaceName` STRING(256) NOT NULL, `User` STRING(256) NOT NULL, CommitId BYTES(64) NOT NULL, OperationId BYTES(64) NOT NULL, TreeId BYTES(64) NOT NULL, TreeIds ARRAY<BYTES(64)> NOT NULL, ConflictLabels ARRAY<STRING(MAX)> NOT NULL, SparsePatterns ARRAY<STRING(MAX)> NOT NULL) PRIMARY KEY(`RepoId`, `WorkspaceName`), INTERLEAVE IN PARENT `Repositories` ON DELETE CASCADE".to_string(),
     ];
     validate_existing_spanner_ddl(&normalized).unwrap();
 
-    // Pre-split PoC markers and pre-migration Workspaces schemas must fail fast with InvalidArgument.
-    let legacy_cases = [
+    // Valid InsertedAtShard variations with DEFAULT, OPTIONS, multiline formatting, and STORING pass.
+    let valid_variants = [
+        [
+            "CREATE TABLE Commits (ProjectId STRING(128) NOT NULL, CommitId BYTES(64) NOT NULL, ChangeId BYTES(64) NOT NULL, Generation INT64 NOT NULL, ProtoBytes BYTES(MAX) NOT NULL, InsertedAtShard INT64 NOT NULL DEFAULT (CAST(0 AS INT64)), InsertedAt TIMESTAMP OPTIONS (allow_commit_timestamp=true)) PRIMARY KEY(ProjectId, CommitId)".to_string(),
+            "CREATE INDEX CommitsByInsertedAt ON Commits(ProjectId, InsertedAtShard, InsertedAt, CommitId) STORING (ChangeId)".to_string(),
+        ],
+        [
+            "CREATE TABLE `Commits` (\n  `ProjectId` STRING(128) NOT NULL,\n  `CommitId` BYTES(64) NOT NULL,\n  `ChangeId` BYTES(64) NOT NULL,\n  `Generation` INT64 NOT NULL,\n  `ProtoBytes` BYTES(MAX) NOT NULL,\n  `InsertedAtShard` INT64\n    NOT NULL OPTIONS (description = 'AS (0) STORED'),\n  `InsertedAt` TIMESTAMP OPTIONS (\n    allow_commit_timestamp=true\n  ),\n) PRIMARY KEY(`ProjectId`, `CommitId`)".to_string(),
+            "CREATE INDEX `CommitsByInsertedAt` ON `Commits`(`ProjectId` ASC, `InsertedAtShard`, `InsertedAt` ASC, `CommitId`) STORING (`Where`), INTERLEAVE IN `Projects`".to_string(),
+        ],
+    ];
+    for variant in &valid_variants {
+        validate_existing_spanner_ddl(variant).unwrap();
+    }
+
+    // Index DDL parser handles modifiers, backticks, table name, sort directions, and WHERE clauses.
+    assert_eq!(
+        parse_create_index_ddl(
+            "CREATE UNIQUE NULL_FILTERED INDEX IF NOT EXISTS `ProjectsByName` ON `Projects`(`Name` DESC)"
+        ),
+        Some(ParsedCreateIndex {
+            index_name: "projectsbyname".to_string(),
+            table_name: "projects".to_string(),
+            is_null_filtered: true,
+            has_where_clause: false,
+            key_cols: vec![("name".to_string(), true)],
+        })
+    );
+    assert_eq!(
+        parse_create_index_ddl(
+            "CREATE INDEX CommitsByInsertedAt ON Commits(ProjectId, InsertedAtShard, InsertedAt DESC, CommitId ASC) STORING (`Where`) WHERE InsertedAt IS NOT NULL"
+        ),
+        Some(ParsedCreateIndex {
+            index_name: "commitsbyinsertedat".to_string(),
+            table_name: "commits".to_string(),
+            is_null_filtered: false,
+            has_where_clause: true,
+            key_cols: vec![
+                ("projectid".to_string(), false),
+                ("insertedatshard".to_string(), false),
+                ("insertedat".to_string(), true),
+                ("commitid".to_string(), false),
+            ],
+        })
+    );
+    assert_eq!(
+        parse_create_index_ddl(
+            "CREATE INDEX `CommitsByInsertedAt` ON `Commits`(`ProjectId`, `InsertedAtShard`, `InsertedAt`, `CommitId`) STORING (`Where`), INTERLEAVE IN `Projects`"
+        ),
+        Some(ParsedCreateIndex {
+            index_name: "commitsbyinsertedat".to_string(),
+            table_name: "commits".to_string(),
+            is_null_filtered: false,
+            has_where_clause: false,
+            key_cols: vec![
+                ("projectid".to_string(), false),
+                ("insertedatshard".to_string(), false),
+                ("insertedat".to_string(), false),
+                ("commitid".to_string(), false),
+            ],
+        })
+    );
+
+    // Pre-split PoC, pre-migration Workspaces, and unsharded CommitsByInsertedAt schemas must fail fast.
+    let valid_sharded_commits = "CREATE TABLE Commits (ProjectId STRING(128) NOT NULL, CommitId BYTES(64) NOT NULL, ChangeId BYTES(64) NOT NULL, Generation INT64 NOT NULL, ProtoBytes BYTES(MAX) NOT NULL, InsertedAtShard INT64 NOT NULL, InsertedAt TIMESTAMP OPTIONS (allow_commit_timestamp=true)) PRIMARY KEY(ProjectId, CommitId)".to_string();
+    let legacy_cases: Vec<(&str, Vec<String>)> = vec![
         (
             "legacy repos table",
-            [
+            vec![
                 "CREATE TABLE repos (repo_id STRING(MAX) NOT NULL, project_id STRING(MAX) NOT NULL) PRIMARY KEY(repo_id)".to_string(),
             ],
         ),
         (
             "legacy commits without ProtoBytes/Generation",
-            [
+            vec![
                 "CREATE TABLE commits (project_id STRING(MAX) NOT NULL, commit_id BYTES(MAX) NOT NULL, data BYTES(MAX) NOT NULL) PRIMARY KEY(project_id, commit_id)".to_string(),
             ],
         ),
         (
+            "unsharded commits without InsertedAtShard",
+            vec![
+                "CREATE TABLE Commits (ProjectId STRING(128) NOT NULL, CommitId BYTES(64) NOT NULL, ChangeId BYTES(64) NOT NULL, Generation INT64 NOT NULL, ProtoBytes BYTES(MAX) NOT NULL, InsertedAt TIMESTAMP OPTIONS (allow_commit_timestamp=true)) PRIMARY KEY(ProjectId, CommitId)".to_string(),
+            ],
+        ),
+        (
+            "partially migrated commits with nullable InsertedAtShard",
+            vec![
+                "CREATE TABLE Commits (ProjectId STRING(128) NOT NULL, CommitId BYTES(64) NOT NULL, ChangeId BYTES(64) NOT NULL, Generation INT64 NOT NULL, ProtoBytes BYTES(MAX) NOT NULL, InsertedAtShard INT64, InsertedAt TIMESTAMP OPTIONS (allow_commit_timestamp=true)) PRIMARY KEY(ProjectId, CommitId)".to_string(),
+            ],
+        ),
+        (
+            "nullable InsertedAtShard with NOT NULL only inside OPTIONS string",
+            vec![
+                "CREATE TABLE Commits (ProjectId STRING(128) NOT NULL, CommitId BYTES(64) NOT NULL, ChangeId BYTES(64) NOT NULL, Generation INT64 NOT NULL, ProtoBytes BYTES(MAX) NOT NULL, InsertedAtShard INT64 OPTIONS (description = 'NOT NULL'), InsertedAt TIMESTAMP OPTIONS (allow_commit_timestamp=true)) PRIMARY KEY(ProjectId, CommitId)".to_string(),
+            ],
+        ),
+        (
+            "nullable InsertedAtShard after column using comparison operator in parens",
+            vec![
+                "CREATE TABLE Commits (ProjectId STRING(128) NOT NULL, CommitId BYTES(64) NOT NULL, ChangeId BYTES(64) NOT NULL, Generation INT64 NOT NULL, ProtoBytes BYTES(MAX) NOT NULL, CheckFlag BOOL AS (Generation < 10) STORED, InsertedAtShard INT64, InsertedAt TIMESTAMP OPTIONS (allow_commit_timestamp=true)) PRIMARY KEY(ProjectId, CommitId)".to_string(),
+            ],
+        ),
+        (
+            "Commits.InsertedAtShard with wrong STRING type",
+            vec![
+                "CREATE TABLE Commits (ProjectId STRING(128) NOT NULL, CommitId BYTES(64) NOT NULL, ChangeId BYTES(64) NOT NULL, Generation INT64 NOT NULL, ProtoBytes BYTES(MAX) NOT NULL, InsertedAtShard STRING(16) NOT NULL, InsertedAt TIMESTAMP OPTIONS (allow_commit_timestamp=true)) PRIMARY KEY(ProjectId, CommitId)".to_string(),
+            ],
+        ),
+        (
+            "Commits.InsertedAtShard with wrong ARRAY<INT64> type",
+            vec![
+                "CREATE TABLE Commits (ProjectId STRING(128) NOT NULL, CommitId BYTES(64) NOT NULL, ChangeId BYTES(64) NOT NULL, Generation INT64 NOT NULL, ProtoBytes BYTES(MAX) NOT NULL, InsertedAtShard ARRAY<INT64> NOT NULL, InsertedAt TIMESTAMP OPTIONS (allow_commit_timestamp=true)) PRIMARY KEY(ProjectId, CommitId)".to_string(),
+            ],
+        ),
+        (
+            "Commits.InsertedAtShard as NOT NULL generated STORED column",
+            vec![
+                "CREATE TABLE Commits (ProjectId STRING(128) NOT NULL, CommitId BYTES(64) NOT NULL, ChangeId BYTES(64) NOT NULL, Generation INT64 NOT NULL, ProtoBytes BYTES(MAX) NOT NULL, InsertedAtShard INT64 NOT NULL AS (MOD(FARM_FINGERPRINT(CommitId), 16)) STORED, InsertedAt TIMESTAMP OPTIONS (allow_commit_timestamp=true)) PRIMARY KEY(ProjectId, CommitId)".to_string(),
+            ],
+        ),
+        (
+            "Commits.InsertedAtShard as nullable generated STORED column",
+            vec![
+                "CREATE TABLE Commits (ProjectId STRING(128) NOT NULL, CommitId BYTES(64) NOT NULL, ChangeId BYTES(64) NOT NULL, Generation INT64 NOT NULL, ProtoBytes BYTES(MAX) NOT NULL, InsertedAtShard INT64 AS (MOD(FARM_FINGERPRINT(CommitId), 16)) STORED, InsertedAt TIMESTAMP OPTIONS (allow_commit_timestamp=true)) PRIMARY KEY(ProjectId, CommitId)".to_string(),
+            ],
+        ),
+        (
+            "Commits.InsertedAtShard as virtual HIDDEN generated column",
+            vec![
+                "CREATE TABLE Commits (ProjectId STRING(128) NOT NULL, CommitId BYTES(64) NOT NULL, ChangeId BYTES(64) NOT NULL, Generation INT64 NOT NULL, ProtoBytes BYTES(MAX) NOT NULL, InsertedAtShard INT64 NOT NULL AS (0) HIDDEN, InsertedAt TIMESTAMP OPTIONS (allow_commit_timestamp=true)) PRIMARY KEY(ProjectId, CommitId)".to_string(),
+            ],
+        ),
+        (
+            "Commits.InsertedAtShard as identity generated column",
+            vec![
+                "CREATE TABLE Commits (ProjectId STRING(128) NOT NULL, CommitId BYTES(64) NOT NULL, ChangeId BYTES(64) NOT NULL, Generation INT64 NOT NULL, ProtoBytes BYTES(MAX) NOT NULL, InsertedAtShard INT64 NOT NULL GENERATED BY DEFAULT AS IDENTITY, InsertedAt TIMESTAMP OPTIONS (allow_commit_timestamp=true)) PRIMARY KEY(ProjectId, CommitId)".to_string(),
+            ],
+        ),
+        (
+            "unsharded CommitsByInsertedAt index",
+            vec![
+                valid_sharded_commits.clone(),
+                "CREATE INDEX CommitsByInsertedAt ON Commits(ProjectId, InsertedAt)"
+                    .to_string(),
+            ],
+        ),
+        (
+            "CommitsByInsertedAt missing CommitId key column",
+            vec![
+                valid_sharded_commits.clone(),
+                "CREATE INDEX CommitsByInsertedAt ON Commits(ProjectId, InsertedAtShard, InsertedAt)"
+                    .to_string(),
+            ],
+        ),
+        (
+            "CommitsByInsertedAt with mixed InsertedAt DESC sort direction",
+            vec![
+                valid_sharded_commits.clone(),
+                "CREATE INDEX CommitsByInsertedAt ON Commits(ProjectId, InsertedAtShard, InsertedAt DESC, CommitId)"
+                    .to_string(),
+            ],
+        ),
+        (
+            "CommitsByInsertedAt with descending key columns",
+            vec![
+                valid_sharded_commits.clone(),
+                "CREATE INDEX CommitsByInsertedAt ON Commits(ProjectId, InsertedAtShard, InsertedAt DESC, CommitId DESC)"
+                    .to_string(),
+            ],
+        ),
+        (
+            "CommitsByInsertedAt targeting wrong table",
+            vec![
+                valid_sharded_commits.clone(),
+                "CREATE INDEX CommitsByInsertedAt ON Projects(ProjectId, InsertedAtShard, InsertedAt, CommitId)"
+                    .to_string(),
+            ],
+        ),
+        (
+            "CommitsByInsertedAt targeting schema-qualified table",
+            vec![
+                valid_sharded_commits.clone(),
+                "CREATE INDEX CommitsByInsertedAt ON other_schema.Commits(ProjectId, InsertedAtShard, InsertedAt, CommitId)"
+                    .to_string(),
+            ],
+        ),
+        (
+            "NULL_FILTERED CommitsByInsertedAt index",
+            vec![
+                valid_sharded_commits.clone(),
+                "CREATE NULL_FILTERED INDEX CommitsByInsertedAt ON Commits(ProjectId, InsertedAtShard, InsertedAt, CommitId)"
+                    .to_string(),
+            ],
+        ),
+        (
+            "UNIQUE NULL_FILTERED CommitsByInsertedAt index",
+            vec![
+                valid_sharded_commits.clone(),
+                "CREATE UNIQUE NULL_FILTERED INDEX CommitsByInsertedAt ON Commits(ProjectId, InsertedAtShard, InsertedAt, CommitId)"
+                    .to_string(),
+            ],
+        ),
+        (
+            "WHERE-filtered CommitsByInsertedAt index",
+            vec![
+                valid_sharded_commits.clone(),
+                "CREATE INDEX CommitsByInsertedAt ON Commits(ProjectId, InsertedAtShard, InsertedAt, CommitId) WHERE InsertedAt IS NOT NULL"
+                    .to_string(),
+            ],
+        ),
+        (
+            "STORING plus WHERE-filtered CommitsByInsertedAt index",
+            vec![
+                valid_sharded_commits.clone(),
+                "CREATE INDEX CommitsByInsertedAt ON Commits(ProjectId, InsertedAtShard, InsertedAt, CommitId) STORING (ChangeId) WHERE InsertedAtShard < 8"
+                    .to_string(),
+            ],
+        ),
+        (
+            "INTERLEAVE plus WHERE-filtered CommitsByInsertedAt index",
+            vec![
+                valid_sharded_commits,
+                "CREATE INDEX CommitsByInsertedAt ON Commits(ProjectId, InsertedAtShard, InsertedAt, CommitId), INTERLEAVE IN Projects WHERE InsertedAt IS NOT NULL"
+                    .to_string(),
+            ],
+        ),
+        (
             "legacy trees without Ready",
-            [
+            vec![
                 "CREATE TABLE trees (project_id STRING(MAX) NOT NULL, tree_id BYTES(MAX) NOT NULL, data BYTES(MAX) NOT NULL) PRIMARY KEY(project_id, tree_id)".to_string(),
             ],
         ),
         (
             "legacy operations without ProtoBytes",
-            [
+            vec![
                 "CREATE TABLE operations (repo_id STRING(MAX) NOT NULL, op_id BYTES(MAX) NOT NULL, data BYTES(MAX) NOT NULL) PRIMARY KEY(repo_id, op_id)".to_string(),
             ],
         ),
         (
             "legacy pre-split PoC lowercase workspaces",
-            [
+            vec![
                 "CREATE TABLE workspaces (repo_id STRING(MAX) NOT NULL, user STRING(MAX) NOT NULL, workspace_name STRING(MAX) NOT NULL) PRIMARY KEY(repo_id, user, workspace_name)".to_string(),
             ],
         ),
         (
             "stale pre-migration Workspaces with UserEmail PK",
-            [
+            vec![
                 "CREATE TABLE Workspaces (RepoId STRING(128) NOT NULL, UserEmail STRING(256) NOT NULL, WorkspaceName STRING(256) NOT NULL) PRIMARY KEY(RepoId, UserEmail, WorkspaceName), INTERLEAVE IN PARENT Repositories ON DELETE CASCADE".to_string(),
             ],
         ),
         (
             "stale Workspaces with User embedded in PK",
-            [
+            vec![
                 "CREATE TABLE Workspaces (RepoId STRING(128) NOT NULL, User STRING(256) NOT NULL, WorkspaceName STRING(256) NOT NULL) PRIMARY KEY(RepoId, User, WorkspaceName), INTERLEAVE IN PARENT Repositories ON DELETE CASCADE".to_string(),
             ],
         ),
         (
             "stale Workspaces carrying both User and legacy UserEmail",
-            [
+            vec![
                 "CREATE TABLE Workspaces (RepoId STRING(128) NOT NULL, WorkspaceName STRING(256) NOT NULL, User STRING(256) NOT NULL, UserEmail STRING(256) NOT NULL) PRIMARY KEY(RepoId, WorkspaceName), INTERLEAVE IN PARENT Repositories ON DELETE CASCADE".to_string(),
             ],
         ),
         (
             "Workspaces missing PRIMARY KEY clause",
-            [
+            vec![
                 "CREATE TABLE Workspaces (RepoId STRING(128) NOT NULL, WorkspaceName STRING(256) NOT NULL, User STRING(256) NOT NULL)".to_string(),
             ],
         ),
         (
             "Workspaces with empty PRIMARY KEY()",
-            [
+            vec![
                 "CREATE TABLE Workspaces (RepoId STRING(128) NOT NULL, WorkspaceName STRING(256) NOT NULL, User STRING(256) NOT NULL) PRIMARY KEY()".to_string(),
             ],
         ),
         (
             "Workspaces with OPTIONS tail instead of PRIMARY KEY",
-            [
+            vec![
                 "CREATE TABLE Workspaces (RepoId STRING(128) NOT NULL, WorkspaceName STRING(256) NOT NULL, User STRING(256) NOT NULL) OPTIONS(RepoId, WorkspaceName)".to_string(),
             ],
         ),
         (
             "Workspaces with malformed PRIMARY KEY followed by OPTIONS parens",
-            [
+            vec![
                 "CREATE TABLE Workspaces (RepoId STRING(128) NOT NULL, WorkspaceName STRING(256) NOT NULL, User STRING(256) NOT NULL) PRIMARY KEY OPTIONS(RepoId, WorkspaceName)".to_string(),
             ],
         ),
@@ -601,6 +873,18 @@ fn validate_existing_spanner_ddl_accepts_current_and_rejects_pre_split_poc() {
             );
         }
     }
+
+    // Nullable InsertedAtShard error includes backfill and ALTER COLUMN remediation.
+    let nullable_err = validate_existing_spanner_ddl(&[
+        "CREATE TABLE Commits (ProjectId STRING(128) NOT NULL, CommitId BYTES(64) NOT NULL, ChangeId BYTES(64) NOT NULL, Generation INT64 NOT NULL, ProtoBytes BYTES(MAX) NOT NULL, InsertedAtShard INT64, InsertedAt TIMESTAMP OPTIONS (allow_commit_timestamp=true)) PRIMARY KEY(ProjectId, CommitId)".to_string(),
+    ])
+    .unwrap_err()
+    .to_string();
+    assert!(
+        nullable_err.contains("backfill")
+            && nullable_err.contains("ALTER COLUMN InsertedAtShard INT64 NOT NULL"),
+        "expected backfill + ALTER COLUMN remediation in error: {nullable_err}"
+    );
 
     // Emulator GET /ddl JSON parser handles empty object and statements list.
     assert!(

@@ -24,7 +24,7 @@
 //! configured through emulator environment variables, and uses the Spanner
 //! `DatabaseAdmin` gRPC API for Cloud Spanner and Spanner Omni.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use google_cloud_gax::error::rpc::Status as RpcStatus;
 use google_cloud_spanner::client::Spanner;
@@ -37,6 +37,33 @@ use crate::store::{StoreError, StoreResult};
 pub(super) const SPANNER_SCHEMA: &str = include_str!("../../../sql/spanner_schema.sql");
 
 const MAX_EMULATOR_ADMIN_RESPONSE_BYTES: u64 = 1024 * 1024;
+
+/// Number of hash shards prefixed ahead of `InsertedAt` per project in `CommitsByInsertedAt`
+/// to distribute monotonically increasing commit timestamps across Cloud Spanner splits.
+pub const COMMIT_INSERTED_AT_SHARDS: i64 = 16;
+
+/// Maps `commit_id` deterministically into `0..COMMIT_INSERTED_AT_SHARDS`.
+///
+/// Uses 64-bit FNV-1a with a MurmurHash3 finalizer so both cryptographic digests and
+/// synthetic commit IDs that differ only in trailing or upper-nibble bytes spread evenly
+/// across shards without depending on Rust `RandomState` or `DefaultHasher` stability.
+pub fn commit_inserted_at_shard(commit_id: &[u8]) -> i64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in commit_id {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    hash ^= hash >> 33;
+    (hash % (COMMIT_INSERTED_AT_SHARDS as u64)) as i64
+}
+
+pub(super) fn commit_inserted_at_shards() -> Vec<i64> {
+    (0..COMMIT_INSERTED_AT_SHARDS).collect()
+}
 
 pub(super) fn parse_ddl_statements(sql: &str) -> Vec<String> {
     sql.split(';')
@@ -51,8 +78,23 @@ pub(super) fn parse_ddl_statements(sql: &str) -> Vec<String> {
         .collect()
 }
 
+fn trim_leading_ws_and_comments(mut s: &str) -> &str {
+    loop {
+        s = s.trim_start();
+        if let Some(after_dash) = s.strip_prefix("--") {
+            s = after_dash.find('\n').map_or("", |nl| &after_dash[nl + 1..]);
+        } else if let Some(after_open) = s.strip_prefix("/*") {
+            s = after_open
+                .find("*/")
+                .map_or("", |end| &after_open[end + 2..]);
+        } else {
+            return s;
+        }
+    }
+}
+
 fn strip_ascii_keyword_prefix<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
-    let trimmed = s.trim_start();
+    let trimmed = trim_leading_ws_and_comments(s);
     if trimmed.len() < kw.len() || !trimmed.is_char_boundary(kw.len()) {
         return None;
     }
@@ -64,7 +106,7 @@ fn strip_ascii_keyword_prefix<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
         || rest
             .as_bytes()
             .first()
-            .is_some_and(|b| b.is_ascii_whitespace() || *b == b'(' || *b == b'`')
+            .is_some_and(|b| !(b.is_ascii_alphanumeric() || *b == b'_'))
     {
         Some(rest)
     } else {
@@ -72,7 +114,281 @@ fn strip_ascii_keyword_prefix<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
     }
 }
 
-fn parse_create_table_ddl(stmt: &str) -> Option<(String, HashSet<String>, Vec<String>)> {
+fn take_sql_identifier(s: &str) -> Option<(String, bool, &str)> {
+    let trimmed = trim_leading_ws_and_comments(s);
+    if let Some(after_open) = trimmed.strip_prefix('`') {
+        let mut chars = after_open.char_indices();
+        while let Some((idx, ch)) = chars.next() {
+            if ch == '\\' {
+                let _ = chars.next();
+            } else if ch == '`' {
+                let ident = after_open[..idx].to_ascii_lowercase();
+                if ident.is_empty() {
+                    return None;
+                }
+                return Some((ident, true, &after_open[idx + 1..]));
+            }
+        }
+        return None;
+    }
+    let end = trimmed
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(trimmed.len());
+    if end == 0 {
+        return None;
+    }
+    Some((trimmed[..end].to_ascii_lowercase(), false, &trimmed[end..]))
+}
+
+fn take_qualified_sql_identifier(s: &str) -> Option<(String, &str)> {
+    let (mut ident, _, mut rest) = take_sql_identifier(s)?;
+    while let Some(after_dot) = trim_leading_ws_and_comments(rest).strip_prefix('.') {
+        let (segment, _, next_rest) = take_sql_identifier(after_dot)?;
+        ident.push('.');
+        ident.push_str(&segment);
+        rest = next_rest;
+    }
+    Some((ident, rest))
+}
+
+fn find_matching_close_paren(body: &str) -> Option<usize> {
+    let bytes = body.as_bytes();
+    let len = body.len();
+    let mut i = 0usize;
+    let mut depth = 1usize;
+    while i < len {
+        match bytes[i] {
+            b'-' if i + 1 < len && bytes[i + 1] == b'-' => {
+                i += 2;
+                while i < len && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < len && bytes[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(len);
+            }
+            b'\'' | b'"' | b'`' => {
+                let quote = bytes[i];
+                i += 1;
+                while i < len {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                        if i < len {
+                            i += body[i..].chars().next().map_or(1, char::len_utf8);
+                        }
+                    } else if bytes[i] == quote {
+                        i += 1;
+                        break;
+                    } else {
+                        i += body[i..].chars().next().map_or(1, char::len_utf8);
+                    }
+                }
+            }
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+                i += 1;
+            }
+            _ => {
+                i += body[i..].chars().next().map_or(1, char::len_utf8);
+            }
+        }
+    }
+    None
+}
+
+fn split_top_level_comma_items(s: &str) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let len = s.len();
+    let mut items = Vec::new();
+    let mut item_start = 0usize;
+    let mut paren_depth = 0usize;
+    let mut angle_depth = 0usize;
+    let mut i = 0usize;
+    while i < len {
+        match bytes[i] {
+            b'-' if i + 1 < len && bytes[i + 1] == b'-' => {
+                i += 2;
+                while i < len && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < len && bytes[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(len);
+            }
+            b'\'' | b'"' | b'`' => {
+                let quote = bytes[i];
+                i += 1;
+                while i < len {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                        if i < len {
+                            i += s[i..].chars().next().map_or(1, char::len_utf8);
+                        }
+                    } else if bytes[i] == quote {
+                        i += 1;
+                        break;
+                    } else {
+                        i += s[i..].chars().next().map_or(1, char::len_utf8);
+                    }
+                }
+            }
+            b'(' => {
+                paren_depth += 1;
+                i += 1;
+            }
+            b')' => {
+                paren_depth = paren_depth.saturating_sub(1);
+                i += 1;
+            }
+            b'<' if paren_depth == 0 => {
+                angle_depth += 1;
+                i += 1;
+            }
+            b'>' if paren_depth == 0 => {
+                angle_depth = angle_depth.saturating_sub(1);
+                i += 1;
+            }
+            b',' if paren_depth == 0 && angle_depth == 0 => {
+                items.push(&s[item_start..i]);
+                i += 1;
+                item_start = i;
+            }
+            _ => {
+                i += s[i..].chars().next().map_or(1, char::len_utf8);
+            }
+        }
+    }
+    items.push(&s[item_start..]);
+    items
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SqlToken<'a> {
+    Ident { text: &'a str, is_quoted: bool },
+    Parens,
+    StringLit,
+    Punct(char),
+}
+
+fn is_unquoted_keyword(tok: &SqlToken<'_>, kw: &str) -> bool {
+    matches!(tok, SqlToken::Ident { text, is_quoted: false } if text.eq_ignore_ascii_case(kw))
+}
+
+fn tokenize_top_level(input: &str) -> Vec<SqlToken<'_>> {
+    let bytes = input.as_bytes();
+    let len = input.len();
+    let mut tokens = Vec::new();
+    let mut i = 0usize;
+    while i < len {
+        match bytes[i] {
+            b if b.is_ascii_whitespace() => {
+                i += 1;
+            }
+            b'-' if i + 1 < len && bytes[i + 1] == b'-' => {
+                i += 2;
+                while i < len && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < len && bytes[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(len);
+            }
+            b'`' => {
+                let start = i + 1;
+                i += 1;
+                let mut closed = false;
+                while i < len {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                        if i < len {
+                            i += input[i..].chars().next().map_or(1, char::len_utf8);
+                        }
+                    } else if bytes[i] == b'`' {
+                        tokens.push(SqlToken::Ident {
+                            text: &input[start..i],
+                            is_quoted: true,
+                        });
+                        i += 1;
+                        closed = true;
+                        break;
+                    } else {
+                        i += input[i..].chars().next().map_or(1, char::len_utf8);
+                    }
+                }
+                if !closed {
+                    tokens.push(SqlToken::Ident {
+                        text: &input[start..len],
+                        is_quoted: true,
+                    });
+                }
+            }
+            b'\'' | b'"' => {
+                let quote = bytes[i];
+                i += 1;
+                while i < len {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                        if i < len {
+                            i += input[i..].chars().next().map_or(1, char::len_utf8);
+                        }
+                    } else if bytes[i] == quote {
+                        i += 1;
+                        break;
+                    } else {
+                        i += input[i..].chars().next().map_or(1, char::len_utf8);
+                    }
+                }
+                tokens.push(SqlToken::StringLit);
+            }
+            b'(' => {
+                if let Some(rel_close) = find_matching_close_paren(&input[i + 1..]) {
+                    i = i + 1 + rel_close + 1;
+                } else {
+                    i = len;
+                }
+                tokens.push(SqlToken::Parens);
+            }
+            b if b.is_ascii_alphanumeric() || b == b'_' => {
+                let start = i;
+                i += 1;
+                while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                tokens.push(SqlToken::Ident {
+                    text: &input[start..i],
+                    is_quoted: false,
+                });
+            }
+            _ => {
+                let ch = input[i..].chars().next().unwrap();
+                tokens.push(SqlToken::Punct(ch));
+                i += ch.len_utf8();
+            }
+        }
+    }
+    tokens
+}
+
+fn parse_create_table_ddl(stmt: &str) -> Option<(String, HashMap<String, String>, Vec<String>)> {
     let rest = strip_ascii_keyword_prefix(stmt, "CREATE")?;
     let mut rest = strip_ascii_keyword_prefix(rest, "TABLE")?;
     if let Some(after_if) = strip_ascii_keyword_prefix(rest, "IF")
@@ -81,117 +397,27 @@ fn parse_create_table_ddl(stmt: &str) -> Option<(String, HashSet<String>, Vec<St
     {
         rest = after_exists;
     }
-    let rest = rest.trim_start();
-    let name_end = rest.find(|c: char| c.is_ascii_whitespace() || c == '(')?;
-    let raw_table = rest[..name_end].trim().trim_matches('`');
-    if raw_table.is_empty() {
-        return None;
-    }
-    let table_name = raw_table.to_ascii_lowercase();
-
-    let after_name = &rest[name_end..];
-    let open_idx = after_name.find('(')?;
-    let body = &after_name[open_idx + 1..];
-
-    // Match the closing `)` of the column definition block, ignoring nested type/option parens
-    // and quoted literals.
-    let mut depth = 1usize;
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut close_idx = None;
-    let mut chars = body.char_indices().peekable();
-    while let Some((idx, ch)) = chars.next() {
-        if in_single {
-            if ch == '\\' {
-                let _ = chars.next();
-            } else if ch == '\'' {
-                in_single = false;
-            }
-            continue;
-        }
-        if in_double {
-            if ch == '\\' {
-                let _ = chars.next();
-            } else if ch == '"' {
-                in_double = false;
-            }
-            continue;
-        }
-        match ch {
-            '\'' => in_single = true,
-            '"' => in_double = true,
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    close_idx = Some(idx);
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    let close_pos = close_idx?;
+    let (table_name, after_name) = take_qualified_sql_identifier(rest)?;
+    let body = trim_leading_ws_and_comments(after_name).strip_prefix('(')?;
+    let close_pos = find_matching_close_paren(body)?;
     let cols_block = &body[..close_pos];
     let tail = &body[close_pos + 1..];
 
-    let mut columns = HashSet::new();
-    let mut paren_depth = 0usize;
-    let mut angle_depth = 0usize;
-    let mut in_sq = false;
-    let mut in_dq = false;
-    let mut item_start = 0usize;
-    let mut scan = cols_block.char_indices().peekable();
-    let mut push_item = |slice: &str| {
-        let trimmed = slice.trim();
-        if trimmed.is_empty() {
-            return;
-        }
-        let tok_end = trimmed
-            .find(|c: char| c.is_ascii_whitespace() || c == '(')
-            .unwrap_or(trimmed.len());
-        let tok = trimmed[..tok_end].trim_matches('`').to_ascii_lowercase();
-        if !tok.is_empty()
-            && !matches!(
+    let mut columns = HashMap::new();
+    for item in split_top_level_comma_items(cols_block) {
+        let Some((tok, is_quoted, def_rest)) = take_sql_identifier(item) else {
+            continue;
+        };
+        if !is_quoted
+            && matches!(
                 tok.as_str(),
                 "constraint" | "foreign" | "primary" | "check" | "synonym" | "row"
             )
         {
-            columns.insert(tok);
-        }
-    };
-    while let Some((idx, ch)) = scan.next() {
-        if in_sq {
-            if ch == '\\' {
-                let _ = scan.next();
-            } else if ch == '\'' {
-                in_sq = false;
-            }
             continue;
         }
-        if in_dq {
-            if ch == '\\' {
-                let _ = scan.next();
-            } else if ch == '"' {
-                in_dq = false;
-            }
-            continue;
-        }
-        match ch {
-            '\'' => in_sq = true,
-            '"' => in_dq = true,
-            '(' => paren_depth += 1,
-            ')' => paren_depth = paren_depth.saturating_sub(1),
-            '<' => angle_depth += 1,
-            '>' => angle_depth = angle_depth.saturating_sub(1),
-            ',' if paren_depth == 0 && angle_depth == 0 => {
-                push_item(&cols_block[item_start..idx]);
-                item_start = idx + 1;
-            }
-            _ => {}
-        }
+        columns.insert(tok, def_rest.trim().to_string());
     }
-    push_item(&cols_block[item_start..]);
 
     let pk_cols = parse_primary_key_cols(tail);
     Some((table_name, columns, pk_cols))
@@ -224,14 +450,128 @@ fn parse_primary_key_cols(tail: &str) -> Vec<String> {
         .collect()
 }
 
-/// Rejects pre-split PoC Spanner databases and pre-migration `Workspaces` schemas before
-/// `--spanner-auto-migrate` runs `CREATE TABLE IF NOT EXISTS`, matching
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ParsedCreateIndex {
+    pub(super) index_name: String,
+    pub(super) table_name: String,
+    pub(super) is_null_filtered: bool,
+    pub(super) has_where_clause: bool,
+    /// Ordered index key columns as `(lowercase_column_name, is_desc)`.
+    pub(super) key_cols: Vec<(String, bool)>,
+}
+
+/// Parses `CREATE [UNIQUE] [NULL_FILTERED] INDEX [IF NOT EXISTS] <name> ON <table>(<cols...>)`
+/// along with null-filtering, `WHERE` filter presence, and per-column sort direction.
+pub(super) fn parse_create_index_ddl(stmt: &str) -> Option<ParsedCreateIndex> {
+    let mut rest = strip_ascii_keyword_prefix(stmt, "CREATE")?;
+    if let Some(after_unique) = strip_ascii_keyword_prefix(rest, "UNIQUE") {
+        rest = after_unique;
+    }
+    let is_null_filtered = if let Some(after_nf) = strip_ascii_keyword_prefix(rest, "NULL_FILTERED")
+    {
+        rest = after_nf;
+        true
+    } else {
+        false
+    };
+    let mut rest = strip_ascii_keyword_prefix(rest, "INDEX")?;
+    if let Some(after_if) = strip_ascii_keyword_prefix(rest, "IF")
+        && let Some(after_not) = strip_ascii_keyword_prefix(after_if, "NOT")
+        && let Some(after_exists) = strip_ascii_keyword_prefix(after_not, "EXISTS")
+    {
+        rest = after_exists;
+    }
+    let (index_name, rest) = take_qualified_sql_identifier(rest)?;
+    let after_on = strip_ascii_keyword_prefix(rest, "ON")?;
+    let (table_name, after_table) = take_qualified_sql_identifier(after_on)?;
+    let body = trim_leading_ws_and_comments(after_table).strip_prefix('(')?;
+    let close_idx = find_matching_close_paren(body)?;
+    let cols_block = &body[..close_idx];
+    let tail = &body[close_idx + 1..];
+
+    let mut key_cols = Vec::new();
+    for piece_tokens in
+        tokenize_top_level(cols_block).split(|tok| matches!(tok, SqlToken::Punct(',')))
+    {
+        let Some(SqlToken::Ident { text, .. }) = piece_tokens.first() else {
+            continue;
+        };
+        let col = text.to_ascii_lowercase();
+        if col.is_empty() {
+            continue;
+        }
+        let is_desc = piece_tokens[1..]
+            .iter()
+            .any(|tok| is_unquoted_keyword(tok, "DESC"));
+        key_cols.push((col, is_desc));
+    }
+
+    let has_where_clause = tokenize_top_level(tail)
+        .iter()
+        .any(|tok| is_unquoted_keyword(tok, "WHERE"));
+
+    Some(ParsedCreateIndex {
+        index_name,
+        table_name,
+        is_null_filtered,
+        has_where_clause,
+        key_cols,
+    })
+}
+
+fn validate_inserted_at_shard_column_def(col_def: &str) -> StoreResult<()> {
+    let tokens = tokenize_top_level(col_def);
+    let is_int64 = tokens
+        .first()
+        .is_some_and(|tok| is_unquoted_keyword(tok, "INT64"))
+        && !matches!(tokens.get(1), Some(SqlToken::Parens | SqlToken::Punct('<')));
+    if !is_int64 {
+        return Err(StoreError::InvalidArgument(format!(
+            "detected incompatible Spanner database schema ('Commits.InsertedAtShard' has definition '{col_def}', \
+             expected non-generated 'INT64 NOT NULL'); \
+             migrate Commits.InsertedAtShard to INT64, backfill every row, and run \
+             ALTER TABLE Commits ALTER COLUMN InsertedAtShard INT64 NOT NULL \
+             (or provision a fresh Spanner database) before starting jj-cc-server with --spanner-auto-migrate"
+        )));
+    }
+    let is_generated = tokens
+        .iter()
+        .any(|tok| is_unquoted_keyword(tok, "AS") || is_unquoted_keyword(tok, "GENERATED"));
+    if is_generated {
+        return Err(StoreError::InvalidArgument(format!(
+            "detected incompatible Spanner database schema ('Commits.InsertedAtShard' is a generated column ('{col_def}'), \
+             expected a writable non-generated 'INT64 NOT NULL' column); \
+             replace it with a writable INT64 column, backfill every row, and run \
+             ALTER TABLE Commits ALTER COLUMN InsertedAtShard INT64 NOT NULL \
+             (or provision a fresh Spanner database) before starting jj-cc-server with --spanner-auto-migrate"
+        )));
+    }
+    let is_not_null = tokens
+        .windows(2)
+        .any(|pair| is_unquoted_keyword(&pair[0], "NOT") && is_unquoted_keyword(&pair[1], "NULL"));
+    if !is_not_null {
+        return Err(StoreError::InvalidArgument(format!(
+            "detected incompatible Spanner database schema ('Commits.InsertedAtShard' is nullable ('{col_def}'), \
+             expected 'INT64 NOT NULL'); \
+             backfill Commits.InsertedAtShard for every row and run \
+             ALTER TABLE Commits ALTER COLUMN InsertedAtShard INT64 NOT NULL \
+             before starting jj-cc-server with --spanner-auto-migrate"
+        )));
+    }
+    Ok(())
+}
+
+/// Rejects pre-split PoC, pre-migration `Workspaces`, and unsharded `CommitsByInsertedAt` Spanner
+/// databases before `--spanner-auto-migrate` runs `CREATE ... IF NOT EXISTS`, matching
 /// [`crate::store::SqliteMetadataStore`]'s fail-fast guard.
 pub(super) fn validate_existing_spanner_ddl(existing_statements: &[String]) -> StoreResult<()> {
-    let mut tables: HashMap<String, (HashSet<String>, Vec<String>)> = HashMap::new();
+    let mut tables: HashMap<String, (HashMap<String, String>, Vec<String>)> = HashMap::new();
+    let mut indexes: HashMap<String, ParsedCreateIndex> = HashMap::new();
     for stmt in existing_statements {
         if let Some((table_name, cols, pk_cols)) = parse_create_table_ddl(stmt) {
             tables.insert(table_name, (cols, pk_cols));
+        } else if let Some(parsed_index) = parse_create_index_ddl(stmt) {
+            indexes.insert(parsed_index.index_name.clone(), parsed_index);
         }
     }
 
@@ -245,7 +585,7 @@ pub(super) fn validate_existing_spanner_ddl(existing_statements: &[String]) -> S
     }
 
     if let Some((ws_cols, _)) = tables.get("workspaces")
-        && ws_cols.contains("useremail")
+        && ws_cols.contains_key("useremail")
     {
         return Err(StoreError::InvalidArgument(
             "detected incompatible Spanner database ('Workspaces' table contains legacy 'UserEmail' column); \
@@ -264,6 +604,8 @@ pub(super) fn validate_existing_spanner_ddl(existing_statements: &[String]) -> S
                 "changeid",
                 "generation",
                 "protobytes",
+                "insertedatshard",
+                "insertedat",
             ],
         ),
         ("trees", &["projectid", "treeid", "ready"]),
@@ -274,14 +616,20 @@ pub(super) fn validate_existing_spanner_ddl(existing_statements: &[String]) -> S
     for (table, required_cols) in REQUIRED_COLUMNS {
         if let Some((existing_cols, _)) = tables.get(*table) {
             for col in *required_cols {
-                if !existing_cols.contains(*col) {
+                if !existing_cols.contains_key(*col) {
                     return Err(StoreError::InvalidArgument(format!(
-                        "detected incompatible Spanner database ('{table}' table lacks '{col}' column); \
-                         provision a fresh Spanner database or migrate the schema before starting jj-cc-server with --spanner-auto-migrate"
+                        "detected incompatible Spanner database schema ('{table}' table lacks '{col}' column); \
+                         migrate the schema or provision a fresh Spanner database before starting jj-cc-server with --spanner-auto-migrate"
                     )));
                 }
             }
         }
+    }
+
+    if let Some((commits_cols, _)) = tables.get("commits")
+        && let Some(shard_def) = commits_cols.get("insertedatshard")
+    {
+        validate_inserted_at_shard_column_def(shard_def)?;
     }
 
     if let Some((_, ws_pk)) = tables.get("workspaces")
@@ -292,6 +640,63 @@ pub(super) fn validate_existing_spanner_ddl(existing_statements: &[String]) -> S
              migrate 'Workspaces' before starting jj-cc-server",
             ws_pk.join(", ")
         )));
+    }
+
+    const EXPECTED_COMMITS_BY_INSERTED_AT: &[(&str, bool)] = &[
+        ("projectid", false),
+        ("insertedatshard", false),
+        ("insertedat", false),
+        ("commitid", false),
+    ];
+    if let Some(index) = indexes.get("commitsbyinsertedat") {
+        if index.table_name != "commits" {
+            return Err(StoreError::InvalidArgument(format!(
+                "detected incompatible Spanner database schema ('CommitsByInsertedAt' index targets table '{}' \
+                 instead of 'Commits'); \
+                 drop and recreate the index on Commits(ProjectId, InsertedAtShard, InsertedAt, CommitId), \
+                 or provision a fresh Spanner database before starting jj-cc-server with --spanner-auto-migrate",
+                index.table_name
+            )));
+        }
+        if index.is_null_filtered || index.has_where_clause {
+            let filter_kind = match (index.is_null_filtered, index.has_where_clause) {
+                (true, true) => "NULL_FILTERED with a WHERE clause",
+                (true, false) => "NULL_FILTERED",
+                (false, true) => "filtered with a WHERE clause",
+                (false, false) => unreachable!(),
+            };
+            return Err(StoreError::InvalidArgument(format!(
+                "detected incompatible Spanner database schema ('CommitsByInsertedAt' index is {filter_kind}, \
+                 expected an unfiltered index on Commits(ProjectId, InsertedAtShard, InsertedAt, CommitId)); \
+                 drop and recreate the index without NULL_FILTERED or WHERE, or provision a fresh Spanner database \
+                 before starting jj-cc-server with --spanner-auto-migrate"
+            )));
+        }
+        let actual: Vec<(&str, bool)> = index
+            .key_cols
+            .iter()
+            .map(|(col, desc)| (col.as_str(), *desc))
+            .collect();
+        if actual != EXPECTED_COMMITS_BY_INSERTED_AT {
+            let formatted = index
+                .key_cols
+                .iter()
+                .map(|(col, desc)| {
+                    if *desc {
+                        format!("{col} DESC")
+                    } else {
+                        col.clone()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(StoreError::InvalidArgument(format!(
+                "detected incompatible Spanner database schema ('CommitsByInsertedAt' index has key columns ({formatted}) \
+                 instead of ascending (ProjectId, InsertedAtShard, InsertedAt, CommitId)); \
+                 drop and recreate the index after backfilling Commits.InsertedAtShard, or provision a fresh Spanner database \
+                 before starting jj-cc-server with --spanner-auto-migrate"
+            )));
+        }
     }
     Ok(())
 }
