@@ -1,0 +1,7 @@
+/target
+/.git
+/.jj
+/.jj-cc
+/bin
+**/*.rs.bk
+*.pdb

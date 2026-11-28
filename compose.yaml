@@ -1,0 +1,272 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Cross-platform Docker / Podman Compose profiles for local jj-commit-cloud testing:
+#   docker compose --profile memory up -d --build
+#   docker compose --profile sqlite up -d --build
+#   docker compose --profile postgres up -d --build
+#   docker compose --profile spanner up -d --build
+#   docker compose --profile multiregion up -d --build
+#   docker compose --profile smoke run --rm smoke
+#   docker compose down -v
+
+services:
+  server-memory:
+    build:
+      context: .
+      target: server
+    image: jj-cc-server:local
+    profiles: ["memory"]
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8080"
+      JJ_CC_ALLOW_UNAUTHENTICATED: "true"
+      STORE_TYPE: "memory"
+      BLOB_STORE: "memory"
+    ports:
+      - "127.0.0.1:8080:8080"
+    networks:
+      default:
+        aliases:
+          - jj-cc-server
+
+  server-sqlite:
+    build:
+      context: .
+      target: server
+    image: jj-cc-server:local
+    profiles: ["sqlite"]
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8080"
+      JJ_CC_ALLOW_UNAUTHENTICATED: "true"
+      STORE_TYPE: "sqlite"
+      BLOB_STORE: "local"
+      SQLITE_PATH: "/data/commit_cloud.db"
+      BLOB_PATH: "/data/blobs"
+    volumes:
+      - jj-cc-sqlite-data:/data
+    ports:
+      - "127.0.0.1:8080:8080"
+    networks:
+      default:
+        aliases:
+          - jj-cc-server
+
+  postgres:
+    image: docker.io/library/postgres:17-alpine
+    profiles: ["postgres"]
+    environment:
+      POSTGRES_USER: "jj"
+      POSTGRES_PASSWORD: "jj"
+      POSTGRES_DB: "commit_cloud"
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - jj-cc-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U jj -d commit_cloud"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    image: cgr.dev/chainguard/minio:latest
+    profiles: ["postgres"]
+    command:
+      - "server"
+      - "/data"
+      - "--address"
+      - ":9000"
+      - "--console-address"
+      - ":9001"
+    environment:
+      MINIO_ROOT_USER: "minioadmin"
+      MINIO_ROOT_PASSWORD: "minioadmin"
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - jj-cc-minio-data:/data
+
+  server-postgres:
+    build:
+      context: .
+      target: server
+    image: jj-cc-server:local
+    profiles: ["postgres"]
+    restart: on-failure
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8080"
+      METRICS_LISTEN: "0.0.0.0:50052"
+      JJ_CC_ALLOW_UNAUTHENTICATED: "true"
+      STORE_TYPE: "postgres"
+      POSTGRES_URL: "postgres://jj:jj@postgres:5432/commit_cloud?sslmode=disable"
+      POSTGRES_AUTO_MIGRATE: "true"
+      BLOB_STORE: "s3"
+      S3_BUCKET: "jj-blobs"
+      S3_ENDPOINT: "http://minio:9000"
+      S3_REGION: "us-east-1"
+      S3_ACCESS_KEY_ID: "minioadmin"
+      S3_SECRET_ACCESS_KEY: "minioadmin"
+      S3_PATH_STYLE: "true"
+      S3_AUTO_CREATE_BUCKET: "true"
+    ports:
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:50052:50052"
+    networks:
+      default:
+        aliases:
+          - jj-cc-server
+
+  spanner-emulator:
+    image: gcr.io/cloud-spanner-emulator/emulator:latest
+    profiles: ["spanner", "multiregion"]
+    ports:
+      - "127.0.0.1:9010:9010"
+      - "127.0.0.1:9020:9020"
+
+  gcs-emulator:
+    image: docker.io/fsouza/fake-gcs-server:latest
+    profiles: ["spanner", "multiregion"]
+    command:
+      - "-scheme"
+      - "http"
+      - "-port"
+      - "4443"
+      - "-external-url"
+      - "http://gcs-emulator:4443"
+      - "-backend"
+      - "memory"
+    ports:
+      - "127.0.0.1:4443:4443"
+
+  server-spanner:
+    build:
+      context: .
+      target: server
+    image: jj-cc-server:local
+    profiles: ["spanner"]
+    restart: on-failure
+    depends_on:
+      - spanner-emulator
+      - gcs-emulator
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8080"
+      JJ_CC_ALLOW_UNAUTHENTICATED: "true"
+      STORE_TYPE: "spanner"
+      SPANNER_EMULATOR_HOST: "spanner-emulator:9010"
+      SPANNER_EMULATOR_REST_HOST: "http://spanner-emulator:9020"
+      SPANNER_DATABASE: "projects/local-project/instances/local-instance/databases/commit-cloud"
+      SPANNER_AUTO_MIGRATE: "true"
+      BLOB_STORE: "gcs"
+      STORAGE_EMULATOR_HOST: "http://gcs-emulator:4443"
+      GCS_BUCKET: "gs://blobs-uc1"
+    ports:
+      - "127.0.0.1:8080:8080"
+    networks:
+      default:
+        aliases:
+          - jj-cc-server
+
+  server-us:
+    build:
+      context: .
+      target: server
+    image: jj-cc-server:local
+    profiles: ["multiregion"]
+    restart: on-failure
+    depends_on:
+      - spanner-emulator
+      - gcs-emulator
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8080"
+      JJ_CC_ALLOW_UNAUTHENTICATED: "true"
+      STORE_TYPE: "spanner"
+      SPANNER_EMULATOR_HOST: "spanner-emulator:9010"
+      SPANNER_EMULATOR_REST_HOST: "http://spanner-emulator:9020"
+      SPANNER_DATABASE: "projects/local-project/instances/local-instance/databases/commit-cloud"
+      SPANNER_AUTO_MIGRATE: "true"
+      BLOB_STORE: "gcs"
+      STORAGE_EMULATOR_HOST: "http://gcs-emulator:4443"
+      GCS_BUCKET: "gs://blobs-uc1"
+      GCS_PEER_BUCKETS: "gs://blobs-ew1"
+    ports:
+      - "127.0.0.1:8081:8080"
+    networks:
+      default:
+        aliases:
+          - jj-cc-server
+
+  server-eu:
+    build:
+      context: .
+      target: server
+    image: jj-cc-server:local
+    profiles: ["multiregion"]
+    restart: on-failure
+    depends_on:
+      - spanner-emulator
+      - gcs-emulator
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8080"
+      JJ_CC_ALLOW_UNAUTHENTICATED: "true"
+      STORE_TYPE: "spanner"
+      SPANNER_EMULATOR_HOST: "spanner-emulator:9010"
+      SPANNER_EMULATOR_REST_HOST: "http://spanner-emulator:9020"
+      SPANNER_DATABASE: "projects/local-project/instances/local-instance/databases/commit-cloud"
+      SPANNER_AUTO_MIGRATE: "true"
+      BLOB_STORE: "gcs"
+      STORAGE_EMULATOR_HOST: "http://gcs-emulator:4443"
+      GCS_BUCKET: "gs://blobs-ew1"
+      GCS_PEER_BUCKETS: "gs://blobs-uc1"
+    ports:
+      - "127.0.0.1:8082:8080"
+    networks:
+      default:
+        aliases:
+          - jj-cc-peer
+
+  smoke:
+    build:
+      context: .
+      target: cli
+    image: jj-cc-cli:local
+    profiles: ["smoke"]
+    environment:
+      - SMOKE_PEER_SERVER_URL
+      - JJ_CC_AUTH_TOKEN
+    entrypoint: ["xtask"]
+    command:
+      - "smoke"
+      - "--jj-bin"
+      - "/usr/local/bin/jj"
+      - "--server"
+      - "${SMOKE_SERVER_URL:-http://jj-cc-server:8080}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  jj-cc-sqlite-data:
+  jj-cc-postgres-data:
+  jj-cc-minio-data:

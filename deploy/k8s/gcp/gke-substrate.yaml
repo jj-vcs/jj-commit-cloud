@@ -1,0 +1,168 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# GKE Agent Substrate manifest for jj-cc-server backed by native Cloud Spanner + Cloud Storage.
+# Runs 4 stateless replicas with Workload Identity, OIDC Actor JWT + Kubernetes TokenReview auth,
+# 16 KiB inline blob threshold, 2 GiB in-memory LRU blob cache, and /healthz /statz /metrics on
+# port 50052.
+#
+# Prerequisites:
+#   1. Grant jj-cc-server-ksa TokenReview permissions in your target namespace:
+#        kubectl create clusterrolebinding jj-cc-server-auth-delegator \
+#          --clusterrole=system:auth-delegator \
+#          --serviceaccount=default:jj-cc-server-ksa
+#   2. Create the ConfigMap holding the internal OIDC IDP PEM CA bundle:
+#        kubectl create configmap substrate-idp-ca --from-file=ca.crt=./idp-ca.crt
+#   3. Substitute template placeholders and apply:
+#        sed \
+#          -e "s|__GCP_SERVICE_ACCOUNT__|${GCP_SERVICE_ACCOUNT}|g" \
+#          -e "s|__IMAGE_URI__|${IMAGE_URI}|g" \
+#          -e "s|__SPANNER_DATABASE__|${SPANNER_DATABASE}|g" \
+#          -e "s|__GCS_BUCKET__|${GCS_BUCKET}|g" \
+#          -e "s|__GCS_PEER_BUCKETS__|${GCS_PEER_BUCKETS:-}|g" \
+#          -e "s|__OIDC_ISSUER__|${OIDC_ISSUER:-https://idp.ate-system.svc}|g" \
+#          -e "s|__OIDC_AUDIENCE__|${OIDC_AUDIENCE:-cloud-jj}|g" \
+#          deploy/k8s/gcp/gke-substrate.yaml | kubectl apply -f -
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: jj-cc-server-ksa
+  annotations:
+    iam.gke.io/gcp-service-account: "__GCP_SERVICE_ACCOUNT__"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jj-cc-server
+  labels:
+    app: jj-cc-server
+    profile: substrate-spanner
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: jj-cc-server
+  template:
+    metadata:
+      labels:
+        app: jj-cc-server
+        profile: substrate-spanner
+    spec:
+      serviceAccountName: jj-cc-server-ksa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+        - name: jj-cc-server
+          image: "__IMAGE_URI__"
+          securityContext:
+            runAsNonRoot: true
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            seccompProfile:
+              type: RuntimeDefault
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: HOST
+              value: "0.0.0.0"
+            - name: PORT
+              value: "8080"
+            - name: METRICS_LISTEN
+              value: "0.0.0.0:50052"
+            - name: STORE_TYPE
+              value: "spanner"
+            - name: SPANNER_DATABASE
+              value: "__SPANNER_DATABASE__"
+            - name: BLOB_STORE
+              value: "gcs"
+            - name: GCS_BUCKET
+              value: "__GCS_BUCKET__"
+            - name: GCS_PEER_BUCKETS
+              value: "__GCS_PEER_BUCKETS__"
+            - name: INLINE_BLOB_THRESHOLD_BYTES
+              value: "16384"
+            - name: BLOB_CACHE_BYTES
+              value: "2147483648"
+            - name: JJ_CC_AUTH_OIDC_ISSUER
+              value: "__OIDC_ISSUER__"
+            - name: JJ_CC_AUTH_OIDC_AUDIENCE
+              value: "__OIDC_AUDIENCE__"
+            - name: JJ_CC_AUTH_OIDC_CA_CERT
+              value: "/etc/jj-cc/oidc-ca/ca.crt"
+            - name: JJ_CC_AUTH_ENFORCE_ACTOR_REPO_SUFFIX
+              value: "true"
+            - name: JJ_CC_AUTH_K8S_TOKENREVIEW_URL
+              value: "https://kubernetes.default.svc"
+            - name: JJ_CC_AUTH_K8S_TOKENREVIEW_AUD
+              value: "__OIDC_AUDIENCE__"
+            - name: JJ_CC_AUTH_K8S_CA_CERT
+              value: "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+            - name: JJ_CC_AUTH_K8S_SA_TOKEN_FILE
+              value: "/var/run/secrets/kubernetes.io/serviceaccount/token"
+          volumeMounts:
+            - name: oidc-ca
+              mountPath: /etc/jj-cc/oidc-ca
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          ports:
+            - name: grpc
+              containerPort: 8080
+            - name: metrics
+              containerPort: 50052
+          readinessProbe:
+            grpc:
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            grpc:
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "1000m"
+              memory: "3Gi"
+            limits:
+              cpu: "4000m"
+              memory: "4Gi"
+      volumes:
+        - name: oidc-ca
+          configMap:
+            name: substrate-idp-ca
+            defaultMode: 0440
+            optional: false
+        - name: tmp
+          emptyDir:
+            sizeLimit: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jj-cc-server
+spec:
+  type: ClusterIP
+  selector:
+    app: jj-cc-server
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: 8080
+    - name: metrics
+      port: 50052
+      targetPort: 50052

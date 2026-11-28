@@ -1,0 +1,110 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Local Cloud Spanner + Cloud Storage emulator manifest for Podman
+# (`podman kube play deploy/k8s/spanner.yaml`, which binds 127.0.0.1:8080 via hostIP/hostPort)
+# or Kubernetes (`kubectl apply -f deploy/k8s/spanner.yaml`, then
+# `kubectl port-forward svc/jj-cc-server 8080:8080`).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: jj-cc-spanner
+  labels:
+    app: jj-cc-server
+    mode: spanner
+spec:
+  restartPolicy: Always
+  containers:
+    - name: spanner-emulator
+      image: gcr.io/cloud-spanner-emulator/emulator:latest
+      ports:
+        - containerPort: 9010
+        - containerPort: 9020
+    - name: gcs-emulator
+      image: docker.io/fsouza/fake-gcs-server:latest
+      args:
+        - "-scheme"
+        - "http"
+        - "-port"
+        - "4443"
+        - "-external-url"
+        - "http://127.0.0.1:4443"
+        - "-backend"
+        - "memory"
+      ports:
+        - containerPort: 4443
+    - name: jj-cc-server
+      image: localhost/jj-cc-server:local
+      imagePullPolicy: IfNotPresent
+      securityContext:
+        runAsNonRoot: true
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
+        seccompProfile:
+          type: RuntimeDefault
+        capabilities:
+          drop: ["ALL"]
+      env:
+        - name: HOST
+          value: "0.0.0.0"
+        - name: PORT
+          value: "8080"
+        - name: JJ_CC_ALLOW_UNAUTHENTICATED
+          value: "true"
+        - name: STORE_TYPE
+          value: "spanner"
+        - name: SPANNER_EMULATOR_HOST
+          value: "127.0.0.1:9010"
+        - name: SPANNER_EMULATOR_REST_HOST
+          value: "http://127.0.0.1:9020"
+        - name: SPANNER_DATABASE
+          value: "projects/local-project/instances/local-instance/databases/commit-cloud"
+        - name: SPANNER_AUTO_MIGRATE
+          value: "true"
+        - name: BLOB_STORE
+          value: "gcs"
+        - name: STORAGE_EMULATOR_HOST
+          value: "http://127.0.0.1:4443"
+        - name: GCS_BUCKET
+          value: "gs://blobs-uc1"
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+      ports:
+        - containerPort: 8080
+          hostIP: 127.0.0.1
+          hostPort: 8080
+          protocol: TCP
+      readinessProbe:
+        grpc:
+          port: 8080
+        initialDelaySeconds: 2
+        periodSeconds: 3
+  volumes:
+    - name: tmp
+      emptyDir:
+        sizeLimit: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jj-cc-server
+spec:
+  type: ClusterIP
+  selector:
+    app: jj-cc-server
+  ports:
+    - name: grpc
+      port: 8080
+      targetPort: 8080

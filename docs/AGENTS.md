@@ -13,9 +13,9 @@ Apply these conventions alongside [AGENTS.md](../AGENTS.md) when drafting or edi
 
 * **Direct Language (No `-ly` Adverbs or Weasel Words):** Strip subjective `-ly` adverbs (*typically*, *seamlessly*, *easily*, *simply*, *significantly*), marketing adjectives (*robust*, *revolutionary*), and weasel words. Substantiate superlatives with measurements.
 * **Propose, Don't Oppose:** Open sentences with affirmative descriptions rather than opposition ("Rather than...", "Instead of...", "Unlike Git...").
-* **Headings, Lists, and Dashes:** Use unnumbered, unbolded headings (`# Title`, `## Section`), bold only short bullet lead-in labels (`* **Latency:** ...`) in flat lists, avoid stuffed parentheticals, and use spaced hyphens (`expression - expression`) instead of em dashes or unspaced clause hyphens.
+* **Headings, Lists, and Dashes:** Use unnumbered, unbolded headings (`# Title`, `## Section`), bold only short bullet lead-in labels (`* **Latency:** ...`) in flat lists, avoid stuffed parentheticals, and use periods, commas, or colons instead of em dashes or clause-separating dashes.
 * **Naming and Backticks:** Refer to the VCS as jj (mention "Jujutsu" at most once in [README.md](../README.md)). Reserve backticks for CLI invocations (`jj status`, `jj fix -s @`), flags (`--store-type`), environment variables, and literal code/file identifiers (`BackendService`, `OpStoreService`, `CommitId`, `Merge<TreeId>`). Write project, binary, and cloud service names without backticks (jj, jj-commit-cloud, jj-cc-server, jj-vfs, [Cloud Spanner](https://cloud.google.com/spanner), [Cloud Storage](https://cloud.google.com/storage)), linking first mentions.
-* **Relative In-Repo Links:** Link repository files with relative paths without backticks - such as [server/src/store/mod.rs](../server/src/store/mod.rs) - so links work across forks and branches. Never include `file:///` links.
+* **Relative In-Repo Links:** Link repository files with relative paths without backticks, such as [server/src/store/mod.rs](../server/src/store/mod.rs), so links work across forks and branches. Never include `file:///` links.
 
 ## Diagram Conventions (Mermaid)
 
@@ -34,7 +34,7 @@ flowchart TD
     Cli["jj CLI<br/>(Standard jj + jj cc)"]:::component
     Lib["cc-lib<br/>(Backend & OpStore)"]:::component
     Server["jj-cc-server<br/>(BackendService & OpStoreService)"]:::component
-    Store["Store trait<br/>(MemoryStore)"]:::storage
+    Store["CompositeStore<br/>(MetadataStore & BlobStore)"]:::storage
 
     Cli --> Lib -->|"HTTP/2 gRPC"| Server --> Store
 ```
